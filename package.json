@@ -1,0 +1,28 @@
+{
+  "name": "botwa-cs-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Landing page SaaS untuk Bot WA CS AI + Cek Ongkir Otomatis",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "eslint-config-next": "^15.5.23",
+    "lucide-react": "^0.454.0",
+    "next": "^15.5.23",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "@types/react": "^19.0.7",
+    "@types/react-dom": "^19.0.3",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5.26",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.3"
+  }
+}
