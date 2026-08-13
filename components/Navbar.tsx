@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { MessageCircle, Menu, X } from "lucide-react";
+import Link from "next/link";
+import { MessageCircle, Menu, X, LayoutDashboard } from "lucide-react";
 
 const NAV_LINKS = [
   { href: "#fitur", label: "Fitur" },
@@ -35,7 +36,7 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
             <MessageCircle className="h-5 w-5" />
           </span>
           <span className="text-lg font-extrabold tracking-tight text-ink">
-            Bot<span className="text-brand-600">WA</span>
+            Bot<span className="text-brand-600">WA</span>.ai
           </span>
         </a>
 
@@ -52,11 +53,18 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
         </div>
 
         <div className="hidden items-center gap-3 md:flex">
+          <Link
+            href="/login"
+            className="flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-ink transition hover:bg-slate-50"
+          >
+            <LayoutDashboard className="h-4 w-4 text-brand-600" />
+            <span>Login Dashboard</span>
+          </Link>
           <button
             onClick={onCtaClick}
             className="rounded-xl bg-brand-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-brand-700"
           >
-            Coba Sekarang
+            Mulai Sekarang
           </button>
         </div>
 
@@ -83,6 +91,14 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
                 {l.label}
               </a>
             ))}
+            <Link
+              href="/login"
+              onClick={() => setMobileOpen(false)}
+              className="mt-2 flex items-center justify-center gap-2 rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-ink"
+            >
+              <LayoutDashboard className="h-4 w-4 text-brand-600" />
+              <span>Login Dashboard</span>
+            </Link>
             <button
               onClick={() => {
                 setMobileOpen(false);
@@ -90,7 +106,7 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
               }}
               className="mt-2 rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white"
             >
-              Coba Sekarang
+              Mulai Sekarang
             </button>
           </div>
         </div>

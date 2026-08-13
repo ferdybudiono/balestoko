@@ -1,6 +1,7 @@
 "use client";
 
 import { forwardRef, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import {
   X,
   User,
@@ -12,6 +13,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Lock,
+  ArrowRight,
 } from "lucide-react";
 import { formatIDR, type Plan } from "@/lib/packages";
 
@@ -63,7 +65,6 @@ export default function CheckoutModal({
       setForm(EMPTY_FORM);
       setErrors({});
       setStatus({ kind: "idle" });
-      // Fokus ke field pertama untuk aksesibilitas.
       const t = setTimeout(() => firstFieldRef.current?.focus(), 80);
       return () => clearTimeout(t);
     }
@@ -144,6 +145,11 @@ export default function CheckoutModal({
         order_id: string;
       };
 
+      // Simpan session email ke localStorage untuk langsung dipakai di dashboard
+      if (typeof window !== "undefined") {
+        localStorage.setItem("user_email", form.email.trim());
+      }
+
       if (!window.snap) {
         setStatus({
           kind: "error",
@@ -165,7 +171,6 @@ export default function CheckoutModal({
           }),
         onClose: () =>
           setStatus((s) =>
-            // Hanya kembali ke form kalau user menutup pop-up tanpa hasil.
             s.kind === "paying" ? { kind: "idle" } : s
           ),
       });
@@ -199,7 +204,7 @@ export default function CheckoutModal({
         <div className="flex items-start justify-between gap-4 border-b border-slate-100 p-6 pb-5">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wider text-brand-600">
-              Checkout
+              Checkout Pembayaran
             </p>
             <h2
               id="checkout-title"
@@ -250,7 +255,7 @@ export default function CheckoutModal({
               />
               <Field
                 icon={<Phone className="h-4 w-4" />}
-                label="Nomor WhatsApp"
+                label="Nomor WhatsApp Toko"
                 placeholder="mis. 0812xxxxxxx"
                 value={form.whatsapp}
                 onChange={(v) => update("whatsapp", v)}
@@ -260,7 +265,7 @@ export default function CheckoutModal({
               />
               <Field
                 icon={<Mail className="h-4 w-4" />}
-                label="Email"
+                label="Email Akun Toko"
                 placeholder="mis. budi@email.com"
                 value={form.email}
                 onChange={(v) => update("email", v)}
@@ -271,7 +276,7 @@ export default function CheckoutModal({
               />
               <Field
                 icon={<Store className="h-4 w-4" />}
-                label="Nama Toko"
+                label="Nama Toko Anda"
                 placeholder="mis. Toko Budi Jaya"
                 value={form.storeName}
                 onChange={(v) => update("storeName", v)}
@@ -295,17 +300,17 @@ export default function CheckoutModal({
               {status.kind === "submitting" ? (
                 <>
                   <Loader2 className="h-5 w-5 animate-spin" />
-                  Memproses…
+                  Memproses Order…
                 </>
               ) : status.kind === "paying" ? (
                 <>
                   <Loader2 className="h-5 w-5 animate-spin" />
-                  Membuka pembayaran…
+                  Membuka Snap Midtrans…
                 </>
               ) : (
                 <>
                   <Lock className="h-4 w-4" />
-                  Bayar {formatIDR(plan.price)}
+                  Bayar {formatIDR(plan.price)} via Midtrans
                 </>
               )}
             </button>
@@ -396,37 +401,49 @@ function ResultView({
       : "";
 
   return (
-    <div className="p-8 text-center">
+    <div className="p-8 text-center space-y-4">
       <div
         className={`mx-auto flex h-16 w-16 items-center justify-center rounded-full ${
-          success ? "bg-brand-100" : "bg-amber-100"
+          success ? "bg-emerald-100" : "bg-amber-100"
         }`}
       >
         {success ? (
-          <CheckCircle2 className="h-9 w-9 text-brand-600" />
+          <CheckCircle2 className="h-9 w-9 text-emerald-600" />
         ) : (
           <Loader2 className="h-9 w-9 text-amber-600" />
         )}
       </div>
-      <h3 className="mt-5 text-xl font-bold text-ink">
+      <h3 className="text-xl font-bold text-ink">
         {success ? "Pembayaran Berhasil! 🎉" : "Menunggu Pembayaran"}
       </h3>
-      <p className="mx-auto mt-2 max-w-xs text-sm text-ink-muted">
+      <p className="mx-auto max-w-xs text-sm text-ink-muted">
         {success
-          ? `Terima kasih! Paket ${planName} Anda sedang kami aktifkan. Tim kami akan menghubungi Anda via WhatsApp.`
+          ? `Terima kasih! Pembayaran Paket ${planName} sukses. Klik tombol di bawah untuk langsung menautkan WhatsApp (Fonnte) & Mengantar Ongkir.`
           : "Selesaikan pembayaran sesuai instruksi. Status akan otomatis terupdate setelah pembayaran diterima."}
       </p>
       {orderId && (
-        <p className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
-          ID Order: <span className="font-mono">{orderId}</span>
+        <p className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500 font-mono">
+          ID Order: {orderId}
         </p>
       )}
-      <button
-        onClick={onClose}
-        className="mt-6 w-full rounded-2xl bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-ink-soft"
-      >
-        Selesai
-      </button>
+
+      {success ? (
+        <Link
+          href="/dashboard"
+          onClick={onClose}
+          className="flex items-center justify-center gap-2 w-full rounded-2xl bg-emerald-600 hover:bg-emerald-700 px-5 py-3.5 text-sm font-semibold text-white transition shadow-glow"
+        >
+          <span>Masuk Dashboard Penautan WA</span>
+          <ArrowRight className="h-4 w-4" />
+        </Link>
+      ) : (
+        <button
+          onClick={onClose}
+          className="w-full rounded-2xl bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-ink-soft"
+        >
+          Tutup
+        </button>
+      )}
     </div>
   );
 }
