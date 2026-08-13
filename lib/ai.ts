@@ -50,6 +50,31 @@ function formatOngkirWhatsApp(options: ShippingOption[], destinationCity: string
 }
 
 /**
+ * Panggil Gemini Generative AI API jika GEMINI_API_KEY di-set
+ */
+async function generateGeminiReply(prompt: string, apiKey: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }]
+      }),
+      cache: "no-store"
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) return text.trim();
+    }
+  } catch (err) {
+    console.warn("[ai] Gemini API call failed:", err);
+  }
+  return null;
+}
+
+/**
  * Proses pesan pembeli yang masuk melalui WhatsApp
  */
 export async function processAICustomerService(params: AIProcessParams): Promise<AIProcessResult> {
@@ -175,9 +200,32 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     };
   }
 
-  // 4. Default Smart AI Response Engine
-  const systemContext = aiPromptSystem || `Kamu adalah CS AI toko ${storeName}. Balaslah dengan ramah, singkat, dan berikan opsi untuk mengecek ongkir atau pemesanan produk.`;
-  
+  // 4. Menggunakan Google Gemini Generative AI jika GEMINI_API_KEY tersedia di ENV
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (geminiApiKey) {
+    const productCatalogStr = products.map((p) => `- ${p.name}: Rp ${p.price} (${p.weight}g)`).join("\n");
+    const aiPrompt = `
+System Prompt: ${aiPromptSystem || "Kamu adalah CS AI yang ramah."}
+Toko: ${storeName}
+Pengiriman dari: ${originCityName}
+Katalog Produk:
+${productCatalogStr || "Belum ada katalog"}
+
+Pesan Pembeli: "${rawMessage}"
+
+Balaslah sebagai Customer Service WhatsApp yang sopan, ramah, dan solutif. Sertakan ajakan untuk mengecek ongkir atau pemesanan produk jika relevan.
+`;
+
+    const geminiReply = await generateGeminiReply(aiPrompt, geminiApiKey);
+    if (geminiReply) {
+      return {
+        replyText: geminiReply,
+        intent: "GENERAL_CHAT"
+      };
+    }
+  }
+
+  // 5. Default Smart Rule Engine Fallback
   let fallbackReply = `Terima kasih sudah menghubungi *${storeName}*! 😊\n\n`;
   fallbackReply += `Pesan Kakak sudah kami terima. Kami siap membantu pertanyaan seputar produk maupun pengecekan tarif ongkos kirim (ongkir) kurir ke seluruh wilayah Indonesia.\n\n`;
   fallbackReply += `Boleh diinfokan nama kota/kecamatan tujuan Kakak agar langsung kami bantu cek tarif ongkirnya? 📍`;
