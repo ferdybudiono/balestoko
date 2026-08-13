@@ -46,7 +46,7 @@ export async function searchMengantarLocation(
   // 1. Coba panggil Live API Mengantar jika apiKey ada
   if (effectiveApiKey && effectiveApiKey !== "demo") {
     try {
-      const res = await fetch(`https://api.mengantar.com/v1/locations/search?q=${encodeURIComponent(clean)}`, {
+      const res = await fetch(`https://api-public.mengantar.com/v1/locations/search?q=${encodeURIComponent(clean)}`, {
         headers: {
           Authorization: `Bearer ${effectiveApiKey}`,
           "Content-Type": "application/json"
@@ -112,7 +112,7 @@ export async function calculateMengantarOngkir(params: {
   // 1. Coba panggil Live Mengantar API jika apiKey diset
   if (effectiveApiKey && effectiveApiKey !== "demo") {
     try {
-      const res = await fetch("https://api.mengantar.com/v1/shipping/rates", {
+      const res = await fetch("https://api-public.mengantar.com/v1/shipping/rates", {
         method: "POST",
         headers: {
           Authorization: `Bearer ${effectiveApiKey}`,

@@ -101,7 +101,7 @@ export default function DashboardPage() {
     setLoadingQr(true);
     try {
       const tokenParam = fonnteToken || "";
-      const res = await fetch(`/api/fonnte/qr?token=${encodeURIComponent(tokenParam)}`);
+      const res = await fetch(`/api/fonnte/qr?email=${encodeURIComponent(userEmail)}&token=${encodeURIComponent(tokenParam)}`);
       if (res.ok) {
         const data = await res.json();
         if (data.connected) {
