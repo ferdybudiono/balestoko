@@ -30,18 +30,31 @@ export function formatFonntePhone(phone: string): string {
 }
 
 /**
- * Buat Device Baru di Fonnte menggunakan Account Token milik SaaS Owner
+ * Buat Device Baru di Fonnte menggunakan Account Token milik SaaS Owner.
+ * `phone` (nomor tujuan device) WAJIB dan harus unik lintas seluruh akun Fonnte.
  */
-export async function createFonnteDevice(name: string, accountToken?: string): Promise<{ success: boolean; token?: string; error?: string }> {
+export async function createFonnteDevice(
+  name: string,
+  phone: string,
+  accountToken?: string
+): Promise<{ success: boolean; token?: string; error?: string }> {
   const token = accountToken || process.env.FONNTE_TOKEN;
   if (!token) {
     return { success: false, error: "Account Token Fonnte (FONNTE_TOKEN) belum di-set di ENV." };
   }
 
+  const devicePhone = formatFonntePhone(phone);
+  if (!devicePhone || devicePhone.replace(/\D/g, "").length < 8) {
+    return { success: false, error: "Nomor WhatsApp device tidak valid (min. 8 digit)." };
+  }
+
+  // Nama device dibatasi 2–30 karakter oleh Fonnte.
+  const deviceName = (name || "Device").trim().slice(0, 30) || "Device";
+
   try {
     const formData = new URLSearchParams();
-    formData.append("name", name);
-    formData.append("device", name);
+    formData.append("name", deviceName);
+    formData.append("device", devicePhone);
 
     const res = await fetch("https://api.fonnte.com/add-device", {
       method: "POST",
@@ -53,15 +66,15 @@ export async function createFonnteDevice(name: string, accountToken?: string): P
     });
 
     const data = await res.json();
-    if (res.ok && data.status && data.token) {
-      return { success: true, token: data.token };
+    if (res.ok && data.status && (data.token || data.device_token)) {
+      return { success: true, token: data.token || data.device_token };
     }
 
-    // Jika gagal buat device baru, gunakan account token sebagai token device bawaan
-    return { success: true, token, error: data.reason || data.message };
+    // Gagal (nomor sudah dipakai, batas device tercapai, dll). JANGAN fallback ke account token bersama.
+    return { success: false, error: data.reason || data.message || "Gagal membuat device Fonnte." };
   } catch (err) {
     console.error("[fonnte] Exception creating device:", err);
-    return { success: true, token, error: String(err) };
+    return { success: false, error: String(err) };
   }
 }
 
@@ -142,7 +155,7 @@ export async function getFonnteDeviceStatus(token: string): Promise<FonnteDevice
 }
 
 /**
- * Dapatkan Gambar QR Code langsung dari Fonnte API untuk di-scan oleh user di dalam Dashboard SaaS
+ * Dapatkan Gambar QR Code langsung dari Fonnte API (Base64 atau URL) untuk di-scan di Dashboard
  */
 export async function getFonnteQRCode(token: string): Promise<{ success: boolean; qrUrl?: string; error?: string }> {
   const activeToken = token || process.env.FONNTE_TOKEN;
@@ -151,11 +164,15 @@ export async function getFonnteQRCode(token: string): Promise<{ success: boolean
   }
 
   try {
+    const formData = new URLSearchParams();
+    formData.append("type", "qr");
+
     const res = await fetch("https://api.fonnte.com/qr", {
       method: "POST",
       headers: {
         Authorization: activeToken
       },
+      body: formData,
       cache: "no-store"
     });
 
@@ -164,11 +181,20 @@ export async function getFonnteQRCode(token: string): Promise<{ success: boolean
     }
 
     const data = await res.json();
-    if (data.status && (data.url || data.url_image)) {
-      return { success: true, qrUrl: data.url || data.url_image };
+    const rawQr = data.url || data.url_image || data.url_base64 || data.qr || data.base64;
+
+    if (data.status && rawQr) {
+      let formattedQr = String(rawQr);
+      if (!formattedQr.startsWith("http") && !formattedQr.startsWith("data:")) {
+        formattedQr = `data:image/png;base64,${formattedQr}`;
+      }
+      return { success: true, qrUrl: formattedQr };
     }
 
-    return { success: false, error: data.reason || data.message || "QR Code tidak tersedia atau WhatsApp sudah terhubung!" };
+    return {
+      success: false,
+      error: data.reason || data.message || "QR Code sedang dimuat atau WhatsApp sudah terhubung! Silakan klik muat ulang dalam 2 detik."
+    };
   } catch (err) {
     return { success: false, error: String(err) };
   }

@@ -15,6 +15,8 @@ create table if not exists public.orders (
   customer_phone    text not null,
   customer_email    text not null,
   store_name        text not null,
+  password_hash     text,                           -- hash password (scrypt) — disalin ke stores saat PAID
+  coupon_code       text,                           -- kode kupon yang dipakai (mis. 'ferdy budiono'), null jika tanpa kupon
   snap_token        text,
   raw_notification  jsonb,                          -- payload webhook Midtrans terakhir
   created_at        timestamptz not null default now(),
@@ -26,11 +28,20 @@ create table if not exists public.stores (
   id                    uuid primary key default gen_random_uuid(),
   email                 text unique not null,
   store_name            text not null,
+  password_hash         text,                           -- hash password login (scrypt)
   customer_name         text,
   customer_phone        text,
   is_paid               boolean not null default false,
   package_id            text default 'pro',
-  
+
+  -- Trial & Kupon
+  trial_ends_at         timestamptz,                    -- akhir masa uji coba 7 hari (null jika bukan/atau sudah bayar)
+  coupon_used           text,                           -- kode kupon yang sudah pernah dipakai akun ini (sekali pakai)
+
+  -- Reset Password via WhatsApp OTP
+  reset_otp_hash        text,                           -- hash (scrypt) dari OTP reset password
+  reset_otp_expires     timestamptz,                    -- kedaluwarsa OTP reset (mis. 10 menit)
+
   -- Fonnte WA Settings
   fonnte_token          text,
   fonnte_device_status  text default 'DISCONNECTED',
@@ -104,3 +115,14 @@ create trigger trg_stores_updated_at before update on public.stores for each row
 
 drop trigger if exists trg_conversations_updated_at on public.conversations;
 create trigger trg_conversations_updated_at before update on public.conversations for each row execute function public.set_updated_at();
+
+-- =====================================================================
+--  MIGRASI untuk DB yang sudah ada (aman dijalankan berulang)
+-- =====================================================================
+alter table public.orders add column if not exists password_hash text;
+alter table public.orders add column if not exists coupon_code text;
+alter table public.stores add column if not exists password_hash text;
+alter table public.stores add column if not exists trial_ends_at timestamptz;
+alter table public.stores add column if not exists coupon_used text;
+alter table public.stores add column if not exists reset_otp_hash text;
+alter table public.stores add column if not exists reset_otp_expires timestamptz;

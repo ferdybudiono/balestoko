@@ -22,7 +22,10 @@ import {
   ShoppingBag,
   Wifi,
   WifiOff,
-  ChevronRight
+  ChevronRight,
+  Clock,
+  Crown,
+  AlertTriangle
 } from "lucide-react";
 
 interface Product {
@@ -52,6 +55,8 @@ export default function DashboardPage() {
 
   // User State
   const [userEmail, setUserEmail] = useState("demo@balestoko.com");
+  const [isPaid, setIsPaid] = useState(true);
+  const [trialEndsAt, setTrialEndsAt] = useState<string | null>(null);
 
   // Store Configuration State
   const [storeId, setStoreId] = useState("");
@@ -91,6 +96,7 @@ export default function DashboardPage() {
   // QR Code State
   const [qrUrl, setQrUrl] = useState<string | null>(null);
   const [loadingQr, setLoadingQr] = useState(false);
+  const [connectPhone, setConnectPhone] = useState("");
 
   // Test Message State
   const [testPhone, setTestPhone] = useState("");
@@ -98,21 +104,26 @@ export default function DashboardPage() {
   const [sendingTest, setSendingTest] = useState(false);
 
   const handleFetchQr = async () => {
+    if (connectPhone.replace(/\D/g, "").length < 9 && !fonnteToken) {
+      showToast("Masukkan nomor WhatsApp yang valid terlebih dahulu.");
+      return;
+    }
     setLoadingQr(true);
     try {
-      const tokenParam = fonnteToken || "";
-      const res = await fetch(`/api/fonnte/qr?email=${encodeURIComponent(userEmail)}&token=${encodeURIComponent(tokenParam)}`);
+      const res = await fetch(`/api/fonnte/qr?phone=${encodeURIComponent(connectPhone)}`);
+      const data = await res.json();
       if (res.ok) {
-        const data = await res.json();
         if (data.connected) {
           showToast("WhatsApp sudah terhubung! 🎉");
           setQrUrl(null);
-          fetchStoreData(userEmail);
+          fetchStoreData();
         } else if (data.qrUrl) {
           setQrUrl(data.qrUrl);
         } else {
           showToast(data.error || "QR Code belum tersedia. Silakan coba lagi.");
         }
+      } else {
+        showToast(data.error || "Gagal memuat QR Code.");
       }
     } catch {
       showToast("Gagal memuat QR Code.");
@@ -122,11 +133,8 @@ export default function DashboardPage() {
   };
 
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      const email = localStorage.getItem("user_email") || "demo@balestoko.com";
-      setUserEmail(email);
-      fetchStoreData(email);
-    }
+    fetchStoreData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const showToast = (msg: string) => {
@@ -134,16 +142,24 @@ export default function DashboardPage() {
     setTimeout(() => setToastMessage(null), 3500);
   };
 
-  const fetchStoreData = async (email: string) => {
+  const fetchStoreData = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/store?email=${encodeURIComponent(email)}`);
+      const res = await fetch(`/api/store`);
+      if (res.status === 401) {
+        router.push("/login");
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         if (data.store) {
           setStoreId(data.store.id || "");
+          setUserEmail(data.store.email || "");
+          setIsPaid(!!data.store.is_paid);
+          setTrialEndsAt(data.store.trial_ends_at || null);
           setStoreName(data.store.store_name || "Toko Online Saya");
           setFonnteToken(data.store.fonnte_token || "");
+          if (data.store.customer_phone && !connectPhone) setConnectPhone(data.store.customer_phone);
           setOriginCityName(data.store.origin_city_name || "Jakarta Pusat");
           setOriginSubdistrictId(data.store.origin_subdistrict_id || "3171010");
           setDefaultWeight(data.store.default_weight || 1000);
@@ -176,7 +192,6 @@ export default function DashboardPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          email: userEmail,
           store_name: storeName,
           origin_city_name: originCityName,
           origin_subdistrict_id: originSubdistrictId,
@@ -188,7 +203,7 @@ export default function DashboardPage() {
 
       if (res.ok) {
         showToast("Pengaturan toko berhasil disimpan! ✨");
-        fetchStoreData(userEmail);
+        fetchStoreData();
       } else {
         showToast("Gagal menyimpan pengaturan.");
       }
@@ -226,7 +241,6 @@ export default function DashboardPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          store_id: storeId,
           name: newProductName,
           price: Number(newProductPrice),
           weight: Number(newProductWeight) || 1000,
@@ -239,7 +253,7 @@ export default function DashboardPage() {
         setNewProductName("");
         setNewProductPrice("");
         setNewProductDesc("");
-        fetchStoreData(userEmail);
+        fetchStoreData();
       }
     } catch {
       showToast("Gagal menambah produk.");
@@ -251,7 +265,7 @@ export default function DashboardPage() {
       const res = await fetch(`/api/products?id=${id}`, { method: "DELETE" });
       if (res.ok) {
         showToast("Produk berhasil dihapus.");
-        fetchStoreData(userEmail);
+        fetchStoreData();
       }
     } catch {
       showToast("Gagal menghapus produk.");
@@ -275,12 +289,15 @@ export default function DashboardPage() {
         })
       });
 
-      if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
         showToast("Simulasi berhasil! Cek tab Riwayat Chat.");
-        fetchStoreData(userEmail);
+        fetchStoreData();
         setActiveTab("chats");
+      } else if (res.ok && data.status === "ignored") {
+        showToast("Hubungkan WhatsApp dulu agar simulasi bisa diproses.");
       } else {
-        showToast("Gagal memicu simulasi.");
+        showToast(data.error || "Gagal memicu simulasi.");
       }
     } catch {
       showToast("Terjadi kesalahan.");
@@ -295,6 +312,12 @@ export default function DashboardPage() {
     { id: "products" as const, icon: Package, label: `Produk (${products.length})` },
     { id: "chats" as const, icon: MessageSquare, label: `Chat AI (${conversations.length})` }
   ];
+
+  // Status uji coba (trial) — dipakai untuk banner & gating akses.
+  const trialMs = trialEndsAt ? new Date(trialEndsAt).getTime() - Date.now() : 0;
+  const trialActive = !isPaid && !!trialEndsAt && trialMs > 0;
+  const trialExpired = !isPaid && !!trialEndsAt && trialMs <= 0;
+  const trialDaysLeft = trialActive ? Math.max(1, Math.ceil(trialMs / (24 * 60 * 60 * 1000))) : 0;
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans">
@@ -336,8 +359,12 @@ export default function DashboardPage() {
             )}
 
             <button
-              onClick={() => {
-                if (typeof window !== "undefined") localStorage.removeItem("user_email");
+              onClick={async () => {
+                try {
+                  await fetch("/api/auth/logout", { method: "POST" });
+                } catch {
+                  /* abaikan */
+                }
                 router.push("/login");
               }}
               className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-xl transition-colors"
@@ -349,7 +376,45 @@ export default function DashboardPage() {
         </div>
       </header>
 
-      {/* Main Content Layout */}
+      {/* Trial Status Banner */}
+      {trialActive && (
+        <div className="bg-amber-50 border-b border-amber-200">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-2 text-sm font-medium text-amber-800">
+              <Clock className="w-4 h-4" />
+              Masa uji coba Anda: <strong>{trialDaysLeft} hari tersisa</strong>. Nikmati semua fitur Pro.
+            </span>
+            <Link
+              href="/#harga"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold px-3 py-1.5 transition-colors"
+            >
+              <Crown className="w-3.5 h-3.5" /> Upgrade Sekarang
+            </Link>
+          </div>
+        </div>
+      )}
+
+      {/* Gate: masa uji coba berakhir & belum berlangganan */}
+      {trialExpired ? (
+        <div className="max-w-2xl mx-auto px-4 sm:px-6 py-16">
+          <div className="bg-white border border-amber-200 rounded-3xl shadow-sm p-8 text-center space-y-5">
+            <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-amber-100">
+              <AlertTriangle className="h-8 w-8 text-amber-600" />
+            </div>
+            <h2 className="text-xl font-bold text-gray-900">Masa Uji Coba Telah Berakhir</h2>
+            <p className="text-sm text-gray-500 max-w-sm mx-auto">
+              Terima kasih telah mencoba BalesToko.ai! Untuk melanjutkan menggunakan bot WhatsApp AI dan cek ongkir otomatis, silakan berlangganan salah satu paket.
+            </p>
+            <Link
+              href="/#harga"
+              className="inline-flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-emerald-200 transition-all"
+            >
+              <Crown className="h-4 w-4" /> Lihat Paket Berlangganan
+            </Link>
+          </div>
+        </div>
+      ) : (
+      /* Main Content Layout */
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 w-full flex-1 grid grid-cols-1 lg:grid-cols-4 gap-8">
         {/* Sidebar Navigation */}
         <div className="lg:col-span-1 space-y-3">
@@ -377,7 +442,7 @@ export default function DashboardPage() {
           <div className="bg-white border border-gray-200 rounded-2xl p-4 space-y-3 shadow-sm">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Status Bot AI</span>
-              <button onClick={() => fetchStoreData(userEmail)} className="p-1.5 hover:bg-gray-100 rounded-lg">
+              <button onClick={() => fetchStoreData()} className="p-1.5 hover:bg-gray-100 rounded-lg">
                 <RefreshCw className={`w-3.5 h-3.5 text-gray-400 ${loading ? "animate-spin" : ""}`} />
               </button>
             </div>
@@ -441,6 +506,25 @@ export default function DashboardPage() {
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center text-center py-6 space-y-5">
+                      <div className="w-full max-w-sm text-left space-y-1.5">
+                        <label className="block text-xs font-semibold uppercase tracking-wider text-gray-600">
+                          Nomor WhatsApp yang ingin dihubungkan
+                        </label>
+                        <input
+                          type="tel"
+                          inputMode="tel"
+                          placeholder="mis. 0812xxxxxxx"
+                          value={connectPhone}
+                          onChange={(e) => setConnectPhone(e.target.value)}
+                          disabled={!!fonnteToken}
+                          className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-sm text-gray-800 focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100 disabled:opacity-60"
+                        />
+                        <p className="text-[11px] text-gray-400">
+                          {fonnteToken
+                            ? "Device sudah dibuat untuk nomor ini. Scan QR di bawah untuk menautkan."
+                            : "Nomor ini akan didaftarkan sebagai device WhatsApp khusus toko Anda."}
+                        </p>
+                      </div>
                       {qrUrl ? (
                         <>
                           <div className="p-4 bg-white border-2 border-emerald-200 rounded-3xl shadow-lg shadow-emerald-100/50 inline-block">
@@ -838,6 +922,7 @@ export default function DashboardPage() {
 
         </div>
       </div>
+      )}
     </div>
   );
 }

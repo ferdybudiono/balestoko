@@ -2,7 +2,9 @@ import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { getPlan, isPackageId } from "@/lib/packages";
 import { createSnapTransaction } from "@/lib/midtrans";
-import { insertPendingOrder } from "@/lib/supabase";
+import { insertPendingOrder, getStoreByEmail } from "@/lib/supabase";
+import { hashPassword } from "@/lib/auth";
+import { validateCouponForPlan, applyDiscount } from "@/lib/coupons";
 
 // Route ini butuh Node runtime (pakai crypto & Buffer) dan selalu dinamis.
 export const runtime = "nodejs";
@@ -14,6 +16,8 @@ interface CheckoutBody {
   whatsapp?: string;
   email?: string;
   storeName?: string;
+  password?: string;
+  coupon?: string;
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -44,7 +48,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const { packageId, name, whatsapp, email, storeName } = body;
+  const { packageId, name, whatsapp, email, storeName, password, coupon } = body;
 
   // ---- Validasi input ----
   if (!isPackageId(packageId)) {
@@ -77,11 +81,48 @@ export async function POST(req: Request) {
       { status: 400 }
     );
   }
+  if (!password || password.length < 6) {
+    return NextResponse.json(
+      { error: "Kata sandi wajib diisi (min. 6 karakter)." },
+      { status: 400 }
+    );
+  }
 
   // ---- Harga OTORITATIF dari server (bukan dari client) ----
   const plan = getPlan(packageId)!;
   const orderId = generateOrderId(plan.id);
-  const grossAmount = plan.price;
+  let grossAmount = plan.price;
+  let appliedCoupon: string | null = null;
+
+  // ---- Validasi & terapkan kupon (opsional) ----
+  const couponRaw = (coupon || "").trim();
+  if (couponRaw) {
+    const check = validateCouponForPlan(couponRaw, plan.id);
+    if (!check.valid || !check.coupon) {
+      return NextResponse.json(
+        { error: check.error || "Kupon tidak valid." },
+        { status: 400 }
+      );
+    }
+
+    // Kupon hanya untuk AKUN BARU & sekali pakai. Cek toko yang sudah ada.
+    const existing = await getStoreByEmail(email.trim());
+    if (existing?.is_paid) {
+      return NextResponse.json(
+        { error: "Kupon hanya berlaku untuk akun baru yang belum berlangganan." },
+        { status: 400 }
+      );
+    }
+    if (existing?.coupon_used) {
+      return NextResponse.json(
+        { error: "Kupon sudah pernah dipakai pada akun ini." },
+        { status: 400 }
+      );
+    }
+
+    grossAmount = applyDiscount(plan.price, check.coupon.discountPercent);
+    appliedCoupon = check.coupon.code;
+  }
 
   const cleanName = name.trim();
   const [firstName, ...rest] = cleanName.split(/\s+/);
@@ -106,7 +147,9 @@ export async function POST(req: Request) {
       items: [
         {
           id: plan.id,
-          name: `Paket ${plan.name} - Bot WA CS AI`,
+          name: appliedCoupon
+            ? `Paket ${plan.name} (Kupon ${appliedCoupon})`
+            : `Paket ${plan.name} - Bot WA CS AI`,
           price: grossAmount,
           quantity: 1,
         },
@@ -116,6 +159,7 @@ export async function POST(req: Request) {
         package_name: plan.name,
         store_name: storeName.trim(),
         whatsapp: phone,
+        coupon: appliedCoupon,
       },
       callbackFinishUrl: `${baseUrl}/?order=${orderId}`,
     });
@@ -131,6 +175,8 @@ export async function POST(req: Request) {
       customer_phone: phone,
       customer_email: email.trim(),
       store_name: storeName.trim(),
+      password_hash: hashPassword(password),
+      coupon_code: appliedCoupon,
       snap_token: snap.token,
     });
 

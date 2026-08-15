@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getStoreByFonnteToken, getProductsByStoreId, getConversation, saveConversationMessage } from "@/lib/supabase";
+import { getStoreByFonnteToken, getProductsByStoreId, getConversation, saveConversationMessage, isStoreActive } from "@/lib/supabase";
 import { processAICustomerService } from "@/lib/ai";
 import { sendFonnteMessage } from "@/lib/fonnte";
 
@@ -35,36 +35,31 @@ export async function POST(req: Request) {
   }
 
   try {
-    // 1. Cari toko berdasarkan token Fonnte (atau toko pertama jika fallback)
-    let store = await getStoreByFonnteToken(deviceToken);
-    
-    // Jika token Fonnte di headers/payload tidak terikat secara eksplisit, ambil data toko default untuk kemudahan testing
+    // 1. Cari toko berdasarkan token Fonnte (device token) — WAJIB cocok.
+    const store = await getStoreByFonnteToken(deviceToken);
+
+    // Token device tidak dikenal → abaikan. Jangan salah-arahkan pesan ke toko lain.
     if (!store) {
-      const defaultStoreResult = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/rest/v1/stores?limit=1`, {
-        headers: {
-          apikey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
-          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY || ""}`
-        },
-        cache: "no-store"
-      });
-      if (defaultStoreResult.ok) {
-        const list = await defaultStoreResult.json();
-        if (Array.isArray(list) && list.length > 0) {
-          store = list[0];
-        }
-      }
+      console.warn("[fonnte webhook] device token tidak dikenal, pesan diabaikan.");
+      return NextResponse.json({ status: "ignored", reason: "Unknown device token" });
     }
 
-    const storeName = store?.store_name || "Toko Bot WA CS AI";
-    const storeId = store?.id || "demo-store-id";
-    const originSubdistrictId = store?.origin_subdistrict_id || "3171010";
-    const originCityName = store?.origin_city_name || "Jakarta Pusat";
-    const mengantarApiKey = store?.mengantar_api_key;
-    const aiPromptSystem = store?.ai_prompt_system;
-    const greetingMessage = store?.greeting_message;
+    // Toko nonaktif (trial habis & belum bayar) → jangan proses AI (cegah pemakaian gratis).
+    if (!isStoreActive(store)) {
+      console.warn("[fonnte webhook] toko nonaktif / trial berakhir, pesan diabaikan.");
+      return NextResponse.json({ status: "ignored", reason: "Store inactive or trial expired" });
+    }
+
+    const storeName = store.store_name || "Toko Bot WA CS AI";
+    const storeId = store.id || "";
+    const originSubdistrictId = store.origin_subdistrict_id || "3171010";
+    const originCityName = store.origin_city_name || "Jakarta Pusat";
+    const mengantarApiKey = store.mengantar_api_key;
+    const aiPromptSystem = store.ai_prompt_system;
+    const greetingMessage = store.greeting_message;
 
     // 2. Ambil katalog produk & riwayat chat pembeli dari Supabase
-    const products = storeId !== "demo-store-id" ? await getProductsByStoreId(storeId) : [];
+    const products = storeId ? await getProductsByStoreId(storeId) : [];
     const conversation = await getConversation(storeId, sender);
 
     // 3. Olah pesan dengan AI CS Engine (Greeting -> Ongkir Mengantar -> Produk)
@@ -81,7 +76,7 @@ export async function POST(req: Request) {
     });
 
     // 4. Kirim balasan WhatsApp ke pembeli lewat Fonnte
-    const activeFonnteToken = store?.fonnte_token || deviceToken || process.env.FONNTE_TOKEN;
+    const activeFonnteToken = store.fonnte_token || deviceToken || process.env.FONNTE_TOKEN;
     if (activeFonnteToken) {
       await sendFonnteMessage({
         target: sender,
@@ -93,7 +88,7 @@ export async function POST(req: Request) {
     }
 
     // 5. Simpan riwayat percakapan ke Supabase DB
-    if (storeId && storeId !== "demo-store-id") {
+    if (storeId) {
       await saveConversationMessage(
         storeId,
         sender,

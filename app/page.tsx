@@ -12,16 +12,20 @@ import FAQ from "@/components/FAQ";
 import FinalCTA from "@/components/FinalCTA";
 import Footer from "@/components/Footer";
 import CheckoutModal from "@/components/CheckoutModal";
+import TrialModal from "@/components/TrialModal";
 import { type Plan } from "@/lib/packages";
 
 export default function Home() {
   const [selectedPlan, setSelectedPlan] = useState<Plan | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [trialOpen, setTrialOpen] = useState(false);
 
   const openCheckout = useCallback((plan: Plan) => {
     setSelectedPlan(plan);
     setModalOpen(true);
   }, []);
+
+  const openTrial = useCallback(() => setTrialOpen(true), []);
 
   // CTA umum (navbar, hero, final CTA) -> arahkan ke bagian harga supaya
   // user lihat pilihan paket dulu sebelum mengisi form checkout.
@@ -42,7 +46,7 @@ export default function Home() {
         <TrustBar />
         <Features />
         <HowItWorks />
-        <Pricing onSelect={openCheckout} />
+        <Pricing onSelect={openCheckout} onTrial={openTrial} />
         <Testimonials />
         <FAQ />
         <FinalCTA onCtaClick={goToPricing} />
@@ -55,6 +59,8 @@ export default function Home() {
         open={modalOpen}
         onClose={closeCheckout}
       />
+
+      <TrialModal open={trialOpen} onClose={() => setTrialOpen(false)} />
     </>
   );
 }

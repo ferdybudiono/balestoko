@@ -20,10 +20,18 @@ export interface StoreRecord {
   id?: string;
   email: string;
   store_name: string;
+  password_hash?: string;
   customer_name?: string;
   customer_phone?: string;
   is_paid?: boolean;
   package_id?: string;
+  /** Akhir masa uji coba 7 hari (ISO). Null bila bukan trial / sudah bayar. */
+  trial_ends_at?: string | null;
+  /** Kode kupon yang sudah pernah dipakai akun ini (sekali pakai). */
+  coupon_used?: string | null;
+  /** Hash (scrypt) OTP reset password + kedaluwarsanya. */
+  reset_otp_hash?: string | null;
+  reset_otp_expires?: string | null;
   fonnte_token?: string;
   fonnte_device_status?: string;
   mengantar_api_key?: string;
@@ -69,8 +77,24 @@ export interface OrderRecord {
   customer_phone: string;
   customer_email: string;
   store_name: string;
+  password_hash?: string;
+  coupon_code?: string | null;
   snap_token?: string | null;
   raw_notification?: Record<string, unknown> | null;
+}
+
+/**
+ * Apakah toko masih boleh mengakses layanan?
+ * Aktif bila sudah berbayar ATAU masih dalam masa uji coba yang belum kedaluwarsa.
+ */
+export function isStoreActive(store: Pick<StoreRecord, "is_paid" | "trial_ends_at"> | null | undefined): boolean {
+  if (!store) return false;
+  if (store.is_paid) return true;
+  if (store.trial_ends_at) {
+    const ends = new Date(store.trial_ends_at).getTime();
+    return Number.isFinite(ends) && ends > Date.now();
+  }
+  return false;
 }
 
 interface DbResult<T = unknown> {
@@ -153,7 +177,12 @@ export async function updateOrderStatus(
         store_name: order.store_name,
         customer_name: order.customer_name,
         customer_phone: order.customer_phone,
+        password_hash: order.password_hash,
         is_paid: true,
+        // Pembayaran lunas → hentikan masa trial (akun sudah penuh).
+        trial_ends_at: null,
+        // Tandai kupon terpakai supaya tidak bisa dipakai lagi oleh akun ini.
+        ...(order.coupon_code ? { coupon_used: order.coupon_code } : {}),
         package_id: order.package_id
       });
     }

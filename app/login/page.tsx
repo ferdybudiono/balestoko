@@ -10,16 +10,29 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    if (typeof window !== "undefined") {
-      localStorage.setItem("user_email", email || "demo@balestoko.com");
-    }
-    setTimeout(() => {
+    setError(null);
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data?.error || "Gagal login.");
+        setLoading(false);
+        return;
+      }
       router.push("/dashboard");
-    }, 600);
+    } catch {
+      setError("Tidak dapat terhubung ke server. Periksa koneksi Anda.");
+      setLoading(false);
+    }
   };
 
   return (
@@ -63,9 +76,14 @@ export default function LoginPage() {
             </div>
 
             <div>
-              <label className="block text-xs font-semibold uppercase tracking-wider text-gray-600 mb-2">
-                Kata Sandi
-              </label>
+              <div className="flex items-center justify-between mb-2">
+                <label className="block text-xs font-semibold uppercase tracking-wider text-gray-600">
+                  Kata Sandi
+                </label>
+                <Link href="/reset-password" className="text-xs font-medium text-emerald-600 hover:underline">
+                  Lupa kata sandi?
+                </Link>
+              </div>
               <div className="relative">
                 <Lock className="absolute left-3.5 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
                 <input
@@ -78,6 +96,12 @@ export default function LoginPage() {
                 />
               </div>
             </div>
+
+            {error && (
+              <div className="flex items-start gap-2 rounded-xl bg-red-50 border border-red-200 px-3.5 py-2.5 text-sm text-red-700">
+                <span>{error}</span>
+              </div>
+            )}
 
             <button
               type="submit"

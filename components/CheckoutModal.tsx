@@ -14,8 +14,10 @@ import {
   AlertCircle,
   Lock,
   ArrowRight,
+  Ticket,
 } from "lucide-react";
 import { formatIDR, type Plan } from "@/lib/packages";
+import { validateCouponForPlan, applyDiscount } from "@/lib/coupons";
 
 type Status =
   | { kind: "idle" }
@@ -36,6 +38,8 @@ interface FormState {
   whatsapp: string;
   email: string;
   storeName: string;
+  password: string;
+  coupon: string;
 }
 
 const EMPTY_FORM: FormState = {
@@ -43,6 +47,8 @@ const EMPTY_FORM: FormState = {
   whatsapp: "",
   email: "",
   storeName: "",
+  password: "",
+  coupon: "",
 };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -93,6 +99,14 @@ export default function CheckoutModal({
 
   if (!open || !plan) return null;
 
+  // Preview kupon di sisi klien (server tetap jadi otoritas final saat checkout).
+  const couponInput = form.coupon.trim();
+  const couponCheck = couponInput ? validateCouponForPlan(couponInput, plan.id) : null;
+  const couponValid = !!couponCheck?.valid && !!couponCheck.coupon;
+  const effectivePrice = couponValid
+    ? applyDiscount(plan.price, couponCheck!.coupon!.discountPercent)
+    : plan.price;
+
   function update<K extends keyof FormState>(key: K, value: string) {
     setForm((f) => ({ ...f, [key]: value }));
     if (errors[key]) setErrors((e) => ({ ...e, [key]: undefined }));
@@ -106,6 +120,8 @@ export default function CheckoutModal({
     if (!EMAIL_RE.test(form.email)) next.email = "Format email salah.";
     if (form.storeName.trim().length < 2)
       next.storeName = "Nama toko wajib diisi.";
+    if (form.password.length < 6)
+      next.password = "Kata sandi minimal 6 karakter.";
     setErrors(next);
     return Object.keys(next).length === 0;
   }
@@ -127,6 +143,8 @@ export default function CheckoutModal({
           whatsapp: form.whatsapp,
           email: form.email,
           storeName: form.storeName,
+          password: form.password,
+          coupon: form.coupon.trim() || undefined,
         }),
       });
 
@@ -144,11 +162,6 @@ export default function CheckoutModal({
         token: string;
         order_id: string;
       };
-
-      // Simpan session email ke localStorage untuk langsung dipakai di dashboard
-      if (typeof window !== "undefined") {
-        localStorage.setItem("user_email", form.email.trim());
-      }
 
       if (!window.snap) {
         setStatus({
@@ -235,10 +248,20 @@ export default function CheckoutModal({
                 Total pembayaran
               </span>
               <div className="text-right">
+                {couponValid && (
+                  <span className="mr-2 text-sm text-brand-400 line-through">
+                    {formatIDR(plan.price)}
+                  </span>
+                )}
                 <span className="text-lg font-extrabold text-brand-700">
-                  {formatIDR(plan.price)}
+                  {formatIDR(effectivePrice)}
                 </span>
                 <span className="text-xs text-brand-600">{plan.period}</span>
+                {couponValid && (
+                  <span className="mt-0.5 block text-[11px] font-semibold text-emerald-600">
+                    Kupon “{couponCheck!.coupon!.code}” diterapkan −{couponCheck!.coupon!.discountPercent}%
+                  </span>
+                )}
               </div>
             </div>
 
@@ -283,6 +306,36 @@ export default function CheckoutModal({
                 error={errors.storeName}
                 autoComplete="organization"
               />
+              <Field
+                icon={<Lock className="h-4 w-4" />}
+                label="Kata Sandi (untuk login dashboard)"
+                placeholder="min. 6 karakter"
+                value={form.password}
+                onChange={(v) => update("password", v)}
+                error={errors.password}
+                type="password"
+                autoComplete="new-password"
+              />
+              <div>
+                <Field
+                  icon={<Ticket className="h-4 w-4" />}
+                  label="Kode Kupon (opsional)"
+                  placeholder="mis. ferdy budiono"
+                  value={form.coupon}
+                  onChange={(v) => update("coupon", v)}
+                  autoComplete="off"
+                />
+                {couponInput && !couponValid && (
+                  <span className="mt-1 block text-xs text-amber-600">
+                    {couponCheck?.error || "Kupon tidak valid untuk paket ini."}
+                  </span>
+                )}
+                {couponValid && (
+                  <span className="mt-1 block text-xs text-emerald-600">
+                    Hemat {formatIDR(plan.price - effectivePrice)}! Kupon berlaku untuk akun baru.
+                  </span>
+                )}
+              </div>
             </div>
 
             {status.kind === "error" && (
@@ -310,7 +363,7 @@ export default function CheckoutModal({
               ) : (
                 <>
                   <Lock className="h-4 w-4" />
-                  Bayar {formatIDR(plan.price)} via Midtrans
+                  Bayar {formatIDR(effectivePrice)} via Midtrans
                 </>
               )}
             </button>
@@ -418,7 +471,7 @@ function ResultView({
       </h3>
       <p className="mx-auto max-w-xs text-sm text-ink-muted">
         {success
-          ? `Terima kasih! Pembayaran Paket ${planName} sukses. Klik tombol di bawah untuk langsung menautkan WhatsApp (Fonnte) & Mengantar Ongkir.`
+          ? `Terima kasih! Pembayaran Paket ${planName} sukses. Silakan login memakai email & kata sandi yang tadi Anda buat untuk menautkan WhatsApp.`
           : "Selesaikan pembayaran sesuai instruksi. Status akan otomatis terupdate setelah pembayaran diterima."}
       </p>
       {orderId && (
@@ -429,11 +482,11 @@ function ResultView({
 
       {success ? (
         <Link
-          href="/dashboard"
+          href="/login"
           onClick={onClose}
           className="flex items-center justify-center gap-2 w-full rounded-2xl bg-emerald-600 hover:bg-emerald-700 px-5 py-3.5 text-sm font-semibold text-white transition shadow-glow"
         >
-          <span>Masuk Dashboard Penautan WA</span>
+          <span>Login ke Dashboard</span>
           <ArrowRight className="h-4 w-4" />
         </Link>
       ) : (

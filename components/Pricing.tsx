@@ -1,12 +1,14 @@
 "use client";
 
-import { Check, X, Sparkles } from "lucide-react";
+import { Check, X, Sparkles, Gift } from "lucide-react";
 import { PLAN_LIST, formatIDR, type Plan } from "@/lib/packages";
 
 export default function Pricing({
   onSelect,
+  onTrial,
 }: {
   onSelect: (plan: Plan) => void;
+  onTrial?: () => void;
 }) {
   return (
     <section id="harga" className="scroll-mt-20 py-20 sm:py-24">
@@ -22,6 +24,21 @@ export default function Pricing({
             Pilih paket yang sesuai skala toko kamu. Tanpa kontrak, bisa
             berhenti kapan saja.
           </p>
+
+          {onTrial && (
+            <div className="mt-6 inline-flex flex-col items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-6 py-4 sm:flex-row">
+              <span className="text-sm font-medium text-emerald-800">
+                Belum yakin? Coba dulu gratis 7 hari — tanpa kartu kredit.
+              </span>
+              <button
+                onClick={onTrial}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-glow transition hover:bg-emerald-700"
+              >
+                <Gift className="h-4 w-4" />
+                Mulai Uji Coba Gratis
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="mx-auto mt-14 grid max-w-4xl grid-cols-1 items-stretch gap-6 md:grid-cols-2">
