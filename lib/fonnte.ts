@@ -79,6 +79,51 @@ export async function createFonnteDevice(
 }
 
 /**
+ * Set/Update URL webhook "incoming chat" pada sebuah device Fonnte secara
+ * otomatis (tanpa user perlu setting manual di dashboard Fonnte).
+ *
+ * Endpoint /update-device butuh DEVICE token (bukan account token) + wajib
+ * mengirim `name` & `device`. `webhook` = url penerima pesan masuk.
+ */
+export async function setFonnteWebhook(
+  deviceToken: string,
+  deviceName: string,
+  deviceNumber: string,
+  webhookUrl: string
+): Promise<{ success: boolean; error?: string }> {
+  if (!deviceToken) return { success: false, error: "Device token kosong." };
+  if (!webhookUrl) return { success: false, error: "URL webhook kosong." };
+
+  const name = (deviceName || "Device").trim().slice(0, 30) || "Device";
+  const device = formatFonntePhone(deviceNumber);
+
+  try {
+    const formData = new URLSearchParams();
+    formData.append("name", name);
+    formData.append("device", device);
+    formData.append("webhook", webhookUrl);
+
+    const res = await fetch("https://api.fonnte.com/update-device", {
+      method: "POST",
+      headers: {
+        Authorization: deviceToken
+      },
+      body: formData,
+      cache: "no-store"
+    });
+
+    const data = await res.json();
+    if (res.ok && data.status) {
+      return { success: true };
+    }
+    return { success: false, error: data.reason || data.message || "Gagal mengatur webhook device." };
+  } catch (err) {
+    console.error("[fonnte] Exception setting webhook:", err);
+    return { success: false, error: String(err) };
+  }
+}
+
+/**
  * Kirim pesan WhatsApp ke pembeli lewat Fonnte API
  */
 export async function sendFonnteMessage(options: FonnteSendOptions): Promise<{ success: boolean; data?: unknown; error?: string }> {

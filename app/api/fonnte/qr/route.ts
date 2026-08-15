@@ -1,10 +1,19 @@
 import { NextResponse } from "next/server";
-import { getFonnteQRCode, getFonnteDeviceStatus, createFonnteDevice } from "@/lib/fonnte";
+import { getFonnteQRCode, getFonnteDeviceStatus, createFonnteDevice, setFonnteWebhook, formatFonntePhone } from "@/lib/fonnte";
 import { getStoreByEmail, upsertStore } from "@/lib/supabase";
 import { getSessionEmail } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+/** URL webhook publik yang harus dituju device (dari ENV, fallback origin request). */
+function resolveWebhookUrl(req: Request): string {
+  const base =
+    process.env.NEXT_PUBLIC_BASE_URL ||
+    req.headers.get("origin") ||
+    new URL(req.url).origin;
+  return `${base.replace(/\/+$/, "")}/api/fonnte/webhook`;
+}
 
 /**
  * Ambil QR Code WhatsApp untuk di-scan di dalam Dashboard.
@@ -25,18 +34,24 @@ export async function GET(req: Request) {
   }
 
   let token = store.fonnte_token || "";
+  const desiredWebhook = resolveWebhookUrl(req);
+  // Nomor device untuk parameter update-device (wajib oleh Fonnte).
+  const deviceNumber = formatFonntePhone(phone || store.customer_phone || "");
+  const deviceName = `${store.store_name || "Toko"}-${(store.id || "").slice(0, 8)}`;
 
   // Belum punya device token: buat device baru khusus toko ini pakai nomor dari user.
   if (!token) {
-    const targetPhone = phone || store.customer_phone || "";
-    if (!targetPhone) {
+    const rawPhone = phone || store.customer_phone || "";
+    if (!rawPhone) {
       return NextResponse.json(
         { connected: false, error: "Masukkan nomor WhatsApp yang ingin dihubungkan terlebih dahulu." },
         { status: 400 }
       );
     }
 
-    const deviceName = `${store.store_name || "Toko"}-${(store.id || "").slice(0, 8)}`;
+    // Normalisasi ke format 62xxx supaya konsisten dengan field `device` yang
+    // dikirim webhook Fonnte (dipakai untuk mencocokkan pesan masuk ke toko).
+    const targetPhone = formatFonntePhone(rawPhone);
     const created = await createFonnteDevice(deviceName, targetPhone);
     if (!created.success || !created.token) {
       return NextResponse.json(
@@ -47,6 +62,17 @@ export async function GET(req: Request) {
 
     token = created.token;
     await upsertStore({ email, fonnte_token: token, customer_phone: targetPhone });
+  }
+
+  // Set/sinkronkan URL webhook ke device secara OTOMATIS (idempoten): hanya
+  // panggil update-device bila URL tujuan berubah dari yang tersimpan.
+  if (deviceNumber.replace(/\D/g, "").length >= 10 && store.webhook_url !== desiredWebhook) {
+    const hook = await setFonnteWebhook(token, deviceName, deviceNumber, desiredWebhook);
+    if (hook.success) {
+      await upsertStore({ email, webhook_url: desiredWebhook });
+    } else {
+      console.warn("[fonnte qr] gagal set webhook otomatis:", hook.error);
+    }
   }
 
   const status = await getFonnteDeviceStatus(token);

@@ -57,6 +57,7 @@ export default function FAQ() {
                   onClick={() => setOpen(isOpen ? null : i)}
                   className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left"
                   aria-expanded={isOpen}
+                  aria-controls={`faq-panel-${i}`}
                 >
                   <span className="font-semibold text-ink">{item.q}</span>
                   <ChevronDown
@@ -66,6 +67,8 @@ export default function FAQ() {
                   />
                 </button>
                 <div
+                  id={`faq-panel-${i}`}
+                  aria-hidden={!isOpen}
                   className={`grid transition-all duration-300 ease-in-out ${
                     isOpen
                       ? "grid-rows-[1fr] opacity-100"

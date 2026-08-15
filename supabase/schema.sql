@@ -45,6 +45,7 @@ create table if not exists public.stores (
   -- Fonnte WA Settings
   fonnte_token          text,
   fonnte_device_status  text default 'DISCONNECTED',
+  webhook_url           text,                            -- URL webhook incoming chat yang sudah disinkronkan ke device
   
   -- Mengantar API (Ongkir) Settings
   mengantar_api_key     text,
@@ -126,3 +127,4 @@ alter table public.stores add column if not exists trial_ends_at timestamptz;
 alter table public.stores add column if not exists coupon_used text;
 alter table public.stores add column if not exists reset_otp_hash text;
 alter table public.stores add column if not exists reset_otp_expires timestamptz;
+alter table public.stores add column if not exists webhook_url text;

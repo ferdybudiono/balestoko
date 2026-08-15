@@ -15,6 +15,8 @@ import {
   Lock,
   ArrowRight,
   Ticket,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { formatIDR, type Plan } from "@/lib/packages";
 import { validateCouponForPlan, applyDiscount } from "@/lib/coupons";
@@ -239,7 +241,7 @@ export default function CheckoutModal({
 
         {/* Body */}
         {terminal ? (
-          <ResultView status={status} planName={plan.name} onClose={onClose} />
+          <ResultView status={status} planName={plan.name} email={form.email} onClose={onClose} />
         ) : (
           <form onSubmit={handleSubmit} className="p-6 pt-5">
             {/* Ringkasan harga */}
@@ -314,13 +316,14 @@ export default function CheckoutModal({
                 onChange={(v) => update("password", v)}
                 error={errors.password}
                 type="password"
+                revealable
                 autoComplete="new-password"
               />
               <div>
                 <Field
                   icon={<Ticket className="h-4 w-4" />}
                   label="Kode Kupon (opsional)"
-                  placeholder="mis. ferdy budiono"
+                  placeholder="Punya kode kupon?"
                   value={form.coupon}
                   onChange={(v) => update("coupon", v)}
                   autoComplete="off"
@@ -389,6 +392,7 @@ interface FieldProps {
   onChange: (v: string) => void;
   error?: string;
   type?: string;
+  revealable?: boolean;
   inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
   autoComplete?: string;
 }
@@ -402,11 +406,14 @@ const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
     onChange,
     error,
     type = "text",
+    revealable = false,
     inputMode,
     autoComplete,
   },
   ref
 ) {
+  const [reveal, setReveal] = useState(false);
+  const effectiveType = revealable ? (reveal ? "text" : "password") : type;
   return (
     <label className="block">
       <span className="mb-1.5 block text-sm font-medium text-ink-soft">
@@ -418,18 +425,30 @@ const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
         </span>
         <input
           ref={ref}
-          type={type}
+          type={effectiveType}
           inputMode={inputMode}
           autoComplete={autoComplete}
           placeholder={placeholder}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className={`w-full rounded-xl border bg-white py-2.5 pl-10 pr-3.5 text-sm text-ink outline-none transition placeholder:text-slate-400 focus:ring-4 ${
+          className={`w-full rounded-xl border bg-white py-2.5 pl-10 text-sm text-ink outline-none transition placeholder:text-slate-400 focus:ring-4 ${
+            revealable ? "pr-10" : "pr-3.5"
+          } ${
             error
               ? "border-red-300 focus:border-red-400 focus:ring-red-100"
               : "border-slate-200 focus:border-brand-400 focus:ring-brand-100"
           }`}
         />
+        {revealable && (
+          <button
+            type="button"
+            onClick={() => setReveal((v) => !v)}
+            aria-label={reveal ? "Sembunyikan kata sandi" : "Tampilkan kata sandi"}
+            className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg p-0.5 text-slate-400 transition hover:text-slate-600"
+          >
+            {reveal ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          </button>
+        )}
       </div>
       {error && (
         <span className="mt-1 block text-xs text-red-600">{error}</span>
@@ -441,10 +460,12 @@ const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
 function ResultView({
   status,
   planName,
+  email,
   onClose,
 }: {
   status: Status;
   planName: string;
+  email: string;
   onClose: () => void;
 }) {
   const success = status.kind === "success";
@@ -482,7 +503,7 @@ function ResultView({
 
       {success ? (
         <Link
-          href="/login"
+          href={email ? `/login?email=${encodeURIComponent(email)}` : "/login"}
           onClick={onClose}
           className="flex items-center justify-center gap-2 w-full rounded-2xl bg-emerald-600 hover:bg-emerald-700 px-5 py-3.5 text-sm font-semibold text-white transition shadow-glow"
         >

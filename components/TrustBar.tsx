@@ -14,14 +14,15 @@ export default function TrustBar() {
     <section className="border-y border-slate-100 bg-white py-8">
       <div className="mx-auto max-w-6xl px-5">
         <p className="text-center text-xs font-semibold uppercase tracking-widest text-ink-muted">
-          Terintegrasi dengan channel jualan favorit kamu
+          Cocok untuk penjual di channel favorit kamu
         </p>
-        <div className="relative mt-6 overflow-hidden [mask-image:linear-gradient(to_right,transparent,black_12%,black_88%,transparent)]">
-          <div className="flex w-max animate-marquee items-center gap-12">
+        <div className="group relative mt-6 overflow-hidden [mask-image:linear-gradient(to_right,transparent,black_12%,black_88%,transparent)]">
+          <div className="flex w-max animate-marquee items-center gap-12 group-hover:[animation-play-state:paused]">
             {[...LOGOS, ...LOGOS].map((name, i) => (
               <span
                 key={i}
-                className="shrink-0 text-xl font-bold text-slate-300 transition hover:text-slate-400"
+                aria-hidden={i >= LOGOS.length}
+                className="shrink-0 text-xl font-bold text-slate-400 transition hover:text-slate-500"
               >
                 {name}
               </span>

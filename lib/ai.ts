@@ -50,23 +50,36 @@ function formatOngkirWhatsApp(options: ShippingOption[], destinationCity: string
 }
 
 /**
- * Panggil Gemini Generative AI API jika GEMINI_API_KEY di-set
+ * Panggil Gemini Generative AI API jika GEMINI_API_KEY di-set.
+ * Model bisa diatur lewat ENV GEMINI_MODEL (default: gemini-2.5-flash).
+ * Catatan: gemini-1.5-flash & gemini-2.0-flash sudah di-shutdown Google.
  */
 async function generateGeminiReply(prompt: string, apiKey: string): Promise<string | null> {
+  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
   try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }]
-      }),
-      cache: "no-store"
-    });
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        }),
+        cache: "no-store"
+      }
+    );
 
     if (res.ok) {
       const data = await res.json();
       const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (text) return text.trim();
+      console.warn("[ai] Gemini merespons tanpa teks:", JSON.stringify(data).slice(0, 500));
+    } else {
+      const errBody = await res.text();
+      console.warn(
+        `[ai] Gemini API error ${res.status} (model=${model}):`,
+        errBody.slice(0, 500)
+      );
     }
   } catch (err) {
     console.warn("[ai] Gemini API call failed:", err);
@@ -223,6 +236,9 @@ Balaslah sebagai Customer Service WhatsApp yang sopan, ramah, dan solutif. Serta
         intent: "GENERAL_CHAT"
       };
     }
+    console.warn("[ai] Gemini tidak mengembalikan balasan — pakai fallback rule-based.");
+  } else {
+    console.warn("[ai] GEMINI_API_KEY belum di-set — AI Gemini nonaktif, pakai fallback rule-based.");
   }
 
   // 5. Default Smart Rule Engine Fallback

@@ -22,6 +22,13 @@ body {
   @apply bg-brand-200 text-brand-900;
 }
 
+/* Focus keyboard-only yang konsisten & terlihat di seluruh app */
+:focus-visible {
+  outline: 2px solid theme("colors.brand.600");
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 /* Scrollbar halus */
 @media (min-width: 768px) {
   ::-webkit-scrollbar {

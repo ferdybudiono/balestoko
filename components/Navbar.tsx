@@ -22,6 +22,21 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
+  // Tutup menu mobile dengan Escape & kunci scroll body saat terbuka.
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [mobileOpen]);
+
   return (
     <header
       className={`fixed inset-x-0 top-0 z-50 transition-all duration-300 ${
@@ -31,14 +46,14 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
       }`}
     >
       <nav className="mx-auto flex h-16 max-w-6xl items-center justify-between px-5">
-        <a href="#" className="flex items-center gap-2">
+        <Link href="/" className="flex items-center gap-2" aria-label="BalesToko.ai beranda">
           <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-600 text-white shadow-glow">
             <MessageCircle className="h-5 w-5" />
           </span>
           <span className="text-lg font-extrabold tracking-tight text-ink">
-            Bot<span className="text-brand-600">WA</span>.ai
+            BalesToko<span className="text-brand-600">.ai</span>
           </span>
-        </a>
+        </Link>
 
         <div className="hidden items-center gap-8 md:flex">
           {NAV_LINKS.map((l) => (
@@ -58,7 +73,7 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
             className="flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-ink transition hover:bg-slate-50"
           >
             <LayoutDashboard className="h-4 w-4 text-brand-600" />
-            <span>Login Dashboard</span>
+            <span>Masuk</span>
           </Link>
           <button
             onClick={onCtaClick}
@@ -71,7 +86,9 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
         <button
           className="rounded-lg p-2 text-ink md:hidden"
           onClick={() => setMobileOpen((v) => !v)}
-          aria-label="Menu"
+          aria-label={mobileOpen ? "Tutup menu" : "Buka menu"}
+          aria-expanded={mobileOpen}
+          aria-controls="mobile-menu"
         >
           {mobileOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
         </button>
@@ -79,7 +96,7 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
 
       {/* Mobile menu */}
       {mobileOpen && (
-        <div className="border-t border-slate-200 bg-white px-5 py-4 md:hidden">
+        <div id="mobile-menu" className="border-t border-slate-200 bg-white px-5 py-4 md:hidden">
           <div className="flex flex-col gap-1">
             {NAV_LINKS.map((l) => (
               <a
@@ -97,7 +114,7 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
               className="mt-2 flex items-center justify-center gap-2 rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-ink"
             >
               <LayoutDashboard className="h-4 w-4 text-brand-600" />
-              <span>Login Dashboard</span>
+              <span>Masuk</span>
             </Link>
             <button
               onClick={() => {

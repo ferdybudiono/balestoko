@@ -51,7 +51,7 @@ export default function DashboardPage() {
   const [activeTab, setActiveTab] = useState<"whatsapp" | "store" | "products" | "chats">("whatsapp");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ msg: string; type: "success" | "error" } | null>(null);
 
   // User State
   const [userEmail, setUserEmail] = useState("demo@balestoko.com");
@@ -105,7 +105,7 @@ export default function DashboardPage() {
 
   const handleFetchQr = async () => {
     if (connectPhone.replace(/\D/g, "").length < 9 && !fonnteToken) {
-      showToast("Masukkan nomor WhatsApp yang valid terlebih dahulu.");
+      showToast("Masukkan nomor WhatsApp yang valid terlebih dahulu.", "error");
       return;
     }
     setLoadingQr(true);
@@ -120,13 +120,13 @@ export default function DashboardPage() {
         } else if (data.qrUrl) {
           setQrUrl(data.qrUrl);
         } else {
-          showToast(data.error || "QR Code belum tersedia. Silakan coba lagi.");
+          showToast(data.error || "QR Code belum tersedia. Silakan coba lagi.", "error");
         }
       } else {
-        showToast(data.error || "Gagal memuat QR Code.");
+        showToast(data.error || "Gagal memuat QR Code.", "error");
       }
     } catch {
-      showToast("Gagal memuat QR Code.");
+      showToast("Gagal memuat QR Code.", "error");
     } finally {
       setLoadingQr(false);
     }
@@ -137,9 +137,33 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 3500);
+  // Auto-poll status koneksi selama QR ditampilkan; berhenti begitu terhubung.
+  useEffect(() => {
+    if (!qrUrl || fonnteStatus.status) return;
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/fonnte/qr?phone=${encodeURIComponent(connectPhone)}`);
+        const data = await res.json();
+        if (res.ok) {
+          if (data.connected) {
+            setQrUrl(null);
+            showToast("WhatsApp berhasil terhubung! 🎉");
+            fetchStoreData();
+          } else if (data.qrUrl) {
+            setQrUrl(data.qrUrl);
+          }
+        }
+      } catch {
+        /* diamkan — akan dicoba lagi pada tick berikutnya */
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qrUrl, fonnteStatus.status, connectPhone]);
+
+  const showToast = (msg: string, type: "success" | "error" = "success") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3500);
   };
 
   const fetchStoreData = async () => {
@@ -205,10 +229,10 @@ export default function DashboardPage() {
         showToast("Pengaturan toko berhasil disimpan! ✨");
         fetchStoreData();
       } else {
-        showToast("Gagal menyimpan pengaturan.");
+        showToast("Gagal menyimpan pengaturan.", "error");
       }
     } catch {
-      showToast("Terjadi kesalahan saat menyimpan.");
+      showToast("Terjadi kesalahan saat menyimpan.", "error");
     } finally {
       setSaving(false);
     }
@@ -223,10 +247,14 @@ export default function DashboardPage() {
         const data = await res.json();
         if (Array.isArray(data.locations)) {
           setLocationResults(data.locations);
+          if (data.locations.length === 0) showToast("Lokasi tidak ditemukan. Coba kata kunci lain.", "error");
         }
+      } else {
+        showToast("Gagal mencari lokasi. Coba lagi.", "error");
       }
     } catch (err) {
       console.error(err);
+      showToast("Gagal mencari lokasi. Periksa koneksi Anda.", "error");
     } finally {
       setSearchingLoc(false);
     }
@@ -254,9 +282,12 @@ export default function DashboardPage() {
         setNewProductPrice("");
         setNewProductDesc("");
         fetchStoreData();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        showToast(data.error || "Gagal menambah produk.", "error");
       }
     } catch {
-      showToast("Gagal menambah produk.");
+      showToast("Gagal menambah produk.", "error");
     }
   };
 
@@ -266,15 +297,17 @@ export default function DashboardPage() {
       if (res.ok) {
         showToast("Produk berhasil dihapus.");
         fetchStoreData();
+      } else {
+        showToast("Gagal menghapus produk.", "error");
       }
     } catch {
-      showToast("Gagal menghapus produk.");
+      showToast("Gagal menghapus produk.", "error");
     }
   };
 
   const handleSendTestWebhook = async () => {
     if (!testPhone) {
-      showToast("Masukkan nomor WA penguji terlebih dahulu!");
+      showToast("Masukkan nomor WA penguji terlebih dahulu!", "error");
       return;
     }
     setSendingTest(true);
@@ -285,7 +318,10 @@ export default function DashboardPage() {
         body: JSON.stringify({
           sender: testPhone,
           message: testMessageText,
-          device: fonnteToken
+          // `device` = nomor WA toko yang menerima pesan (cara webhook mencocokkan toko).
+          // `token` disertakan sebagai fallback pencocokan bila nomor belum tersinkron.
+          device: connectPhone,
+          token: fonnteToken || undefined,
         })
       });
 
@@ -295,12 +331,12 @@ export default function DashboardPage() {
         fetchStoreData();
         setActiveTab("chats");
       } else if (res.ok && data.status === "ignored") {
-        showToast("Hubungkan WhatsApp dulu agar simulasi bisa diproses.");
+        showToast("Hubungkan WhatsApp dulu agar simulasi bisa diproses.", "error");
       } else {
-        showToast(data.error || "Gagal memicu simulasi.");
+        showToast(data.error || "Gagal memicu simulasi.", "error");
       }
     } catch {
-      showToast("Terjadi kesalahan.");
+      showToast("Terjadi kesalahan.", "error");
     } finally {
       setSendingTest(false);
     }
@@ -317,15 +353,43 @@ export default function DashboardPage() {
   const trialMs = trialEndsAt ? new Date(trialEndsAt).getTime() - Date.now() : 0;
   const trialActive = !isPaid && !!trialEndsAt && trialMs > 0;
   const trialExpired = !isPaid && !!trialEndsAt && trialMs <= 0;
-  const trialDaysLeft = trialActive ? Math.max(1, Math.ceil(trialMs / (24 * 60 * 60 * 1000))) : 0;
+  // Tampilkan jam bila < 24 jam tersisa supaya lebih akurat menjelang berakhir.
+  const trialHoursLeft = Math.ceil(trialMs / (60 * 60 * 1000));
+  const trialLabel = trialActive
+    ? trialMs < 24 * 60 * 60 * 1000
+      ? `${Math.max(1, trialHoursLeft)} jam tersisa`
+      : `${Math.ceil(trialMs / (24 * 60 * 60 * 1000))} hari tersisa`
+    : "";
+
+  // Cegah "flash" data demo: tampilkan skeleton hingga data toko termuat.
+  if (loading && !storeId) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3 text-gray-400">
+          <RefreshCw className="w-8 h-8 animate-spin text-emerald-500" />
+          <p className="text-sm">Memuat dashboard toko Anda…</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans">
       {/* Toast Notification */}
-      {toastMessage && (
-        <div className="fixed top-5 right-5 z-50 bg-emerald-600 text-white font-medium px-5 py-3 rounded-2xl shadow-xl flex items-center gap-2 animate-bounce">
-          <Sparkles className="w-4 h-4" />
-          <span className="text-sm">{toastMessage}</span>
+      {toast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed top-5 right-5 z-50 text-white font-medium px-5 py-3 rounded-2xl shadow-xl flex items-center gap-2 animate-scale-in ${
+            toast.type === "error" ? "bg-red-600" : "bg-emerald-600"
+          }`}
+        >
+          {toast.type === "error" ? (
+            <AlertTriangle className="w-4 h-4" />
+          ) : (
+            <CheckCircle className="w-4 h-4" />
+          )}
+          <span className="text-sm">{toast.msg}</span>
         </div>
       )}
 
@@ -382,7 +446,7 @@ export default function DashboardPage() {
           <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-2">
             <span className="inline-flex items-center gap-2 text-sm font-medium text-amber-800">
               <Clock className="w-4 h-4" />
-              Masa uji coba Anda: <strong>{trialDaysLeft} hari tersisa</strong>. Nikmati semua fitur Pro.
+              Masa uji coba Anda: <strong>{trialLabel}</strong>. Nikmati semua fitur Pro.
             </span>
             <Link
               href="/#harga"
@@ -642,6 +706,13 @@ export default function DashboardPage() {
                         placeholder="Cari kota atau kecamatan (misal: Bandung)"
                         value={locationQuery}
                         onChange={(e) => setLocationQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            // Cegah submit form simpan-toko; jalankan pencarian saja.
+                            e.preventDefault();
+                            handleSearchLocation();
+                          }
+                        }}
                         className="w-full pl-9 pr-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-800 focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
                       />
                     </div>
@@ -659,7 +730,8 @@ export default function DashboardPage() {
                   {locationResults.length > 0 && (
                     <div className="max-h-40 overflow-y-auto border border-gray-200 rounded-xl divide-y divide-gray-100 bg-white">
                       {locationResults.map((loc) => (
-                        <div
+                        <button
+                          type="button"
                           key={loc.id}
                           onClick={() => {
                             setOriginCityName(`${loc.subdistrict_name}, ${loc.city_name}`);
@@ -668,11 +740,11 @@ export default function DashboardPage() {
                             setLocationQuery("");
                             showToast(`Lokasi asal diubah ke ${loc.subdistrict_name}`);
                           }}
-                          className="p-3 hover:bg-emerald-50 cursor-pointer text-sm flex justify-between items-center transition-colors"
+                          className="w-full p-3 hover:bg-emerald-50 cursor-pointer text-sm flex justify-between items-center transition-colors text-left"
                         >
                           <span className="font-medium text-gray-700">{loc.subdistrict_name}, {loc.city_name}</span>
                           <ChevronRight className="w-4 h-4 text-gray-300" />
-                        </div>
+                        </button>
                       ))}
                     </div>
                   )}
@@ -684,6 +756,23 @@ export default function DashboardPage() {
                       {originCityName}
                     </span>
                   </div>
+                </div>
+
+                {/* Default Weight */}
+                <div>
+                  <label className="block text-xs font-semibold text-gray-600 uppercase tracking-wider mb-2">
+                    Berat Default per Pesanan (gram)
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={defaultWeight}
+                    onChange={(e) => setDefaultWeight(Number(e.target.value) || 0)}
+                    className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-sm text-gray-800 focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                  />
+                  <p className="text-xs text-gray-400 mt-1">
+                    Dipakai AI untuk estimasi ongkir bila berat produk tidak diketahui. Contoh: 1000 = 1 kg.
+                  </p>
                 </div>
 
                 {/* AI Settings */}
@@ -850,12 +939,13 @@ export default function DashboardPage() {
                   {/* Left Chat List */}
                   <div className="md:col-span-1 border border-gray-200 rounded-2xl divide-y divide-gray-100 overflow-hidden bg-gray-50">
                     {conversations.map((c) => (
-                      <div
+                      <button
+                        type="button"
                         key={c.customer_phone}
                         onClick={() => setSelectedChat(c)}
-                        className={`p-3.5 cursor-pointer transition-colors ${
+                        className={`w-full text-left p-3.5 cursor-pointer transition-colors ${
                           selectedChat?.customer_phone === c.customer_phone
-                            ? "bg-emerald-50 border-l-3 border-emerald-500"
+                            ? "bg-emerald-50 border-l-4 border-emerald-500"
                             : "hover:bg-gray-100"
                         }`}
                       >
@@ -868,7 +958,7 @@ export default function DashboardPage() {
                             {c.last_intent}
                           </span>
                         )}
-                      </div>
+                      </button>
                     ))}
                   </div>
 

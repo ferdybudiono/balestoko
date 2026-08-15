@@ -29,10 +29,10 @@ export default function FinalCTA({ onCtaClick }: { onCtaClick: () => void }) {
               onClick={onCtaClick}
               className="group mt-8 inline-flex items-center justify-center gap-2 rounded-2xl bg-white px-7 py-3.5 text-base font-bold text-brand-700 shadow-lg transition hover:bg-brand-50"
             >
-              Coba Sekarang
+              Mulai Sekarang
               <ArrowRight className="h-5 w-5 transition-transform group-hover:translate-x-0.5" />
             </button>
-            <p className="mt-4 text-sm text-brand-100">
+            <p className="mt-4 text-sm text-brand-50">
               Garansi 7 hari uang kembali • Tanpa kontrak
             </p>
           </div>

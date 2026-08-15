@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getStoreByFonnteToken, getProductsByStoreId, getConversation, saveConversationMessage, isStoreActive } from "@/lib/supabase";
+import { getStoreByFonnteToken, getStoreByDevicePhone, getProductsByStoreId, getConversation, saveConversationMessage, isStoreActive } from "@/lib/supabase";
 import { processAICustomerService } from "@/lib/ai";
 import { sendFonnteMessage } from "@/lib/fonnte";
 
@@ -27,7 +27,8 @@ export async function POST(req: Request) {
   // Fonnte payload parameters
   const sender = String(body.sender || body.from || body.phone || "");
   const messageText = String(body.message || body.text || "");
-  const deviceToken = String(body.device || req.headers.get("authorization") || "");
+  // `device` = NOMOR device penerima (payload webhook Fonnte TIDAK memuat token).
+  const deviceNumber = String(body.device || "");
 
   // Abaikan event status / pesan kosong / pesan broadcast keluar
   if (!sender || !messageText || messageText.trim() === "") {
@@ -35,13 +36,20 @@ export async function POST(req: Request) {
   }
 
   try {
-    // 1. Cari toko berdasarkan token Fonnte (device token) — WAJIB cocok.
-    const store = await getStoreByFonnteToken(deviceToken);
-
-    // Token device tidak dikenal → abaikan. Jangan salah-arahkan pesan ke toko lain.
+    // 1. Cari toko berdasarkan NOMOR device penerima (utama). Fallback ke token
+    //    bila suatu konfigurasi mengirimkannya via body/header.
+    let store = deviceNumber ? await getStoreByDevicePhone(deviceNumber) : null;
     if (!store) {
-      console.warn("[fonnte webhook] device token tidak dikenal, pesan diabaikan.");
-      return NextResponse.json({ status: "ignored", reason: "Unknown device token" });
+      const maybeToken = String(body.token || req.headers.get("authorization") || "");
+      if (maybeToken) store = await getStoreByFonnteToken(maybeToken);
+    }
+
+    // Device tidak dikenal → abaikan. Jangan salah-arahkan pesan ke toko lain.
+    if (!store) {
+      console.warn(
+        `[fonnte webhook] device tidak dikenal (device=${deviceNumber}), pesan diabaikan.`
+      );
+      return NextResponse.json({ status: "ignored", reason: "Unknown device" });
     }
 
     // Toko nonaktif (trial habis & belum bayar) → jangan proses AI (cegah pemakaian gratis).
@@ -75,14 +83,17 @@ export async function POST(req: Request) {
       chatHistory: conversation?.messages || []
     });
 
-    // 4. Kirim balasan WhatsApp ke pembeli lewat Fonnte
-    const activeFonnteToken = store.fonnte_token || deviceToken || process.env.FONNTE_TOKEN;
+    // 4. Kirim balasan WhatsApp ke pembeli lewat device token milik toko.
+    const activeFonnteToken = store.fonnte_token || process.env.FONNTE_TOKEN;
     if (activeFonnteToken) {
-      await sendFonnteMessage({
+      const sent = await sendFonnteMessage({
         target: sender,
         message: aiResult.replyText,
         token: activeFonnteToken
       });
+      if (!sent.success) {
+        console.warn("[fonnte webhook] gagal mengirim balasan:", sent.error);
+      }
     } else {
       console.log("[fonnte webhook simulated reply]:", aiResult.replyText);
     }

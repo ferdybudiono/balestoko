@@ -14,7 +14,7 @@ const SITE_URL =
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
-  title: "BotWA — CS WhatsApp Otomatis + Cek Ongkir AI untuk Toko Online",
+  title: "BalesToko.ai — CS WhatsApp Otomatis + Cek Ongkir AI untuk Toko Online",
   description:
     "Bot WhatsApp bertenaga AI yang membalas chat pelanggan 24/7, menghitung ongkir real-time via API Mengantar, dan bantu closing penjualan. Cocok untuk toko online Indonesia.",
   keywords: [
@@ -26,7 +26,7 @@ export const metadata: Metadata = {
     "customer service AI",
   ],
   openGraph: {
-    title: "BotWA — CS WhatsApp Otomatis + Cek Ongkir AI",
+    title: "BalesToko.ai — CS WhatsApp Otomatis + Cek Ongkir AI",
     description:
       "Balas chat & cek ongkir otomatis di WhatsApp dengan AI. Hemat waktu, tingkatkan penjualan.",
     type: "website",

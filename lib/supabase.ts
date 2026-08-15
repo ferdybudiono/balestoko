@@ -34,6 +34,8 @@ export interface StoreRecord {
   reset_otp_expires?: string | null;
   fonnte_token?: string;
   fonnte_device_status?: string;
+  /** URL webhook incoming chat yang sudah disinkronkan ke device (idempotensi). */
+  webhook_url?: string | null;
   mengantar_api_key?: string;
   origin_subdistrict_id?: string;
   origin_city_name?: string;
@@ -220,6 +222,43 @@ export async function getStoreByFonnteToken(token: string): Promise<StoreRecord 
 
   try {
     const url = `${cfg.url}/rest/v1/stores?fonnte_token=eq.${encodeURIComponent(token)}&limit=1`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+
+    if (!res.ok) return null;
+    const list = await res.json();
+    return Array.isArray(list) && list.length > 0 ? (list[0] as StoreRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cari toko berdasarkan NOMOR device WhatsApp.
+ *
+ * Webhook Fonnte mengirim field `device` = nomor device penerima (bukan token,
+ * payload masuk memang tidak memuat token). Karena `customer_phone` bisa
+ * tersimpan sebagai 62xxx atau 08xxx, cocokkan kedua bentuk sekaligus.
+ */
+export async function getStoreByDevicePhone(phone: string): Promise<StoreRecord | null> {
+  const cfg = getConfig();
+  if (!cfg || !phone) return null;
+
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length < 8) return null;
+  const wa62 = digits.startsWith("62")
+    ? digits
+    : digits.startsWith("0")
+    ? "62" + digits.slice(1)
+    : "62" + digits;
+  const local0 = "0" + wa62.slice(2);
+  const candidates = Array.from(new Set([wa62, local0, digits]));
+
+  try {
+    const orExpr = `or=(${candidates.map((c) => `customer_phone.eq.${c}`).join(",")})`;
+    const url = `${cfg.url}/rest/v1/stores?${orExpr}&limit=1`;
     const res = await fetch(url, {
       headers: headers(cfg.key, "return=representation"),
       cache: "no-store"

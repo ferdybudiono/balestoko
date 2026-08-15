@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Bot, Mail, Lock, KeyRound, ArrowRight, ShieldCheck, CheckCircle2 } from "lucide-react";
+import { Bot, Mail, Lock, KeyRound, ArrowRight, ShieldCheck, CheckCircle2, Eye, EyeOff } from "lucide-react";
 
 type Step = "request" | "verify" | "done";
 
@@ -13,13 +13,15 @@ export default function ResetPasswordPage() {
   const [email, setEmail] = useState("");
   const [otp, setOtp] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [phoneHint, setPhoneHint] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
-  const requestOtp = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const requestOtp = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!email) return;
     setLoading(true);
     setError(null);
     setInfo(null);
@@ -107,6 +109,7 @@ export default function ResetPasswordPage() {
                   <input
                     type="email"
                     required
+                    autoFocus
                     placeholder="nama@tokomu.com"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
@@ -143,19 +146,27 @@ export default function ResetPasswordPage() {
                 <div className="relative">
                   <Lock className="absolute left-3.5 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
                   <input
-                    type="password"
+                    type={showPassword ? "text" : "password"}
                     required
                     placeholder="min. 6 karakter"
                     value={newPassword}
                     onChange={(e) => setNewPassword(e.target.value)}
-                    className="w-full pl-11 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition-all"
+                    className="w-full pl-11 pr-11 py-3 bg-gray-50 border border-gray-200 rounded-xl text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition-all"
                   />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    aria-label={showPassword ? "Sembunyikan kata sandi" : "Tampilkan kata sandi"}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg p-1 text-gray-400 hover:text-gray-600"
+                  >
+                    {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                  </button>
                 </div>
               </div>
               <button type="submit" disabled={loading} className="w-full py-3.5 px-4 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold rounded-xl transition-all shadow-lg shadow-emerald-200 flex items-center justify-center gap-2 disabled:opacity-50">
                 {loading ? <span>Menyimpan...</span> : (<><ShieldCheck className="w-4 h-4" /><span>Reset Kata Sandi</span></>)}
               </button>
-              <button type="button" onClick={() => setStep("request")} className="w-full text-xs text-gray-400 hover:text-gray-600">
+              <button type="button" onClick={() => requestOtp()} disabled={loading} className="w-full text-xs text-gray-400 hover:text-gray-600 disabled:opacity-50">
                 Tidak menerima OTP? Kirim ulang
               </button>
             </form>

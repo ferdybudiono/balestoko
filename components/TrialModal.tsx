@@ -13,6 +13,8 @@ import {
   AlertCircle,
   Gift,
   ArrowRight,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 
 interface TrialModalProps {
@@ -108,7 +110,7 @@ export default function TrialModal({ open, onClose }: TrialModalProps) {
   }
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-end justify-center p-0 sm:items-center sm:p-4" role="dialog" aria-modal="true">
+    <div className="fixed inset-0 z-[100] flex items-end justify-center p-0 sm:items-center sm:p-4" role="dialog" aria-modal="true" aria-labelledby="trial-title">
       <div className="absolute inset-0 bg-ink/60 backdrop-blur-sm animate-fade-in" onClick={() => !submitting && onClose()} />
       <div className="relative w-full max-w-md animate-scale-in rounded-t-3xl bg-white shadow-card-lg sm:rounded-3xl">
         <div className="flex items-start justify-between gap-4 border-b border-slate-100 p-6 pb-5">
@@ -116,7 +118,7 @@ export default function TrialModal({ open, onClose }: TrialModalProps) {
             <p className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-emerald-600">
               <Gift className="h-3.5 w-3.5" /> Uji Coba Gratis
             </p>
-            <h2 className="mt-1 text-xl font-bold text-ink">Coba 7 Hari Tanpa Bayar</h2>
+            <h2 id="trial-title" className="mt-1 text-xl font-bold text-ink">Coba 7 Hari Tanpa Bayar</h2>
             <p className="mt-0.5 text-sm text-ink-muted">Akses penuh fitur Pro. Tanpa kartu kredit.</p>
           </div>
           <button onClick={() => !submitting && onClose()} disabled={submitting} aria-label="Tutup" className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40">
@@ -130,7 +132,7 @@ export default function TrialModal({ open, onClose }: TrialModalProps) {
             <TrialField icon={<Phone className="h-4 w-4" />} label="Nomor WhatsApp Toko" placeholder="mis. 0812xxxxxxx" value={form.whatsapp} onChange={(v) => update("whatsapp", v)} error={errors.whatsapp} inputMode="tel" autoComplete="tel" />
             <TrialField icon={<Mail className="h-4 w-4" />} label="Email Akun Toko" placeholder="mis. budi@email.com" value={form.email} onChange={(v) => update("email", v)} error={errors.email} type="email" inputMode="email" autoComplete="email" />
             <TrialField icon={<Store className="h-4 w-4" />} label="Nama Toko Anda" placeholder="mis. Toko Budi Jaya" value={form.storeName} onChange={(v) => update("storeName", v)} error={errors.storeName} autoComplete="organization" />
-            <TrialField icon={<Lock className="h-4 w-4" />} label="Kata Sandi (untuk login dashboard)" placeholder="min. 6 karakter" value={form.password} onChange={(v) => update("password", v)} error={errors.password} type="password" autoComplete="new-password" />
+            <TrialField icon={<Lock className="h-4 w-4" />} label="Kata Sandi (untuk login dashboard)" placeholder="min. 6 karakter" value={form.password} onChange={(v) => update("password", v)} error={errors.password} type="password" revealable autoComplete="new-password" />
           </div>
 
           {serverError && (
@@ -160,14 +162,17 @@ interface TrialFieldProps {
   onChange: (v: string) => void;
   error?: string;
   type?: string;
+  revealable?: boolean;
   inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
   autoComplete?: string;
 }
 
 const TrialField = forwardRef<HTMLInputElement, TrialFieldProps>(function TrialField(
-  { icon, label, placeholder, value, onChange, error, type = "text", inputMode, autoComplete },
+  { icon, label, placeholder, value, onChange, error, type = "text", revealable = false, inputMode, autoComplete },
   ref
 ) {
+  const [reveal, setReveal] = useState(false);
+  const effectiveType = revealable ? (reveal ? "text" : "password") : type;
   return (
     <label className="block">
       <span className="mb-1.5 block text-sm font-medium text-ink-soft">{label}</span>
@@ -175,16 +180,28 @@ const TrialField = forwardRef<HTMLInputElement, TrialFieldProps>(function TrialF
         <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400">{icon}</span>
         <input
           ref={ref}
-          type={type}
+          type={effectiveType}
           inputMode={inputMode}
           autoComplete={autoComplete}
           placeholder={placeholder}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className={`w-full rounded-xl border bg-white py-2.5 pl-10 pr-3.5 text-sm text-ink outline-none transition placeholder:text-slate-400 focus:ring-4 ${
+          className={`w-full rounded-xl border bg-white py-2.5 pl-10 text-sm text-ink outline-none transition placeholder:text-slate-400 focus:ring-4 ${
+            revealable ? "pr-10" : "pr-3.5"
+          } ${
             error ? "border-red-300 focus:border-red-400 focus:ring-red-100" : "border-slate-200 focus:border-brand-400 focus:ring-brand-100"
           }`}
         />
+        {revealable && (
+          <button
+            type="button"
+            onClick={() => setReveal((v) => !v)}
+            aria-label={reveal ? "Sembunyikan kata sandi" : "Tampilkan kata sandi"}
+            className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg p-0.5 text-slate-400 transition hover:text-slate-600"
+          >
+            {reveal ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          </button>
+        )}
       </div>
       {error && <span className="mt-1 block text-xs text-red-600">{error}</span>}
     </label>
