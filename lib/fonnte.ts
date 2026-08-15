@@ -121,7 +121,13 @@ export async function sendFonnteMessage(options: FonnteSendOptions): Promise<{ s
 }
 
 /**
- * Cek status device Fonnte (Connected / Disconnected)
+ * Cek status device Fonnte (Connected / Disconnected).
+ *
+ * PENTING: response /device punya DUA field berbeda:
+ *  - `status`  → hanya menandakan TOKEN VALID (request sukses), BUKAN koneksi WA.
+ *  - `device_status` → status login WhatsApp sebenarnya ("connect"/"disconnect").
+ * Device yang baru dibuat via add-device selalu "disconnect" sampai QR di-scan,
+ * jadi kita HARUS memakai `device_status`, bukan `status`.
  */
 export async function getFonnteDeviceStatus(token: string): Promise<FonnteDeviceResponse> {
   const activeToken = token || process.env.FONNTE_TOKEN;
@@ -143,11 +149,23 @@ export async function getFonnteDeviceStatus(token: string): Promise<FonnteDevice
     }
 
     const data = await res.json();
+
+    // Token tidak valid / error dari Fonnte.
+    if (!data.status) {
+      return {
+        status: false,
+        reason: data.reason || data.message || "Token device tidak valid."
+      };
+    }
+
+    const connected =
+      String(data.device_status || "").toLowerCase() === "connect";
+
     return {
-      status: !!data.status,
+      status: connected,
       device: data.device || data.whatsapp || "Active Device",
       quota: data.quota || "Unlimited",
-      reason: data.reason || data.message
+      reason: connected ? undefined : "WhatsApp belum terhubung (belum scan QR)."
     };
   } catch (err) {
     return { status: false, reason: String(err) };
