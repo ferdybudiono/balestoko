@@ -4,7 +4,7 @@
  * Divalidasi & diterapkan SELALU di server (lihat /api/checkout) supaya
  * diskon tidak bisa dimanipulasi dari browser.
  *
- * Aturan kupon "ferdy budiono":
+ * Aturan kupon "ferdybudiono":
  *  - Diskon 50%.
  *  - Hanya untuk AKUN BARU (email yang belum punya toko berbayar & belum
  *    pernah memakai kupon). Enforcement "sekali pakai" dilakukan di server.
@@ -29,10 +29,10 @@ export function normalizeCouponCode(raw: string): string {
 
 /** Kunci map = kode ternormalisasi. */
 const COUPONS: Record<string, Coupon> = {
-  "ferdy budiono": {
-    code: "ferdy budiono",
+  "ferdybudiono": {
+    code: "ferdybudiono",
     discountPercent: 50,
-    plans: ["pro"],
+    plans: ["starter", "pro"],
   },
 };
 

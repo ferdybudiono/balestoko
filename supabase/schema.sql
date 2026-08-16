@@ -16,7 +16,7 @@ create table if not exists public.orders (
   customer_email    text not null,
   store_name        text not null,
   password_hash     text,                           -- hash password (scrypt) — disalin ke stores saat PAID
-  coupon_code       text,                           -- kode kupon yang dipakai (mis. 'ferdy budiono'), null jika tanpa kupon
+  coupon_code       text,                           -- kode kupon yang dipakai (mis. 'ferdybudiono'), null jika tanpa kupon
   snap_token        text,
   raw_notification  jsonb,                          -- payload webhook Midtrans terakhir
   created_at        timestamptz not null default now(),
