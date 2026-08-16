@@ -63,6 +63,7 @@ export async function POST(req: Request) {
     const originSubdistrictId = store.origin_subdistrict_id || "3171010";
     const originCityName = store.origin_city_name || "Jakarta Pusat";
     const mengantarApiKey = store.mengantar_api_key;
+    const defaultWeight = store.default_weight || 1000;
     const aiPromptSystem = store.ai_prompt_system;
     const greetingMessage = store.greeting_message;
 
@@ -79,6 +80,7 @@ export async function POST(req: Request) {
       originSubdistrictId,
       originCityName,
       mengantarApiKey,
+      defaultWeight,
       products,
       chatHistory: conversation?.messages || []
     });

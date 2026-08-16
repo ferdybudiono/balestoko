@@ -54,8 +54,8 @@ export default function DashboardPage() {
   const [toast, setToast] = useState<{ msg: string; type: "success" | "error" } | null>(null);
 
   // User State
-  const [userEmail, setUserEmail] = useState("demo@balestoko.com");
-  const [isPaid, setIsPaid] = useState(true);
+  const [userEmail, setUserEmail] = useState("");
+  const [isPaid, setIsPaid] = useState(false);
   const [trialEndsAt, setTrialEndsAt] = useState<string | null>(null);
 
   // Store Configuration State
@@ -176,6 +176,13 @@ export default function DashboardPage() {
       }
       if (res.ok) {
         const data = await res.json();
+        if (!data.store) {
+          // Session valid tapi belum ada record toko (akun belum aktif / belum
+          // menyelesaikan pembayaran). Arahkan ke login agar tidak menampilkan
+          // dashboard kosong yang menyesatkan.
+          router.push("/login");
+          return;
+        }
         if (data.store) {
           setStoreId(data.store.id || "");
           setUserEmail(data.store.email || "");

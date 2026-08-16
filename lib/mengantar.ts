@@ -31,53 +31,106 @@ const MOCK_LOCATIONS: MengantarLocation[] = [
   { id: "7371010", subdistrict_name: "Ujung Pandang", district_name: "Ujung Pandang", city_name: "Makassar", province_name: "Sulawesi Selatan", zip_code: "90111" }
 ];
 
+/** Base URL API Mengantar (bisa dioverride via ENV untuk sandbox/testing). */
+const MENGANTAR_BASE_URL = (process.env.MENGANTAR_BASE_URL || "https://api-public.mengantar.com").replace(/\/+$/, "");
+
 /**
- * Cari lokasi kecamatan / kota berdasarkan kata kunci
+ * Segmen {API_KEY} pada path Mengantar. Route `address/search` TIDAK memvalidasi
+ * key (bagian dari legacy system per dokumentasi), sehingga placeholder "public"
+ * tetap berfungsi bila toko belum punya API key sendiri.
+ */
+function mengantarKeyPath(apiKey?: string): string {
+  const key = (apiKey || process.env.MENGANTAR_API_KEY || "public").trim() || "public";
+  return encodeURIComponent(key);
+}
+
+/** Nama ekspedisi ramah-tampilan dari kode kurir Mengantar (allEstimatePublic). */
+const COURIER_NAMES: Record<string, string> = {
+  JNE: "JNE", JNECargo: "JNE Cargo",
+  SiCepat: "SiCepat", SiCepatCargo: "SiCepat Cargo",
+  Sap: "SAP Express", SAP: "SAP Express", SapCargo: "SAP Cargo", SAPLite: "SAP Lite",
+  iDexpress: "ID Express", iDexpressCargo: "ID Express Cargo", iDlite: "ID Lite",
+  JT: "J&T Express", Ninja: "Ninja Xpress", lion: "Lion Parcel",
+  anteraja: "AnterAja", paxel: "Paxel", pos: "POS Indonesia"
+};
+
+/** ALL CAPS dari API → Title Case yang enak dibaca di WhatsApp. */
+function toTitleCase(s: string): string {
+  return s.toLowerCase().replace(/\b([a-z])/g, (m) => m.toUpperCase()).trim();
+}
+
+/** Ubah objek `data` (dikunci per kurir) dari allEstimatePublic → daftar ShippingOption. */
+function mapEstimateData(data: Record<string, unknown>): ShippingOption[] {
+  const options: ShippingOption[] = [];
+  for (const [key, raw] of Object.entries(data)) {
+    if (!raw || typeof raw !== "object") continue;
+    const v = raw as Record<string, unknown>;
+    const price = Number(v.price) || 0;
+    if (v.unsupported === true || price <= 0) continue;
+
+    const deliv = String(v.estimate_delivery || "").trim();
+    const etd = deliv && deliv !== "-" ? deliv : (String(v.estimatedDate || "").trim() || "1-3 hari");
+
+    options.push({
+      courier_code: key.toLowerCase(),
+      courier_name: COURIER_NAMES[key] || key,
+      service_name: key.toLowerCase().includes("cargo") ? "Cargo" : "Reguler",
+      etd,
+      cost: price
+    });
+  }
+  options.sort((a, b) => a.cost - b.cost);
+  return options;
+}
+
+/**
+ * Cari lokasi kecamatan / kota berdasarkan kata kunci.
+ * Endpoint asli: GET {BASE}/api/public/{API_KEY}/address/search?keyword=...
+ * `id` yang dikembalikan adalah `_id` Mengantar — dipakai sebagai origin_id/
+ * destination_id saat menghitung ongkir.
  */
 export async function searchMengantarLocation(
   query: string,
   apiKey?: string
 ): Promise<MengantarLocation[]> {
-  const clean = query.trim().toLowerCase();
+  const clean = query.trim();
   if (!clean) return [];
 
-  const effectiveApiKey = apiKey || process.env.MENGANTAR_API_KEY;
+  // 1. Panggil Live API Mengantar (key tidak divalidasi untuk route ini).
+  try {
+    const url = `${MENGANTAR_BASE_URL}/api/public/${mengantarKeyPath(apiKey)}/address/search?keyword=${encodeURIComponent(clean)}`;
+    const res = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
 
-  // 1. Coba panggil Live API Mengantar jika apiKey ada
-  if (effectiveApiKey && effectiveApiKey !== "demo") {
-    try {
-      const res = await fetch(`https://api-public.mengantar.com/v1/locations/search?q=${encodeURIComponent(clean)}`, {
-        headers: {
-          Authorization: `Bearer ${effectiveApiKey}`,
-          "Content-Type": "application/json"
-        },
-        cache: "no-store"
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data && Array.isArray(data.data)) {
-          return data.data.map((loc: Record<string, unknown>) => ({
-            id: String(loc.id || loc.subdistrict_id),
-            subdistrict_name: String(loc.subdistrict_name || loc.name || ""),
-            district_name: String(loc.district_name || ""),
-            city_name: String(loc.city_name || loc.city || ""),
-            province_name: String(loc.province_name || loc.province || ""),
-            zip_code: loc.zip_code ? String(loc.zip_code) : undefined
-          }));
-        }
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.success && Array.isArray(data.data) && data.data.length > 0) {
+        const mapped = data.data
+          .slice(0, 15)
+          .map((loc: Record<string, unknown>) => ({
+            id: String(loc._id || loc.DESTINATION_CODE || ""),
+            subdistrict_name: toTitleCase(String(loc.SUBDISTRICT_NAME || "")),
+            district_name: toTitleCase(String(loc.DISTRICT_NAME || "")),
+            city_name: toTitleCase(String(loc.CITY_NAME || loc.CITY_NAME_SI || "")),
+            province_name: toTitleCase(String(loc.PROVINCE_NAME || "")),
+            zip_code: loc.ZIP_CODE ? String(loc.ZIP_CODE) : undefined
+          }))
+          .filter((l: MengantarLocation) => l.id);
+        if (mapped.length > 0) return mapped;
       }
-    } catch (err) {
-      console.warn("[mengantar] API search failed, falling back to mock search:", err);
+    } else {
+      console.warn(`[mengantar] address/search HTTP ${res.status}`);
     }
+  } catch (err) {
+    console.warn("[mengantar] address/search gagal, fallback ke mock:", err);
   }
 
   // 2. Mock Fallback Search
+  const lc = clean.toLowerCase();
   const filtered = MOCK_LOCATIONS.filter(
     (loc) =>
-      loc.city_name.toLowerCase().includes(clean) ||
-      loc.subdistrict_name.toLowerCase().includes(clean) ||
-      loc.province_name.toLowerCase().includes(clean)
+      loc.city_name.toLowerCase().includes(lc) ||
+      loc.subdistrict_name.toLowerCase().includes(lc) ||
+      loc.province_name.toLowerCase().includes(lc)
   );
 
   if (filtered.length > 0) return filtered;
@@ -85,10 +138,10 @@ export async function searchMengantarLocation(
   // Jika tidak ditemukan di mock hardcode, hasilkan dinamis agar fleksibel
   return [
     {
-      id: "99999" + clean.length,
-      subdistrict_name: query.trim(),
-      district_name: query.trim(),
-      city_name: query.trim(),
+      id: "99999" + lc.length,
+      subdistrict_name: clean,
+      district_name: clean,
+      city_name: clean,
       province_name: "Indonesia",
       zip_code: "40000"
     }
@@ -105,42 +158,35 @@ export async function calculateMengantarOngkir(params: {
   couriers?: string[];
   apiKey?: string;
 }): Promise<ShippingOption[]> {
-  const { originSubdistrictId, destinationSubdistrictId, weightGram, apiKey } = params;
-  const weightKg = Math.max(1, Math.ceil(weightGram / 1000));
-  const effectiveApiKey = apiKey || process.env.MENGANTAR_API_KEY;
+  const { originSubdistrictId, destinationSubdistrictId, weightGram } = params;
+  const weightKg = Math.max(1, Math.ceil((weightGram || 1000) / 1000));
 
-  // 1. Coba panggil Live Mengantar API jika apiKey diset
-  if (effectiveApiKey && effectiveApiKey !== "demo") {
+  // 1. Panggil Live API Mengantar: allEstimatePublic mengembalikan tarif semua
+  //    kurir sekaligus dan bersifat publik (tanpa {API_KEY} di path), sehingga
+  //    Cek Ongkir tetap live meski toko belum punya API key sendiri.
+  //    origin_id / destination_id HARUS berupa `_id` Mengantar (dari address/search).
+  //    Satuan `weight` adalah KILOGRAM (bukan gram).
+  if (originSubdistrictId && destinationSubdistrictId) {
     try {
-      const res = await fetch("https://api-public.mengantar.com/v1/shipping/rates", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${effectiveApiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          origin_id: originSubdistrictId,
-          destination_id: destinationSubdistrictId,
-          weight: weightGram,
-          couriers: params.couriers || ["jne", "jnt", "sicepat", "pos"]
-        }),
-        cache: "no-store"
+      const qs = new URLSearchParams({
+        origin_id: String(originSubdistrictId),
+        destination_id: String(destinationSubdistrictId),
+        weight: String(weightKg)
       });
+      const url = `${MENGANTAR_BASE_URL}/api/order/allEstimatePublic?${qs.toString()}`;
+      const res = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
 
       if (res.ok) {
         const data = await res.json();
-        if (data && Array.isArray(data.rates)) {
-          return data.rates.map((item: Record<string, unknown>) => ({
-            courier_code: String(item.courier_code || item.code || "KURIR"),
-            courier_name: String(item.courier_name || item.name || "Ekspedisi"),
-            service_name: String(item.service_name || item.service || "Regular"),
-            etd: String(item.etd || item.estimated || "1-3 hari"),
-            cost: Number(item.cost || item.price || 15000)
-          }));
+        if (data?.success && data.data && typeof data.data === "object") {
+          const options = mapEstimateData(data.data as Record<string, unknown>);
+          if (options.length > 0) return options;
         }
+      } else {
+        console.warn(`[mengantar] allEstimatePublic HTTP ${res.status}`);
       }
     } catch (err) {
-      console.warn("[mengantar] API rates failed, using calculated mock rates:", err);
+      console.warn("[mengantar] allEstimatePublic gagal, pakai tarif simulasi:", err);
     }
   }
 

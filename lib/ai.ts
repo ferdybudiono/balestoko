@@ -20,6 +20,8 @@ export interface AIProcessParams {
   originSubdistrictId?: string;
   originCityName?: string;
   mengantarApiKey?: string;
+  /** Berat default (gram) dari pengaturan toko; dipakai bila berat produk tidak diketahui. */
+  defaultWeight?: number;
   products?: Array<{ name: string; price: number; weight: number; description?: string }>;
   chatHistory?: ChatMessage[];
 }
@@ -99,6 +101,7 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     originSubdistrictId = "3171010",
     originCityName = "Jakarta Pusat",
     mengantarApiKey,
+    defaultWeight = 1000,
     products = [],
     chatHistory = []
   } = params;
@@ -115,13 +118,27 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     lowerMsg.includes("kecamatan") ||
     lowerMsg.includes("kota");
 
+  const isProductQuery =
+    lowerMsg.includes("harga") ||
+    lowerMsg.includes("produk") ||
+    lowerMsg.includes("jual") ||
+    lowerMsg.includes("barang") ||
+    lowerMsg.includes("stok") ||
+    lowerMsg.includes("rincian") ||
+    lowerMsg.includes("katalog");
+
+  // Sapaan: pesan pertama, "ping" khas WA ("p"/"pp"), atau diawali kata sapaan.
+  // (Dulu memakai startsWith("p") yang keliru menyapa pesan seperti "produk apa".)
+  const greetingWords = [
+    "halo", "hallo", "hai", "hi", "hei", "assalam", "pagi", "siang",
+    "sore", "malam", "selamat", "permisi", "spam"
+  ];
+  const firstWord = lowerMsg.split(/\s+/)[0] || "";
+  const isPing = lowerMsg === "p" || lowerMsg === "pp";
   const isGreetingQuery =
     chatHistory.length === 0 ||
-    lowerMsg.startsWith("halo") ||
-    lowerMsg.startsWith("hi") ||
-    lowerMsg.startsWith("p") ||
-    lowerMsg.startsWith("selamat") ||
-    lowerMsg.includes("permisi");
+    isPing ||
+    greetingWords.some((w) => firstWord === w || lowerMsg.startsWith(w + " "));
 
   // Eksplorasi Kota/Kecamatan dari teks pesan
   let targetLocationQuery = "";
@@ -158,8 +175,9 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     const destName = destLoc ? `${destLoc.subdistrict_name}, ${destLoc.city_name}` : targetLocationQuery;
     const destId = destLoc ? destLoc.id : "3273010";
 
-    // Hitung berat default dari produk jika ada
-    const totalWeight = products.length > 0 ? products[0].weight : 1000;
+    // Berat estimasi: pakai berat produk bila ada, jika tidak pakai berat default
+    // toko yang diatur di dashboard (bukan lagi hardcode 1 kg).
+    const totalWeight = products.length > 0 ? products[0].weight : (defaultWeight || 1000);
 
     const rates = await calculateMengantarOngkir({
       originSubdistrictId,
@@ -178,24 +196,8 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     };
   }
 
-  // 2. Jika Pesan adalah Sapaan Awal
-  if (isGreetingQuery) {
-    const defaultGreeting = greetingMessage || `Halo! Selamat datang di *${storeName}* 👋 Ada yang bisa kami bantu mengenai produk kami atau mau langsung cek tarif ongkir ke lokasi Kakak?`;
-    return {
-      replyText: defaultGreeting,
-      intent: "GREETING"
-    };
-  }
-
-  // 3. Deteksi Pertanyaan Produk / Katalog
-  const isProductQuery =
-    lowerMsg.includes("harga") ||
-    lowerMsg.includes("produk") ||
-    lowerMsg.includes("jual") ||
-    lowerMsg.includes("barang") ||
-    lowerMsg.includes("stok") ||
-    lowerMsg.includes("rincian");
-
+  // 2. Deteksi Pertanyaan Produk / Katalog (didahulukan dari sapaan agar
+  //    pertanyaan eksplisit seperti "harga produk?" langsung dibalas katalog).
   if (isProductQuery && products.length > 0) {
     let prodText = `🛍️ *Katalog Produk - ${storeName}*\n\n`;
     products.forEach((p, idx) => {
@@ -210,6 +212,15 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     return {
       replyText: prodText,
       intent: "PRODUCT_INQUIRY"
+    };
+  }
+
+  // 3. Jika Pesan adalah Sapaan Awal
+  if (isGreetingQuery) {
+    const defaultGreeting = greetingMessage || `Halo! Selamat datang di *${storeName}* 👋 Ada yang bisa kami bantu mengenai produk kami atau mau langsung cek tarif ongkir ke lokasi Kakak?`;
+    return {
+      replyText: defaultGreeting,
+      intent: "GREETING"
     };
   }
 
