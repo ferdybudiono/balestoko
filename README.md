@@ -43,6 +43,10 @@ cp .env.example .env.local
 | `NEXT_PUBLIC_SUPABASE_URL` | URL project Supabase. |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service Role key Supabase (**server-only**, jangan diekspos!). |
 | `NEXT_PUBLIC_BASE_URL` | Base URL publik aplikasi (untuk callback Snap). |
+| `AUTH_SECRET` | Kunci HMAC penandatangan session login. **Wajib di produksi.** |
+| `FONNTE_TOKEN` | Account Token Fonnte (untuk provisioning device per toko). |
+| `FONNTE_WEBHOOK_SECRET` | Shared secret pelindung `/api/fonnte/webhook`. **Sangat disarankan di produksi** — tanpa ini endpoint terbuka dan bisa dipakai sebagai relay spam. |
+| `GEMINI_API_KEY` | API key Gemini untuk balasan AI. |
 
 > 🔑 Ambil kunci Midtrans di **Dashboard → Settings → Access Keys**.
 > Ambil kunci Supabase di **Project Settings → API**.

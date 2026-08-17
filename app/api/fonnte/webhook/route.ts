@@ -1,15 +1,41 @@
 import { NextResponse } from "next/server";
-import { getStoreByFonnteToken, getStoreByDevicePhone, getProductsByStoreId, getConversation, saveConversationMessage, isStoreActive } from "@/lib/supabase";
-import { processAICustomerService } from "@/lib/ai";
-import { sendFonnteMessage } from "@/lib/fonnte";
+import { getStoreByFonnteToken, getStoreByDevicePhone, isStoreActive } from "@/lib/supabase";
+import { checkRateLimit, runAutoReply } from "@/lib/reply-engine";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * Fonnte Webhook Receiver Endpoint
- * URL untuk Fonnte Dashboard: https://DOMAIN-ANDA.vercel.app/api/fonnte/webhook
+ * Penerima webhook Fonnte.
+ * URL untuk dashboard Fonnte: https://DOMAIN-ANDA/api/fonnte/webhook?secret=XXX
+ *
+ * KEAMANAN — endpoint ini menerima pesan dari internet publik dan setiap
+ * pemanggilan memicu Gemini + pengiriman WhatsApp berbayar ke nomor yang ada
+ * di payload. Tanpa verifikasi, siapa pun yang tahu nomor device sebuah toko
+ * bisa memakainya sebagai relay spam.
+ *
+ * Set `FONNTE_WEBHOOK_SECRET` di environment, lalu tambahkan `?secret=NILAI`
+ * pada URL webhook di dashboard Fonnte. Selama variabel itu belum diisi,
+ * request tetap diterima (agar deployment lama tidak mati) namun dicatat
+ * sebagai peringatan di log.
  */
+function verifyWebhookSecret(req: Request, body: Record<string, unknown>): boolean {
+  const expected = process.env.FONNTE_WEBHOOK_SECRET;
+  if (!expected) {
+    console.warn(
+      "[fonnte webhook] FONNTE_WEBHOOK_SECRET belum diatur — endpoint ini TERBUKA. " +
+        "Isi variabel tersebut lalu tambahkan ?secret=... pada URL webhook di dashboard Fonnte."
+    );
+    return true;
+  }
+  const url = new URL(req.url);
+  const provided =
+    url.searchParams.get("secret") ||
+    req.headers.get("x-webhook-secret") ||
+    String(body.secret || "");
+  return provided === expected;
+}
+
 export async function POST(req: Request) {
   let body: Record<string, unknown>;
   try {
@@ -24,7 +50,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Gagal membaca body request." }, { status: 400 });
   }
 
-  // Fonnte payload parameters
+  if (!verifyWebhookSecret(req, body)) {
+    console.warn("[fonnte webhook] secret tidak valid, request ditolak.");
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
+  // Parameter payload Fonnte
   const sender = String(body.sender || body.from || body.phone || "");
   const messageText = String(body.message || body.text || "");
   // `device` = NOMOR device penerima (payload webhook Fonnte TIDAK memuat token).
@@ -58,68 +89,28 @@ export async function POST(req: Request) {
       return NextResponse.json({ status: "ignored", reason: "Store inactive or trial expired" });
     }
 
-    const storeName = store.store_name || "Toko Bot WA CS AI";
-    const storeId = store.id || "";
-    const originSubdistrictId = store.origin_subdistrict_id || "3171010";
-    const originCityName = store.origin_city_name || "Jakarta Pusat";
-    const mengantarApiKey = store.mengantar_api_key;
-    const defaultWeight = store.default_weight || 1000;
-    const aiPromptSystem = store.ai_prompt_system;
-    const greetingMessage = store.greeting_message;
-
-    // 2. Ambil katalog produk & riwayat chat pembeli dari Supabase
-    const products = storeId ? await getProductsByStoreId(storeId) : [];
-    const conversation = await getConversation(storeId, sender);
-
-    // 3. Olah pesan dengan AI CS Engine (Greeting -> Ongkir Mengantar -> Produk)
-    const aiResult = await processAICustomerService({
-      messageText,
-      storeName,
-      aiPromptSystem,
-      greetingMessage,
-      originSubdistrictId,
-      originCityName,
-      mengantarApiKey,
-      defaultWeight,
-      products,
-      chatHistory: conversation?.messages || []
-    });
-
-    // 4. Kirim balasan WhatsApp ke pembeli lewat device token milik toko.
-    const activeFonnteToken = store.fonnte_token || process.env.FONNTE_TOKEN;
-    if (activeFonnteToken) {
-      const sent = await sendFonnteMessage({
-        target: sender,
-        message: aiResult.replyText,
-        token: activeFonnteToken
-      });
-      if (!sent.success) {
-        console.warn("[fonnte webhook] gagal mengirim balasan:", sent.error);
-      }
-    } else {
-      console.log("[fonnte webhook simulated reply]:", aiResult.replyText);
-    }
-
-    // 5. Simpan riwayat percakapan ke Supabase DB
-    if (storeId) {
-      await saveConversationMessage(
-        storeId,
-        sender,
-        messageText,
-        aiResult.replyText,
-        aiResult.intent,
-        aiResult.detectedCity
+    // Bendung banjir pesan dari satu nomor (termasuk loop balasan antar-bot).
+    const rate = checkRateLimit(store.id || deviceNumber, sender);
+    if (!rate.ok) {
+      console.warn(`[fonnte webhook] batas laju tercapai untuk ${sender}, pesan diabaikan.`);
+      return NextResponse.json(
+        { status: "ignored", reason: "Rate limited" },
+        { status: 429, headers: { "Retry-After": String(rate.retryAfterSec) } }
       );
     }
+
+    const outcome = await runAutoReply({ store, sender, messageText });
 
     return NextResponse.json({
       success: true,
       sender,
-      intent: aiResult.intent,
-      reply: aiResult.replyText
+      intent: outcome.intent,
+      reply: outcome.replyText,
+      delivered: outcome.delivered
     });
   } catch (err) {
     console.error("[fonnte webhook error]:", err);
-    return NextResponse.json({ error: String(err) }, { status: 500 });
+    // Jangan bocorkan detail internal ke pemanggil publik.
+    return NextResponse.json({ error: "Gagal memproses pesan." }, { status: 500 });
   }
 }

@@ -353,18 +353,74 @@ export async function insertProduct(product: Omit<ProductRecord, "id">): Promise
   }
 }
 
-export async function deleteProduct(productId: string): Promise<DbResult> {
+/**
+ * Update produk, DIBATASI ke produk milik `storeId`.
+ * Filter store_id ada di query, jadi PostgREST sendiri yang menegakkan
+ * kepemilikan — tidak perlu fetch-lalu-cek (yang rawan race).
+ * Mengembalikan ok:false + notFound bila tidak ada baris yang cocok.
+ */
+export async function updateProduct(
+  productId: string,
+  storeId: string,
+  patch: Partial<Omit<ProductRecord, "id" | "store_id">>
+): Promise<DbResult<ProductRecord> & { notFound?: boolean }> {
   const cfg = getConfig();
   if (!cfg) return { ok: false, skipped: true };
+  if (!productId || !storeId) return { ok: false, error: "ID produk / toko kosong." };
 
   try {
-    const res = await fetch(`${cfg.url}/rest/v1/products?id=eq.${encodeURIComponent(productId)}`, {
+    const url = `${cfg.url}/rest/v1/products?id=eq.${encodeURIComponent(
+      productId
+    )}&store_id=eq.${encodeURIComponent(storeId)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify(patch),
+      cache: "no-store"
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `product update ${res.status}: ${text}` };
+    }
+
+    const data = await res.json();
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) return { ok: false, notFound: true, error: "Produk tidak ditemukan." };
+    return { ok: true, data: row as ProductRecord };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Hapus produk, DIBATASI ke produk milik `storeId` (kepemilikan via query). */
+export async function deleteProduct(
+  productId: string,
+  storeId: string
+): Promise<DbResult & { notFound?: boolean }> {
+  const cfg = getConfig();
+  if (!cfg) return { ok: false, skipped: true };
+  if (!productId || !storeId) return { ok: false, error: "ID produk / toko kosong." };
+
+  try {
+    const url = `${cfg.url}/rest/v1/products?id=eq.${encodeURIComponent(
+      productId
+    )}&store_id=eq.${encodeURIComponent(storeId)}`;
+    const res = await fetch(url, {
       method: "DELETE",
       headers: headers(cfg.key, "return=representation"),
       cache: "no-store"
     });
 
-    return { ok: res.ok };
+    if (!res.ok) return { ok: false, error: `product delete ${res.status}` };
+
+    // `return=representation` memberi array baris yang benar-benar terhapus:
+    // kosong berarti produk bukan milik toko ini (atau sudah hilang).
+    const data = await res.json().catch(() => []);
+    if (Array.isArray(data) && data.length === 0) {
+      return { ok: false, notFound: true, error: "Produk tidak ditemukan." };
+    }
+    return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err) };
   }

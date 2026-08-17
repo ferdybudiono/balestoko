@@ -44,6 +44,18 @@ body {
   }
 }
 
+/* Sembunyikan scrollbar pada strip tab yang digeser horizontal di mobile —
+   scroll tetap berfungsi, hanya batangnya yang tidak menambah tinggi baris. */
+@layer utilities {
+  .scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 /* Hormati preferensi reduce-motion */
 @media (prefers-reduced-motion: reduce) {
   *,

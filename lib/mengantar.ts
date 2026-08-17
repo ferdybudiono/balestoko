@@ -18,6 +18,35 @@ export interface ShippingOption {
   service_name: string;
   etd: string; // Estimasi Tiba (misal: "1-2 hari")
   cost: number; // Dalam IDR Rupiah
+  /**
+   * Layanan Cargo yang berat kirimannya di bawah minimum, jadi tarifnya adalah
+   * tarif minimum (tidak proporsional dengan berat sebenarnya).
+   */
+  belowMinimumWeight?: boolean;
+}
+
+/**
+ * Asal data: `live` = benar-benar dari API Mengantar, `mock` = hasil simulasi
+ * lokal karena API gagal / origin-destination belum berupa `_id` Mengantar.
+ *
+ * Ini WAJIB dipropagasi ke atas: tarif `mock` tidak boleh disajikan ke pembeli
+ * (atau ke pemilik toko di dashboard) seolah-olah tarif kurir sungguhan.
+ */
+export type RateSource = "live" | "mock";
+
+export interface LocationSearchResult {
+  locations: MengantarLocation[];
+  source: RateSource;
+}
+
+export interface OngkirResult {
+  rates: ShippingOption[];
+  source: RateSource;
+}
+
+/** `_id` Mengantar berupa ObjectId 24 karakter hex. Selain itu bukan ID asli. */
+export function isMengantarId(id?: string | null): boolean {
+  return /^[a-f0-9]{24}$/i.test((id || "").trim());
 }
 
 // Data lokasi bawaan untuk fallback jika API Mengantar belum dihubungkan
@@ -59,24 +88,75 @@ function toTitleCase(s: string): string {
   return s.toLowerCase().replace(/\b([a-z])/g, (m) => m.toUpperCase()).trim();
 }
 
-/** Ubah objek `data` (dikunci per kurir) dari allEstimatePublic → daftar ShippingOption. */
-function mapEstimateData(data: Record<string, unknown>): ShippingOption[] {
+/**
+ * Normalisasi estimasi tiba ke bahasa Indonesia.
+ *
+ * `estimate_delivery` dari API tidak konsisten — nilai nyata yang pernah muncul:
+ * "1 - 2 days", "2 - 3 Days", "2 - 4 days", "2-4 Day", "1 - 2 Hari", "4 HARI",
+ * dan "-". Menampilkannya apa adanya membuat pesan berbahasa Indonesia
+ * bercampur "days"/"Day"/"HARI".
+ */
+function normalizeEtd(raw: unknown, fallback: unknown): string {
+  const pick = (v: unknown): string => {
+    const s = String(v ?? "").trim();
+    return s && s !== "-" ? s : "";
+  };
+  const src = pick(raw) || pick(fallback);
+  if (!src) return "1-3 hari";
+
+  const norm = src
+    .toLowerCase()
+    .replace(/\bdays?\b/g, "hari")
+    .replace(/\s*-\s*/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return /hari/.test(norm) ? norm : `${norm} hari`;
+}
+
+/**
+ * Ubah objek `data` (dikunci per kurir) dari allEstimatePublic → daftar ShippingOption.
+ *
+ * `weightKg` dipakai untuk menandai layanan Cargo yang berat minimumnya belum
+ * terpenuhi. Layanan itu TIDAK dibuang: pada 1 kg cargo memang mahal (kena
+ * tarif minimum), tapi pada 8 kg justru bisa lebih murah dari reguler — jadi
+ * lebih jujur menampilkannya dengan keterangan minimum daripada
+ * menyembunyikan opsi termurah.
+ */
+function mapEstimateData(data: Record<string, unknown>, weightKg: number): ShippingOption[] {
   const options: ShippingOption[] = [];
   for (const [key, raw] of Object.entries(data)) {
     if (!raw || typeof raw !== "object") continue;
     const v = raw as Record<string, unknown>;
+
+    // CATATAN SENGAJA: pakai `price` (tarif normal), BUKAN
+    // `estimatedSpecialPrice`. Field diskon itu tidak bisa dipercaya — pernah
+    // terlihat SiCepatCargo price=40000 tapi estimatedSpecialPrice=8400
+    // (nilai milik SiCepat reguler). Mengutip angka itu ke pembeli membuat
+    // toko menanggung selisihnya.
     const price = Number(v.price) || 0;
     if (v.unsupported === true || price <= 0) continue;
 
-    const deliv = String(v.estimate_delivery || "").trim();
-    const etd = deliv && deliv !== "-" ? deliv : (String(v.estimatedDate || "").trim() || "1-3 hari");
+    const isCargo = key.toLowerCase().includes("cargo");
+    const minCargo = Number(v.minimumWeightCargo) || 0;
+
+    let serviceName: string;
+    if (isCargo) {
+      serviceName = minCargo > 0 ? `Cargo (min. ${minCargo} kg)` : "Cargo";
+    } else if (key.toLowerCase().includes("lite")) {
+      serviceName = "Lite";
+    } else {
+      serviceName = "Reguler";
+    }
 
     options.push({
       courier_code: key.toLowerCase(),
       courier_name: COURIER_NAMES[key] || key,
-      service_name: key.toLowerCase().includes("cargo") ? "Cargo" : "Reguler",
-      etd,
-      cost: price
+      service_name: serviceName,
+      etd: normalizeEtd(v.estimate_delivery, v.estimatedDate),
+      cost: price,
+      // Tarif minimum belum terpenuhi → harga tidak proporsional dengan berat.
+      belowMinimumWeight: isCargo && minCargo > 0 && weightKg < minCargo
     });
   }
   options.sort((a, b) => a.cost - b.cost);
@@ -92,9 +172,9 @@ function mapEstimateData(data: Record<string, unknown>): ShippingOption[] {
 export async function searchMengantarLocation(
   query: string,
   apiKey?: string
-): Promise<MengantarLocation[]> {
+): Promise<LocationSearchResult> {
   const clean = query.trim();
-  if (!clean) return [];
+  if (!clean) return { locations: [], source: "live" };
 
   // 1. Panggil Live API Mengantar (key tidak divalidasi untuk route ini).
   try {
@@ -115,7 +195,7 @@ export async function searchMengantarLocation(
             zip_code: loc.ZIP_CODE ? String(loc.ZIP_CODE) : undefined
           }))
           .filter((l: MengantarLocation) => l.id);
-        if (mapped.length > 0) return mapped;
+        if (mapped.length > 0) return { locations: mapped, source: "live" };
       }
     } else {
       console.warn(`[mengantar] address/search HTTP ${res.status}`);
@@ -124,7 +204,8 @@ export async function searchMengantarLocation(
     console.warn("[mengantar] address/search gagal, fallback ke mock:", err);
   }
 
-  // 2. Mock Fallback Search
+  // 2. Mock Fallback Search — DITANDAI `source: "mock"` supaya pemanggil bisa
+  //    memberi tahu user bahwa ID ini bukan ID Mengantar asli (ongkir simulasi).
   const lc = clean.toLowerCase();
   const filtered = MOCK_LOCATIONS.filter(
     (loc) =>
@@ -133,19 +214,22 @@ export async function searchMengantarLocation(
       loc.province_name.toLowerCase().includes(lc)
   );
 
-  if (filtered.length > 0) return filtered;
+  if (filtered.length > 0) return { locations: filtered, source: "mock" };
 
   // Jika tidak ditemukan di mock hardcode, hasilkan dinamis agar fleksibel
-  return [
-    {
-      id: "99999" + lc.length,
-      subdistrict_name: clean,
-      district_name: clean,
-      city_name: clean,
-      province_name: "Indonesia",
-      zip_code: "40000"
-    }
-  ];
+  return {
+    locations: [
+      {
+        id: "99999" + lc.length,
+        subdistrict_name: clean,
+        district_name: clean,
+        city_name: clean,
+        province_name: "Indonesia",
+        zip_code: "40000"
+      }
+    ],
+    source: "mock"
+  };
 }
 
 /**
@@ -157,16 +241,17 @@ export async function calculateMengantarOngkir(params: {
   weightGram: number; // Dalam gram
   couriers?: string[];
   apiKey?: string;
-}): Promise<ShippingOption[]> {
+}): Promise<OngkirResult> {
   const { originSubdistrictId, destinationSubdistrictId, weightGram } = params;
   const weightKg = Math.max(1, Math.ceil((weightGram || 1000) / 1000));
 
   // 1. Panggil Live API Mengantar: allEstimatePublic mengembalikan tarif semua
   //    kurir sekaligus dan bersifat publik (tanpa {API_KEY} di path), sehingga
   //    Cek Ongkir tetap live meski toko belum punya API key sendiri.
-  //    origin_id / destination_id HARUS berupa `_id` Mengantar (dari address/search).
+  //    origin_id / destination_id HARUS berupa `_id` Mengantar (dari address/search);
+  //    kalau bukan, API pasti gagal — jadi jangan buang waktu memanggilnya.
   //    Satuan `weight` adalah KILOGRAM (bukan gram).
-  if (originSubdistrictId && destinationSubdistrictId) {
+  if (isMengantarId(originSubdistrictId) && isMengantarId(destinationSubdistrictId)) {
     try {
       const qs = new URLSearchParams({
         origin_id: String(originSubdistrictId),
@@ -179,8 +264,8 @@ export async function calculateMengantarOngkir(params: {
       if (res.ok) {
         const data = await res.json();
         if (data?.success && data.data && typeof data.data === "object") {
-          const options = mapEstimateData(data.data as Record<string, unknown>);
-          if (options.length > 0) return options;
+          const options = mapEstimateData(data.data as Record<string, unknown>, weightKg);
+          if (options.length > 0) return { rates: options, source: "live" };
         }
       } else {
         console.warn(`[mengantar] allEstimatePublic HTTP ${res.status}`);
@@ -199,34 +284,37 @@ export async function calculateMengantarOngkir(params: {
 
   const totalBase = baseRate + Math.min(25000, Math.floor(distanceMultiplier / 500) * 1500);
 
-  return [
-    {
-      courier_code: "jne",
-      courier_name: "JNE Express",
-      service_name: "REG (Reguler)",
-      etd: "1-2 hari",
-      cost: totalBase * weightKg
-    },
-    {
-      courier_code: "jnt",
-      courier_name: "J&T Express",
-      service_name: "EZ",
-      etd: "1-3 hari",
-      cost: (totalBase - 1000) * weightKg
-    },
-    {
-      courier_code: "sicepat",
-      courier_name: "SiCepat Ekspres",
-      service_name: "SIUNTUNG",
-      etd: "1-2 hari",
-      cost: (totalBase + 1000) * weightKg
-    },
-    {
-      courier_code: "pos",
-      courier_name: "Pos Indonesia",
-      service_name: "Pos Kilat Khusus",
-      etd: "2-4 hari",
-      cost: Math.max(9000, (totalBase - 3000) * weightKg)
-    }
-  ];
+  return {
+    source: "mock",
+    rates: [
+      {
+        courier_code: "jne",
+        courier_name: "JNE Express",
+        service_name: "REG (Reguler)",
+        etd: "1-2 hari",
+        cost: totalBase * weightKg
+      },
+      {
+        courier_code: "jnt",
+        courier_name: "J&T Express",
+        service_name: "EZ",
+        etd: "1-3 hari",
+        cost: (totalBase - 1000) * weightKg
+      },
+      {
+        courier_code: "sicepat",
+        courier_name: "SiCepat Ekspres",
+        service_name: "SIUNTUNG",
+        etd: "1-2 hari",
+        cost: (totalBase + 1000) * weightKg
+      },
+      {
+        courier_code: "pos",
+        courier_name: "Pos Indonesia",
+        service_name: "Pos Kilat Khusus",
+        etd: "2-4 hari",
+        cost: Math.max(9000, (totalBase - 3000) * weightKg)
+      }
+    ]
+  };
 }

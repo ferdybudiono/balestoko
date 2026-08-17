@@ -12,7 +12,13 @@ function resolveWebhookUrl(req: Request): string {
     process.env.NEXT_PUBLIC_BASE_URL ||
     req.headers.get("origin") ||
     new URL(req.url).origin;
-  return `${base.replace(/\/+$/, "")}/api/fonnte/webhook`;
+  const url = `${base.replace(/\/+$/, "")}/api/fonnte/webhook`;
+  // Sertakan shared secret bila dikonfigurasi. Webhook menolak request tanpa
+  // secret yang benar, jadi tanpa ini device tidak akan bisa mengirim pesan.
+  // Karena URL webhook disinkronkan otomatis (idempoten, lihat di bawah),
+  // device lama ikut diperbarui saat user membuka tab WhatsApp berikutnya.
+  const secret = process.env.FONNTE_WEBHOOK_SECRET;
+  return secret ? `${url}?secret=${encodeURIComponent(secret)}` : url;
 }
 
 /**

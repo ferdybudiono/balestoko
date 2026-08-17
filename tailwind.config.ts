@@ -7,6 +7,11 @@ const config: Config = {
   ],
   theme: {
     extend: {
+      screens: {
+        // Ponsel kecil (≤360px) — dipakai untuk menyembunyikan label sekunder
+        // di header dashboard tanpa mengubah breakpoint bawaan Tailwind.
+        xs: "400px",
+      },
       colors: {
         // Brand green (WhatsApp-adjacent, but a touch more refined)
         brand: {

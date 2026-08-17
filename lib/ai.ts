@@ -4,7 +4,7 @@
  * Handles Buyer Greeting -> Location Extraction -> Mengantar Ongkir Calculation -> Conversational Chat
  */
 
-import { calculateMengantarOngkir, searchMengantarLocation, ShippingOption } from "./mengantar";
+import { calculateMengantarOngkir, searchMengantarLocation, RateSource, ShippingOption } from "./mengantar";
 
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
@@ -31,21 +31,57 @@ export interface AIProcessResult {
   intent: "GREETING" | "ONGKIR_CHECK" | "PRODUCT_INQUIRY" | "GENERAL_CHAT";
   shippingDetails?: ShippingOption[];
   detectedCity?: string;
+  /** `mock` = tarif simulasi (lokasi asal toko belum valid), bukan tarif kurir asli. */
+  rateSource?: RateSource;
 }
 
 /**
- * Format pilihan ongkir Mengantar menjadi teks WhatsApp yang rapi
+ * Format pilihan ongkir Mengantar menjadi teks WhatsApp yang rapi.
+ *
+ * Bila `source === "mock"` tarif BUKAN dari kurir sungguhan (lokasi asal toko
+ * belum di-set ke `_id` Mengantar). Jangan menyajikannya sebagai harga pasti —
+ * beri label "perkiraan" supaya pembeli tidak salah paham & toko tidak rugi.
  */
-function formatOngkirWhatsApp(options: ShippingOption[], destinationCity: string, originCity: string): string {
-  let text = `📦 *Informasi Tarif Ongkir ke ${destinationCity}*\n`;
-  text += `📍 *Pengiriman dari:* ${originCity}\n\n`;
-  text += `Berikut adalah daftar pilihan ekspedisi & ongkos kirim:\n\n`;
+/** allEstimatePublic mengembalikan ~16 kurir; menampilkan semuanya = dinding teks. */
+const MAX_WHATSAPP_OPTIONS = 5;
 
-  options.forEach((opt, idx) => {
+function formatOngkirWhatsApp(
+  options: ShippingOption[],
+  destinationCity: string,
+  originCity: string,
+  source: RateSource
+): string {
+  const isEstimate = source === "mock";
+
+  let text = isEstimate
+    ? `📦 *Perkiraan Ongkir ke ${destinationCity}*\n`
+    : `📦 *Informasi Tarif Ongkir ke ${destinationCity}*\n`;
+  text += `📍 *Pengiriman dari:* ${originCity}\n\n`;
+  text += isEstimate
+    ? `Berikut *perkiraan* ongkos kirim ya Kak:\n\n`
+    : `Berikut adalah daftar pilihan ekspedisi & ongkos kirim:\n\n`;
+
+  // `options` sudah terurut dari termurah, jadi potongannya = pilihan terbaik.
+  const shown = options.slice(0, MAX_WHATSAPP_OPTIONS);
+  const hidden = options.length - shown.length;
+
+  shown.forEach((opt, idx) => {
     text += `${idx + 1}. *${opt.courier_name}* (${opt.service_name})\n`;
     text += `   💰 Rp ${opt.cost.toLocaleString("id-ID")}\n`;
-    text += `   ⏱️ Estimasi: ${opt.etd}\n\n`;
+    text += `   ⏱️ Estimasi: ${opt.etd}\n`;
+    if (opt.belowMinimumWeight) {
+      text += `   ℹ️ Kena tarif minimum karena berat paket di bawah batas layanan ini\n`;
+    }
+    text += `\n`;
   });
+
+  if (hidden > 0) {
+    text += `_Masih ada ${hidden} pilihan ekspedisi lain. Beri tahu kami kalau Kakak ingin lihat opsi lainnya ya._\n\n`;
+  }
+
+  if (isEstimate) {
+    text += `_Catatan: angka di atas masih perkiraan. Tarif pastinya kami konfirmasi ulang sebelum pesanan diproses ya Kak._\n\n`;
+  }
 
   text += `Silakan beri tahu kami ekspedisi pilihan Kakak atau jika ingin langsung lanjut ke pemesanan ya! 😊`;
   return text;
@@ -170,7 +206,7 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     }
 
     // Cari lokasi di Mengantar
-    const locations = await searchMengantarLocation(targetLocationQuery, mengantarApiKey);
+    const { locations, source: locSource } = await searchMengantarLocation(targetLocationQuery, mengantarApiKey);
     const destLoc = locations[0];
     const destName = destLoc ? `${destLoc.subdistrict_name}, ${destLoc.city_name}` : targetLocationQuery;
     const destId = destLoc ? destLoc.id : "3273010";
@@ -179,20 +215,23 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     // toko yang diatur di dashboard (bukan lagi hardcode 1 kg).
     const totalWeight = products.length > 0 ? products[0].weight : (defaultWeight || 1000);
 
-    const rates = await calculateMengantarOngkir({
+    const { rates, source: rateSource } = await calculateMengantarOngkir({
       originSubdistrictId,
       destinationSubdistrictId: destId,
       weightGram: totalWeight,
       apiKey: mengantarApiKey
     });
 
-    const formattedOngkir = formatOngkirWhatsApp(rates, destName, originCityName);
+    // Kalau pencarian lokasi saja sudah jatuh ke mock, tarifnya pasti bukan live.
+    const effectiveSource: RateSource = locSource === "mock" ? "mock" : rateSource;
+    const formattedOngkir = formatOngkirWhatsApp(rates, destName, originCityName, effectiveSource);
 
     return {
       replyText: formattedOngkir,
       intent: "ONGKIR_CHECK",
       shippingDetails: rates,
-      detectedCity: destName
+      detectedCity: destName,
+      rateSource: effectiveSource
     };
   }
 
