@@ -34,7 +34,7 @@ const MAIN: Feature[] = [
     icon: BrainCircuit,
     title: "AI Agent Pintar",
     desc: "Bukan sekadar auto-reply. AI memahami konteks, menjawab pertanyaan produk, dan mengarahkan pelanggan sampai closing.",
-    points: ["Paham bahasa sehari-hari", "Rekomendasi produk", "Follow-up otomatis"],
+    points: ["Paham bahasa sehari-hari", "Rekomendasi produk", "Ingat konteks chat (Pro)"],
   },
 ];
 
@@ -46,8 +46,8 @@ const SECONDARY: Feature[] = [
   },
   {
     icon: BarChart3,
-    title: "Analitik Penjualan",
-    desc: "Pantau performa chat & konversi lewat dashboard.",
+    title: "Analitik Percakapan",
+    desc: "Pantau volume chat, topik yang sering ditanya, dan kota tujuan ongkir.",
   },
   {
     icon: ShieldCheck,

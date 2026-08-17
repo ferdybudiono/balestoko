@@ -6,6 +6,7 @@
  * jangan menambah angka "estimasi" yang tidak benar-benar terukur.
  */
 
+import { monthStartMs } from "@/lib/packages";
 import type { Conversation, Product } from "./types";
 
 export interface DayBucket {
@@ -34,6 +35,12 @@ export interface DashboardStats {
   incoming24h: number;
   /** Percakapan yang aktif (ada pesan) dalam 7 hari terakhir. */
   activeConversations7d: number;
+  /**
+   * Percakapan aktif pada bulan kalender berjalan (WIB) — angka yang sama
+   * dengan yang dipakai server menegakkan kuota paket, supaya meter pemakaian
+   * di dashboard tidak pernah berbeda dari yang benar-benar memblokir bot.
+   */
+  conversationsThisMonth: number;
   /** Histogram 7 hari (termasuk hari ini) untuk pesan pembeli. */
   daily: DayBucket[];
   /** Nilai tertinggi pada histogram — dipakai untuk skala bar. */
@@ -60,6 +67,8 @@ export function computeStats(conversations: Conversation[], products: Product[])
   const now = Date.now();
   const cutoff24h = now - DAY_MS;
   const cutoff7d = now - 7 * DAY_MS;
+  // Sama persis dengan ambang yang dipakai `countConversationsThisMonth`.
+  const monthStart = monthStartMs(now);
 
   // Siapkan 7 keranjang harian (hari ini di paling kanan).
   const daily: DayBucket[] = [];
@@ -80,6 +89,7 @@ export function computeStats(conversations: Conversation[], products: Product[])
   let aiReplies = 0;
   let incoming24h = 0;
   let activeConversations7d = 0;
+  let conversationsThisMonth = 0;
 
   const intentCounts = new Map<string, number>();
   const destinationCounts = new Map<string, number>();
@@ -109,6 +119,7 @@ export function computeStats(conversations: Conversation[], products: Product[])
       convo.updated_at || messages[messages.length - 1]?.timestamp || convo.created_at || null;
     const lastTouch = lastTouchRaw ? new Date(lastTouchRaw).getTime() : NaN;
     if (Number.isFinite(lastTouch) && lastTouch >= cutoff7d) activeConversations7d++;
+    if (Number.isFinite(lastTouch) && lastTouch >= monthStart) conversationsThisMonth++;
 
     if (convo.last_intent) {
       intentCounts.set(convo.last_intent, (intentCounts.get(convo.last_intent) || 0) + 1);
@@ -133,6 +144,7 @@ export function computeStats(conversations: Conversation[], products: Product[])
     aiReplies,
     incoming24h,
     activeConversations7d,
+    conversationsThisMonth,
     daily,
     dailyMax: daily.reduce((max, d) => Math.max(max, d.count), 0),
     intents,

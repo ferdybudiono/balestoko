@@ -35,7 +35,7 @@ import type {
   StoreDevice,
   TabId
 } from "@/components/dashboard/types";
-import { getPlan } from "@/lib/packages";
+import { getPlan, hasAdvancedAnalytics, monthlyConversationLimit } from "@/lib/packages";
 
 const TABS: Array<{ id: TabId; icon: typeof LayoutDashboard; label: string; short: string }> = [
   { id: "overview", icon: LayoutDashboard, label: "Ringkasan", short: "Ringkasan" },
@@ -569,6 +569,10 @@ export default function DashboardPage() {
   const originValid = isMengantarId(savedForm.originSubdistrictId);
 
   const planName = getPlan(packageId)?.name || "Starter";
+  // Kemampuan per paket dibaca dari sumber yang sama dengan yang ditegakkan
+  // server, jadi tampilan dashboard tidak pernah menjanjikan lebih dari isi bot.
+  const conversationLimit = monthlyConversationLimit(packageId);
+  const advancedAnalytics = hasAdvancedAnalytics(packageId);
   // Toko dianggap terhubung bila ADA nomor yang aktif — `fonnteStatus` hanya
   // mencerminkan nomor utama, jadi Pro dengan nomor utama mati tapi nomor kedua
   // aktif tetap harus terbaca "terhubung".
@@ -847,6 +851,9 @@ export default function DashboardPage() {
                   whatsappConnected={whatsappConnected}
                   originValid={originValid}
                   originCityName={savedForm.originCityName || "lokasi toko"}
+                  planName={planName}
+                  conversationLimit={conversationLimit}
+                  advancedAnalytics={advancedAnalytics}
                   onGoTo={goToTab}
                   onOpenChat={(c) => {
                     setSelectedPhone(c.customer_phone);

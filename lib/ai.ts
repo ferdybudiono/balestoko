@@ -24,6 +24,15 @@ export interface AIProcessParams {
   defaultWeight?: number;
   products?: Array<{ name: string; price: number; weight: number; description?: string }>;
   chatHistory?: ChatMessage[];
+  /**
+   * Berapa pesan terakhir dari `chatHistory` yang boleh ikut ke prompt AI.
+   * `0` (default) = AI tanpa memori: tiap pesan dinilai berdiri sendiri.
+   *
+   * Nilainya berasal dari paket toko (`aiContextMessagesForPackage`). Riwayat
+   * tetap dikirim ke fungsi ini apa pun paketnya karena dipakai mendeteksi
+   * sapaan pertama — yang dibatasi hanya apa yang dilihat model.
+   */
+  aiContextMessages?: number;
 }
 
 export interface AIProcessResult {
@@ -139,7 +148,8 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     mengantarApiKey,
     defaultWeight = 1000,
     products = [],
-    chatHistory = []
+    chatHistory = [],
+    aiContextMessages = 0
   } = params;
 
   const rawMessage = messageText.trim();
@@ -267,13 +277,37 @@ export async function processAICustomerService(params: AIProcessParams): Promise
   const geminiApiKey = process.env.GEMINI_API_KEY;
   if (geminiApiKey) {
     const productCatalogStr = products.map((p) => `- ${p.name}: Rp ${p.price} (${p.weight}g)`).join("\n");
+
+    // Riwayat percakapan — hanya untuk paket yang berhak (Pro). Tanpa blok ini
+    // model tidak tahu apa pun yang sudah dibicarakan, jadi pembeli yang
+    // bertanya "yang tadi itu berapa?" akan dibalas seolah pesan pertama.
+    // Dipotong dari BELAKANG supaya yang terbaru selalu ikut, dan tiap isi
+    // pesan dipangkas agar satu pesan panjang tidak menelan seluruh konteks.
+    const contextTurns = Math.max(0, Math.floor(aiContextMessages));
+    const recent = contextTurns > 0 ? chatHistory.slice(-contextTurns) : [];
+    const historyStr = recent
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => `${m.role === "user" ? "Pembeli" : "CS"}: ${m.content.slice(0, 400)}`)
+      .join("\n");
+
     const aiPrompt = `
 System Prompt: ${aiPromptSystem || "Kamu adalah CS AI yang ramah."}
 Toko: ${storeName}
 Pengiriman dari: ${originCityName}
 Katalog Produk:
 ${productCatalogStr || "Belum ada katalog"}
+${
+  historyStr
+    ? `
+Riwayat percakapan sebelumnya dengan pembeli ini (terlama ke terbaru):
+${historyStr}
 
+Gunakan riwayat di atas sebagai konteks: jangan menyapa ulang seperti pesan
+pertama, jangan menanyakan hal yang sudah dijawab pembeli, dan rujuk produk
+atau kota yang sudah disebut bila pembeli memakai kata seperti "itu"/"tadi".
+`
+    : ""
+}
 Pesan Pembeli: "${rawMessage}"
 
 Balaslah sebagai Customer Service WhatsApp yang sopan, ramah, dan solutif. Sertakan ajakan untuk mengecek ongkir atau pemesanan produk jika relevan.

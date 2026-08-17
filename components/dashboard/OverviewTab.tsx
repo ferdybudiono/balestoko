@@ -4,6 +4,7 @@ import {
   ArrowRight,
   CheckCircle2,
   Circle,
+  Crown,
   Inbox,
   MapPin,
   MessageSquare,
@@ -22,8 +23,116 @@ interface OverviewTabProps {
   whatsappConnected: boolean;
   originValid: boolean;
   originCityName: string;
+  planName: string;
+  /** Kuota percakapan bulan ini; `null` = paket tanpa batas. */
+  conversationLimit: number | null;
+  /** Grafik tren & sebaran topik hanya untuk paket yang berhak. */
+  advancedAnalytics: boolean;
   onGoTo: (tab: TabId) => void;
   onOpenChat: (convo: Conversation) => void;
+}
+
+/**
+ * Meter kuota percakapan bulanan.
+ *
+ * Wajib ada begitu kuota ditegakkan di server: kalau bot berhenti membalas
+ * karena kuota habis, pemilik toko harus bisa melihat sebabnya di sini — bukan
+ * menebak-nebak kenapa pembeli tidak dijawab.
+ */
+function QuotaMeter({
+  used,
+  limit,
+  planName
+}: {
+  used: number;
+  limit: number;
+  planName: string;
+}) {
+  const pct = Math.min(100, Math.round((used / limit) * 100));
+  const exhausted = used >= limit;
+  const nearLimit = !exhausted && pct >= 80;
+
+  const tone = exhausted
+    ? { box: "bg-rose-50 border-rose-200", bar: "bg-rose-500", text: "text-rose-900" }
+    : nearLimit
+      ? { box: "bg-amber-50 border-amber-200", bar: "bg-amber-500", text: "text-amber-900" }
+      : { box: "bg-white border-slate-200", bar: "bg-brand-500", text: "text-slate-600" };
+
+  return (
+    <div className={`border rounded-2xl p-4 sm:p-5 shadow-card ${tone.box}`}>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <h3 className="text-sm font-bold text-ink">
+          Percakapan bulan ini{" "}
+          <span className="font-medium text-slate-400">&middot; paket {planName}</span>
+        </h3>
+        <p className={`text-sm font-semibold ${tone.text}`}>
+          {used.toLocaleString("id-ID")} / {limit.toLocaleString("id-ID")}
+        </p>
+      </div>
+
+      <div
+        className="mt-3 h-2 w-full rounded-full bg-slate-200/70 overflow-hidden"
+        role="progressbar"
+        aria-valuenow={used}
+        aria-valuemin={0}
+        aria-valuemax={limit}
+        aria-label="Pemakaian kuota percakapan bulan ini"
+      >
+        <div className={`h-full rounded-full ${tone.bar}`} style={{ width: `${pct}%` }} />
+      </div>
+
+      <p className={`mt-2.5 text-xs leading-relaxed ${exhausted || nearLimit ? tone.text : "text-slate-500"}`}>
+        {exhausted ? (
+          <>
+            <strong>Kuota habis — bot berhenti membalas pembeli baru.</strong> Pembeli yang sudah
+            chat bulan ini tetap dilayani. Kuota reset pada tanggal 1.
+          </>
+        ) : nearLimit ? (
+          <>
+            Sisa {(limit - used).toLocaleString("id-ID")} percakapan. Setelah habis, pembeli baru
+            tidak dibalas sampai tanggal 1.
+          </>
+        ) : (
+          <>Satu pembeli dihitung satu percakapan, sebanyak apa pun pesannya. Reset tanggal 1.</>
+        )}
+      </p>
+
+      {(exhausted || nearLimit) && (
+        <a
+          href="/#harga"
+          className={`mt-3 inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold text-white transition-colors ${
+            exhausted ? "bg-rose-600 hover:bg-rose-700" : "bg-amber-600 hover:bg-amber-700"
+          }`}
+        >
+          <Crown className="w-3.5 h-3.5" aria-hidden="true" />
+          Upgrade ke Pro — percakapan tanpa batas
+        </a>
+      )}
+    </div>
+  );
+}
+
+/** Ajakan upgrade di tempat analitik lanjutan seharusnya berada. */
+function AnalyticsLocked() {
+  return (
+    <div className="bg-white border-2 border-dashed border-slate-200 rounded-2xl p-8 text-center">
+      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-50 border border-amber-200">
+        <Crown className="w-6 h-6 text-amber-600" aria-hidden="true" />
+      </div>
+      <h3 className="mt-3 text-sm font-bold text-ink">Analitik lanjutan ada di paket Pro</h3>
+      <p className="mt-1.5 text-xs text-slate-500 max-w-sm mx-auto leading-relaxed">
+        Grafik tren 7 hari, sebaran topik percakapan, dan kota tujuan ongkir terpopuler — supaya
+        Anda tahu apa yang paling sering ditanyakan pembeli dan dari mana mereka.
+      </p>
+      <a
+        href="/#harga"
+        className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 px-4 py-2.5 text-xs font-semibold text-white transition-colors"
+      >
+        <Crown className="w-3.5 h-3.5" aria-hidden="true" />
+        Lihat paket Pro
+      </a>
+    </div>
+  );
 }
 
 /**
@@ -161,6 +270,9 @@ export default function OverviewTab({
   whatsappConnected,
   originValid,
   originCityName,
+  planName,
+  conversationLimit,
+  advancedAnalytics,
   onGoTo,
   onOpenChat
 }: OverviewTabProps) {
@@ -320,23 +432,17 @@ export default function OverviewTab({
         />
       </div>
 
+      {/* ── Kuota percakapan bulanan (hanya paket berbatas) ────────────── */}
+      {conversationLimit !== null && (
+        <QuotaMeter
+          used={stats.conversationsThisMonth}
+          limit={conversationLimit}
+          planName={planName}
+        />
+      )}
+
       {/* ── Grafik & topik ─────────────────────────────────────────────── */}
-      {hasActivity ? (
-        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-          <div className="lg:col-span-3 bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6">
-            <WeeklyChart stats={stats} />
-          </div>
-          <div className="lg:col-span-2 bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6">
-            {stats.intents.length > 0 ? (
-              <IntentBreakdown stats={stats} />
-            ) : (
-              <div className="h-full flex items-center justify-center text-center text-xs text-slate-400">
-                Topik percakapan akan muncul setelah bot membalas pesan pertama.
-              </div>
-            )}
-          </div>
-        </div>
-      ) : (
+      {!hasActivity ? (
         <div className="bg-white border-2 border-dashed border-slate-200 rounded-2xl p-10 text-center">
           <MessageSquare className="w-9 h-9 mx-auto text-slate-300 mb-3" aria-hidden="true" />
           <h3 className="text-sm font-semibold text-ink">Belum ada percakapan</h3>
@@ -353,11 +459,28 @@ export default function OverviewTab({
             Coba kirim chat uji coba
           </button>
         </div>
+      ) : advancedAnalytics ? (
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+          <div className="lg:col-span-3 bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6">
+            <WeeklyChart stats={stats} />
+          </div>
+          <div className="lg:col-span-2 bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6">
+            {stats.intents.length > 0 ? (
+              <IntentBreakdown stats={stats} />
+            ) : (
+              <div className="h-full flex items-center justify-center text-center text-xs text-slate-400">
+                Topik percakapan akan muncul setelah bot membalas pesan pertama.
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <AnalyticsLocked />
       )}
 
-      {/* ── Tujuan ongkir terpopuler + percakapan terbaru ─────────────── */}
+      {/* ── Percakapan terbaru (+ tujuan ongkir untuk paket Pro) ───────── */}
       {hasActivity && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className={`grid grid-cols-1 gap-6 ${advancedAnalytics ? "lg:grid-cols-2" : ""}`}>
           <div className="bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6">
             <h3 className="text-sm font-bold text-ink mb-4">Percakapan terbaru</h3>
             <ul className="divide-y divide-slate-100 -my-1">
@@ -384,24 +507,26 @@ export default function OverviewTab({
             </ul>
           </div>
 
-          <div className="bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6">
-            <h3 className="text-sm font-bold text-ink mb-4">Tujuan ongkir terpopuler</h3>
-            {stats.topDestinations.length > 0 ? (
-              <ul className="space-y-2.5">
-                {stats.topDestinations.map((dest) => (
-                  <li key={dest.city} className="flex items-center gap-2.5">
-                    <MapPin className="w-3.5 h-3.5 shrink-0 text-brand-600" aria-hidden="true" />
-                    <span className="flex-1 text-sm text-slate-700 truncate">{dest.city}</span>
-                    <span className="text-xs font-semibold text-ink tabular-nums">{dest.count}×</span>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-xs text-slate-400">
-                Belum ada pembeli yang menanyakan ongkir ke kota tertentu.
-              </p>
-            )}
-          </div>
+          {advancedAnalytics && (
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6">
+              <h3 className="text-sm font-bold text-ink mb-4">Tujuan ongkir terpopuler</h3>
+              {stats.topDestinations.length > 0 ? (
+                <ul className="space-y-2.5">
+                  {stats.topDestinations.map((dest) => (
+                    <li key={dest.city} className="flex items-center gap-2.5">
+                      <MapPin className="w-3.5 h-3.5 shrink-0 text-brand-600" aria-hidden="true" />
+                      <span className="flex-1 text-sm text-slate-700 truncate">{dest.city}</span>
+                      <span className="text-xs font-semibold text-ink tabular-nums">{dest.count}×</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-xs text-slate-400">
+                  Belum ada pembeli yang menanyakan ongkir ke kota tertentu.
+                </p>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

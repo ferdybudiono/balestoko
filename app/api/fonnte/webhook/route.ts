@@ -7,7 +7,7 @@ import {
   type StoreDeviceRecord,
   type StoreRecord
 } from "@/lib/supabase";
-import { checkRateLimit, runAutoReply } from "@/lib/reply-engine";
+import { checkConversationQuota, checkRateLimit, runAutoReply } from "@/lib/reply-engine";
 import {
   buildFonnteWebhookUrl,
   isWebhookUrlSynced,
@@ -154,6 +154,17 @@ export async function POST(req: Request) {
         `[fonnte webhook] device ${deviceNumber} di luar kuota paket toko, pesan diabaikan.`
       );
       return NextResponse.json({ status: "ignored", reason: "Device over plan limit" });
+    }
+
+    // Kuota percakapan bulanan paket (Starter 1.000/bulan, Pro tanpa batas).
+    // Diperiksa SEBELUM Gemini dipanggil karena di sinilah biayanya muncul.
+    const quota = await checkConversationQuota(store, sender);
+    if (!quota.ok) {
+      console.warn(
+        `[fonnte webhook] kuota percakapan bulanan toko habis (${quota.used}/${quota.limit}), ` +
+          `pesan dari ${sender} diabaikan.`
+      );
+      return NextResponse.json({ status: "ignored", reason: "Monthly conversation quota exceeded" });
     }
 
     // Bendung banjir pesan dari satu nomor (termasuk loop balasan antar-bot).

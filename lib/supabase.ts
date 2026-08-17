@@ -5,7 +5,7 @@
  * Semua fungsi di sini SERVER-ONLY karena memakai SERVICE_ROLE_KEY.
  */
 
-import { maxDevicesForPackage } from "@/lib/packages";
+import { maxDevicesForPackage, monthStartMs } from "@/lib/packages";
 
 function getConfig(): { url: string; key: string } | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -768,6 +768,44 @@ export async function getConversation(storeId: string, phone: string): Promise<C
     if (!res.ok) return null;
     const list = await res.json();
     return Array.isArray(list) && list.length > 0 ? (list[0] as ConversationRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Jumlah percakapan toko pada bulan kalender berjalan (WIB) — dipakai menegakkan
+ * kuota paket Starter.
+ *
+ * Menghitung BARIS, bukan pesan: satu pembeli yang chat berkali-kali tetap satu
+ * percakapan. Memakai `Prefer: count=exact` + header `Content-Range` supaya
+ * barisnya tidak perlu ditarik semua hanya untuk dihitung.
+ *
+ * Mengembalikan `null` bila hitungan gagal (Supabase belum dikonfigurasi, error
+ * jaringan, header tidak terbaca). Pemanggil WAJIB memperlakukan `null` sebagai
+ * "tidak tahu" dan MEMBIARKAN pesan lewat — memblokir bot toko yang membayar
+ * karena satu query gagal jauh lebih merugikan daripada melayani beberapa
+ * percakapan di atas kuota.
+ */
+export async function countConversationsThisMonth(storeId: string): Promise<number | null> {
+  const cfg = getConfig();
+  if (!cfg || !storeId) return null;
+
+  try {
+    const since = new Date(monthStartMs()).toISOString();
+    const url =
+      `${cfg.url}/rest/v1/conversations?store_id=eq.${encodeURIComponent(storeId)}` +
+      `&updated_at=gte.${encodeURIComponent(since)}&select=id&limit=1`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "count=exact"),
+      cache: "no-store"
+    });
+    if (!res.ok) return null;
+
+    // Format: "0-0/123" — atau "*/123" bila rentangnya kosong.
+    const total = (res.headers.get("content-range") || "").split("/")[1];
+    const parsed = Number(total);
+    return Number.isFinite(parsed) ? parsed : null;
   } catch {
     return null;
   }

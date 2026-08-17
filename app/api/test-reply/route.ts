@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getStoreByEmail, isDeviceWithinPlanLimit, isStoreActive, listStoreDevicesCompat } from "@/lib/supabase";
 import { getSessionEmail } from "@/lib/auth";
-import { checkRateLimit, runAutoReply } from "@/lib/reply-engine";
+import { checkConversationQuota, checkRateLimit, runAutoReply } from "@/lib/reply-engine";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -77,6 +77,20 @@ export async function POST(req: Request) {
     return NextResponse.json(
       { error: `Terlalu banyak percobaan. Coba lagi dalam ${rate.retryAfterSec} detik.` },
       { status: 429, headers: { "Retry-After": String(rate.retryAfterSec) } }
+    );
+  }
+
+  // Uji coba memakai jalur yang sama dengan pesan asli, jadi kuotanya pun sama.
+  // Kalau tidak, pemilik toko bisa mengira botnya sehat padahal kuota sudah habis.
+  const quota = await checkConversationQuota(store, sender);
+  if (!quota.ok) {
+    return NextResponse.json(
+      {
+        error:
+          `Kuota percakapan bulan ini sudah terpakai semua (${quota.used}/${quota.limit}). ` +
+          "Upgrade ke Pro untuk percakapan tanpa batas."
+      },
+      { status: 403 }
     );
   }
 

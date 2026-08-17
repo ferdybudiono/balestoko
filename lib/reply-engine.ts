@@ -1,6 +1,8 @@
 import { processAICustomerService, type AIProcessResult } from "@/lib/ai";
 import { sendFonnteMessage } from "@/lib/fonnte";
+import { aiContextMessagesForPackage, monthlyConversationLimit, monthStartMs } from "@/lib/packages";
 import {
+  countConversationsThisMonth,
   getConversation,
   getProductsByStoreId,
   saveConversationMessage,
@@ -53,6 +55,50 @@ export function checkRateLimit(storeId: string, sender: string): { ok: boolean; 
   return { ok: true, retryAfterSec: 0 };
 }
 
+// ── Kuota percakapan bulanan ─────────────────────────────────────────────
+
+export interface QuotaCheck {
+  ok: boolean;
+  /** Percakapan terpakai bulan ini; `null` bila hitungan tidak tersedia. */
+  used: number | null;
+  /** `null` = paket tanpa batas. */
+  limit: number | null;
+}
+
+/**
+ * Apakah pesan dari `sender` masih boleh diproses menurut kuota paket?
+ *
+ * Dipanggil SEBELUM `runAutoReply` karena tiap pesan yang lolos memicu biaya
+ * Gemini + kirim WhatsApp. Dua keputusan penting di sini:
+ *
+ * 1. Pembeli yang percakapannya SUDAH aktif bulan ini selalu lolos, walau kuota
+ *    sudah penuh. Kuota menghitung percakapan, bukan pesan — kalau pembeli ke-1
+ *    tiba-tiba tidak dibalas di tengah tanya-jawab hanya karena pembeli ke-1000
+ *    baru masuk, itu memutus percakapan yang sudah dibayar.
+ * 2. Hitungan yang GAGAL (`null`) diperlakukan sebagai lolos, bukan blokir.
+ *    Satu query Supabase yang error tidak boleh mematikan bot toko berbayar.
+ */
+export async function checkConversationQuota(
+  store: StoreRecord,
+  sender: string
+): Promise<QuotaCheck> {
+  const limit = monthlyConversationLimit(store.package_id);
+  if (limit === null) return { ok: true, used: null, limit: null };
+
+  const storeId = store.id || "";
+  if (!storeId) return { ok: true, used: null, limit };
+
+  const existing = await getConversation(storeId, sender);
+  const lastTouch = existing?.updated_at ? new Date(existing.updated_at).getTime() : NaN;
+  if (Number.isFinite(lastTouch) && lastTouch >= monthStartMs()) {
+    return { ok: true, used: null, limit };
+  }
+
+  const used = await countConversationsThisMonth(storeId);
+  if (used === null) return { ok: true, used: null, limit };
+  return { ok: used < limit, used, limit };
+}
+
 /**
  * Olah satu pesan masuk: AI menyusun balasan, balasan dikirim ke pengirim,
  * lalu percakapan disimpan.
@@ -88,7 +134,11 @@ export async function runAutoReply(params: {
     mengantarApiKey: store.mengantar_api_key,
     defaultWeight: store.default_weight || 1000,
     products,
-    chatHistory: conversation?.messages || []
+    chatHistory: conversation?.messages || [],
+    // Memori percakapan = fitur berbayar. Riwayatnya tetap dikirim (dipakai
+    // mendeteksi sapaan pertama), tapi hanya paket Pro yang riwayatnya ikut
+    // masuk ke prompt model.
+    aiContextMessages: aiContextMessagesForPackage(store.package_id)
   });
 
   let delivered = false;
