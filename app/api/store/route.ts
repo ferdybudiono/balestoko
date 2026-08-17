@@ -1,6 +1,14 @@
 import { NextResponse } from "next/server";
-import { getStoreByEmail, upsertStore, getAllConversations, getProductsByStoreId } from "@/lib/supabase";
+import {
+  getStoreByEmail,
+  upsertStore,
+  getAllConversations,
+  getProductsByStoreId,
+  listStoreDevicesCompat,
+  toPublicDevice
+} from "@/lib/supabase";
 import { getFonnteDeviceStatus } from "@/lib/fonnte";
+import { maxDevicesForPackage } from "@/lib/packages";
 import { getSessionEmail } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -26,8 +34,30 @@ export async function GET(req: Request) {
     const store = await getStoreByEmail(email);
     if (!store) {
       // Store dibuat saat pembayaran PAID; kalau belum ada berarti akun belum aktif.
-      return NextResponse.json({ store: null, fonnteStatus: { status: false, device: "DISCONNECTED" }, conversations: [], products: [] });
+      return NextResponse.json({
+        store: null,
+        fonnteStatus: { status: false, device: "DISCONNECTED" },
+        conversations: [],
+        products: [],
+        devices: [],
+        deviceLimit: maxDevicesForPackage(null),
+        devicesNeedMigration: false
+      });
     }
+
+    // Tiga query independen — jalankan paralel supaya latensi tidak menumpuk.
+    const [conversations, products, deviceList] = await Promise.all([
+      store?.id ? getAllConversations(store.id) : Promise.resolve([]),
+      store?.id ? getProductsByStoreId(store.id) : Promise.resolve([]),
+      listStoreDevicesCompat(store)
+    ]);
+    const { devices, legacy } = deviceList;
+
+    // Status koneksi WhatsApp yang ditampilkan di header = device UTAMA. Status
+    // tiap nomor lainnya di-refresh terpisah lewat /api/fonnte/devices?status=1
+    // supaya memuat dashboard tidak berarti 3 panggilan ke Fonnte.
+    const primaryToken =
+      devices.find((d) => d.is_primary)?.fonnte_token || store.fonnte_token || "";
 
     let fonnteStatus: { status: boolean; device?: string; reason?: string } | null = {
       status: false,
@@ -37,15 +67,9 @@ export async function GET(req: Request) {
     if (light) {
       // Biarkan client mempertahankan status yang sudah ada.
       fonnteStatus = null;
-    } else if (store?.fonnte_token) {
-      fonnteStatus = await getFonnteDeviceStatus(store.fonnte_token);
+    } else if (primaryToken) {
+      fonnteStatus = await getFonnteDeviceStatus(primaryToken);
     }
-
-    // Dua query independen — jalankan paralel supaya latensi tidak menumpuk.
-    const [conversations, products] = await Promise.all([
-      store?.id ? getAllConversations(store.id) : Promise.resolve([]),
-      store?.id ? getProductsByStoreId(store.id) : Promise.resolve([])
-    ]);
 
     // Jangan bocorkan hash password / OTP reset / kredensial pihak ketiga ke
     // client. Token device Fonnte & API key Mengantar cukup diwakili boolean —
@@ -68,7 +92,10 @@ export async function GET(req: Request) {
       },
       fonnteStatus,
       conversations,
-      products
+      products,
+      devices: devices.map(toPublicDevice),
+      deviceLimit: maxDevicesForPackage(store.package_id),
+      devicesNeedMigration: legacy
     });
   } catch (err) {
     console.error("[store] GET gagal:", err);

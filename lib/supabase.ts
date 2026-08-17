@@ -5,6 +5,8 @@
  * Semua fungsi di sini SERVER-ONLY karena memakai SERVICE_ROLE_KEY.
  */
 
+import { maxDevicesForPackage } from "@/lib/packages";
+
 function getConfig(): { url: string; key: string } | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -42,6 +44,26 @@ export interface StoreRecord {
   default_weight?: number;
   ai_prompt_system?: string;
   greeting_message?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/**
+ * Satu nomor WhatsApp (device Fonnte) milik sebuah toko.
+ *
+ * Jumlah baris per toko dibatasi paketnya (`maxDevicesForPackage`). Device
+ * `is_primary` dipakai untuk pesan non-percakapan seperti OTP reset password,
+ * dan tokennya dicerminkan ke `stores.fonnte_token`.
+ */
+export interface StoreDeviceRecord {
+  id?: string;
+  store_id: string;
+  label?: string | null;
+  phone: string;
+  fonnte_token?: string | null;
+  device_status?: string | null;
+  webhook_url?: string | null;
+  is_primary?: boolean;
   created_at?: string;
   updated_at?: string;
 }
@@ -235,43 +257,6 @@ export async function getStoreByFonnteToken(token: string): Promise<StoreRecord 
   }
 }
 
-/**
- * Cari toko berdasarkan NOMOR device WhatsApp.
- *
- * Webhook Fonnte mengirim field `device` = nomor device penerima (bukan token,
- * payload masuk memang tidak memuat token). Karena `customer_phone` bisa
- * tersimpan sebagai 62xxx atau 08xxx, cocokkan kedua bentuk sekaligus.
- */
-export async function getStoreByDevicePhone(phone: string): Promise<StoreRecord | null> {
-  const cfg = getConfig();
-  if (!cfg || !phone) return null;
-
-  const digits = phone.replace(/\D/g, "");
-  if (digits.length < 8) return null;
-  const wa62 = digits.startsWith("62")
-    ? digits
-    : digits.startsWith("0")
-    ? "62" + digits.slice(1)
-    : "62" + digits;
-  const local0 = "0" + wa62.slice(2);
-  const candidates = Array.from(new Set([wa62, local0, digits]));
-
-  try {
-    const orExpr = `or=(${candidates.map((c) => `customer_phone.eq.${c}`).join(",")})`;
-    const url = `${cfg.url}/rest/v1/stores?${orExpr}&limit=1`;
-    const res = await fetch(url, {
-      headers: headers(cfg.key, "return=representation"),
-      cache: "no-store"
-    });
-
-    if (!res.ok) return null;
-    const list = await res.json();
-    return Array.isArray(list) && list.length > 0 ? (list[0] as StoreRecord) : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function upsertStore(store: Partial<StoreRecord> & { email: string }): Promise<DbResult<StoreRecord>> {
   const cfg = getConfig();
   if (!cfg) return { ok: false, skipped: true };
@@ -305,6 +290,345 @@ export async function upsertStore(store: Partial<StoreRecord> & { email: string 
     }
     const data = await res.json();
     return { ok: true, data: Array.isArray(data) ? data[0] : data };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Bentuk-bentuk nomor yang mungkin tersimpan untuk satu nomor WA yang sama.
+ *
+ * Nomor bisa masuk sebagai 62xxx, 08xxx, atau angka mentah tergantung dari mana
+ * datangnya (input user, payload Fonnte, data lama). Pencarian harus mencoba
+ * semuanya, kalau tidak pesan masuk gagal dirutekan hanya karena selisih format.
+ */
+function phoneCandidates(phone: string): string[] {
+  const digits = (phone || "").replace(/\D/g, "");
+  if (digits.length < 8) return [];
+  const wa62 = digits.startsWith("62")
+    ? digits
+    : digits.startsWith("0")
+    ? "62" + digits.slice(1)
+    : "62" + digits;
+  return Array.from(new Set([wa62, "0" + wa62.slice(2), digits]));
+}
+
+export async function getStoreById(id: string): Promise<StoreRecord | null> {
+  const cfg = getConfig();
+  if (!cfg || !id) return null;
+
+  try {
+    const url = `${cfg.url}/rest/v1/stores?id=eq.${encodeURIComponent(id)}&limit=1`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+    if (!res.ok) return null;
+    const list = await res.json();
+    return Array.isArray(list) && list.length > 0 ? (list[0] as StoreRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------- STORE DEVICE METHODS ----------------
+
+export async function listStoreDevices(storeId: string): Promise<StoreDeviceRecord[]> {
+  const cfg = getConfig();
+  if (!cfg || !storeId) return [];
+
+  try {
+    const url = `${cfg.url}/rest/v1/store_devices?store_id=eq.${encodeURIComponent(
+      storeId
+    )}&order=is_primary.desc,created_at.asc`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+    if (!res.ok) return [];
+    return (await res.json()) as StoreDeviceRecord[];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Bentuk device yang AMAN dikirim ke browser.
+ *
+ * Satu definisi dipakai semua endpoint: kalau pemetaan ini disalin-tempel per
+ * route, cukup satu yang lupa membuang `fonnte_token` dan token device toko bocor
+ * ke browser (bisa dipakai mengirim WhatsApp atas nama toko itu).
+ */
+export interface PublicStoreDevice {
+  id?: string;
+  label: string | null;
+  phone: string;
+  device_status: string;
+  is_primary: boolean;
+  has_token: boolean;
+  created_at?: string;
+}
+
+export function toPublicDevice(device: StoreDeviceRecord): PublicStoreDevice {
+  return {
+    id: device.id,
+    label: device.label || null,
+    phone: device.phone,
+    device_status: device.device_status || "DISCONNECTED",
+    is_primary: !!device.is_primary,
+    has_token: !!device.fonnte_token,
+    created_at: device.created_at
+  };
+}
+
+/**
+ * Daftar device untuk ditampilkan/dikelola, dengan jaring pengaman migrasi.
+ *
+ * `legacy: true` berarti tabel `store_devices` belum ada atau belum terisi untuk
+ * toko ini, sementara kolom lama `stores.fonnte_token` menunjukkan ada device
+ * yang sudah tersambung. Dalam kondisi itu nomornya tetap kita tampilkan (biar
+ * dashboard tidak terlihat "kosong" padahal bot jalan), tapi penambahan dan
+ * penghapusan nomor harus ditolak sampai SQL-nya dijalankan.
+ */
+export async function listStoreDevicesCompat(
+  store: StoreRecord
+): Promise<{ devices: StoreDeviceRecord[]; legacy: boolean }> {
+  const devices = await listStoreDevices(store.id || "");
+  if (devices.length > 0) return { devices, legacy: false };
+  // Hanya `fonnte_token` yang membuktikan device pernah dibuat. `customer_phone`
+  // selalu terisi sejak pendaftaran, jadi tidak bisa dipakai sebagai penanda.
+  if (store.fonnte_token) {
+    return { devices: [legacyDeviceFromStore(store, store.customer_phone || "")], legacy: true };
+  }
+  return { devices: [], legacy: false };
+}
+
+/**
+ * Device utama sebuah toko — dipakai jalur yang memang harus memakai satu nomor
+ * tetap (OTP reset password, uji kirim default).
+ */
+export async function getPrimaryStoreDevice(store: StoreRecord): Promise<StoreDeviceRecord | null> {
+  const { devices } = await listStoreDevicesCompat(store);
+  return devices.find((d) => d.is_primary) || devices[0] || null;
+}
+
+/**
+ * Apakah device ini masih dalam kuota nomor paketnya?
+ *
+ * Menolak penambahan nomor saja tidak cukup: toko yang trial (kuota Pro, 3 nomor)
+ * lalu berlangganan Starter akan tetap punya 3 nomor tersambung. Tanpa
+ * pemeriksaan ini, batas paket hanya berlaku bagi yang belum pernah trial.
+ *
+ * Urutannya sama dengan yang ditampilkan dashboard (`is_primary` dulu, lalu yang
+ * terlama), jadi nomor yang "di luar kuota" bisa ditunjukkan ke user — bukan mati
+ * diam-diam.
+ *
+ * Biaya query ditekan: device utama selalu lolos tanpa query (batas terkecil pun
+ * 1 nomor), jadi toko Starter satu-nomor tidak pernah membayar tambahan ini.
+ */
+export async function isDeviceWithinPlanLimit(
+  store: StoreRecord,
+  device: StoreDeviceRecord
+): Promise<boolean> {
+  if (device.is_primary) return true;
+
+  const limit = maxDevicesForPackage(store.package_id);
+  const devices = await listStoreDevices(store.id || "");
+  if (devices.length <= limit) return true;
+
+  return devices.slice(0, limit).some((d) => d.id === device.id);
+}
+
+export async function getStoreDeviceByPhone(phone: string): Promise<StoreDeviceRecord | null> {
+  const cfg = getConfig();
+  const candidates = phoneCandidates(phone);
+  if (!cfg || candidates.length === 0) return null;
+
+  try {
+    const orExpr = `or=(${candidates.map((c) => `phone.eq.${c}`).join(",")})`;
+    const url = `${cfg.url}/rest/v1/store_devices?${orExpr}&limit=1`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+    if (!res.ok) return null;
+    const list = await res.json();
+    return Array.isArray(list) && list.length > 0 ? (list[0] as StoreDeviceRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cari toko + device penerima berdasarkan NOMOR device WhatsApp.
+ *
+ * Webhook Fonnte mengirim field `device` = nomor device penerima (payload masuk
+ * memang tidak memuat token), jadi ini jalur utama perutean pesan masuk.
+ *
+ * FALLBACK: bila tabel `store_devices` belum ada (migrasi belum dijalankan) atau
+ * nomornya belum termigrasi, jatuh ke cara lama lewat `stores.customer_phone`
+ * dan device disusun dari kolom-kolom `stores`. Tanpa ini, men-deploy kode ini
+ * sebelum menjalankan SQL-nya akan mematikan seluruh bot.
+ */
+export async function getStoreAndDeviceByPhone(
+  phone: string
+): Promise<{ store: StoreRecord; device: StoreDeviceRecord } | null> {
+  const device = await getStoreDeviceByPhone(phone);
+  if (device?.store_id) {
+    const store = await getStoreById(device.store_id);
+    if (store) return { store, device };
+  }
+
+  const legacy = await getStoreByLegacyDevicePhone(phone);
+  if (!legacy) return null;
+  return { store: legacy, device: legacyDeviceFromStore(legacy, phone) };
+}
+
+/**
+ * Cari toko + device berdasarkan DEVICE token.
+ *
+ * Payload webhook Fonnte tidak memuat token, jadi ini hanya jalur cadangan bila
+ * suatu konfigurasi mengirimkannya lewat body/header.
+ */
+export async function getStoreAndDeviceByToken(
+  token: string
+): Promise<{ store: StoreRecord; device: StoreDeviceRecord } | null> {
+  const cfg = getConfig();
+  if (!cfg || !token) return null;
+
+  try {
+    const url = `${cfg.url}/rest/v1/store_devices?fonnte_token=eq.${encodeURIComponent(token)}&limit=1`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+    if (res.ok) {
+      const list = await res.json();
+      const device = Array.isArray(list) && list.length > 0 ? (list[0] as StoreDeviceRecord) : null;
+      if (device?.store_id) {
+        const store = await getStoreById(device.store_id);
+        if (store) return { store, device };
+      }
+    }
+  } catch {
+    // Lanjut ke fallback legacy di bawah.
+  }
+
+  const legacy = await getStoreByFonnteToken(token);
+  if (!legacy) return null;
+  return { store: legacy, device: legacyDeviceFromStore(legacy, legacy.customer_phone || "") };
+}
+
+/** Susun device dari kolom-kolom `stores` (data pra-`store_devices`). */
+function legacyDeviceFromStore(store: StoreRecord, phone: string): StoreDeviceRecord {
+  return {
+    store_id: store.id || "",
+    phone: store.customer_phone || phone,
+    fonnte_token: store.fonnte_token,
+    device_status: store.fonnte_device_status,
+    webhook_url: store.webhook_url,
+    is_primary: true
+  };
+}
+
+/** Pencarian device gaya lama (pra-`store_devices`) — hanya untuk fallback. */
+async function getStoreByLegacyDevicePhone(phone: string): Promise<StoreRecord | null> {
+  const cfg = getConfig();
+  const candidates = phoneCandidates(phone);
+  if (!cfg || candidates.length === 0) return null;
+
+  try {
+    const orExpr = `or=(${candidates.map((c) => `customer_phone.eq.${c}`).join(",")})`;
+    const url = `${cfg.url}/rest/v1/stores?${orExpr}&limit=1`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+    if (!res.ok) return null;
+    const list = await res.json();
+    return Array.isArray(list) && list.length > 0 ? (list[0] as StoreRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function insertStoreDevice(
+  device: Omit<StoreDeviceRecord, "id">
+): Promise<DbResult<StoreDeviceRecord>> {
+  const cfg = getConfig();
+  if (!cfg) return { ok: false, skipped: true };
+
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/store_devices`, {
+      method: "POST",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify(device),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `device insert ${res.status}: ${text}` };
+    }
+    const data = await res.json();
+    return { ok: true, data: Array.isArray(data) ? data[0] : data };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+export async function updateStoreDevice(
+  id: string,
+  patch: Partial<StoreDeviceRecord>
+): Promise<DbResult<StoreDeviceRecord>> {
+  const cfg = getConfig();
+  if (!cfg || !id) return { ok: false, skipped: true };
+
+  try {
+    const url = `${cfg.url}/rest/v1/store_devices?id=eq.${encodeURIComponent(id)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `device update ${res.status}: ${text}` };
+    }
+    const data = await res.json();
+    return { ok: true, data: Array.isArray(data) ? data[0] : data };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Hapus device. `storeId` ikut disaring supaya request dari satu toko tidak bisa
+ * menghapus nomor toko lain hanya dengan menebak id.
+ */
+export async function deleteStoreDevice(id: string, storeId: string): Promise<DbResult> {
+  const cfg = getConfig();
+  if (!cfg || !id || !storeId) return { ok: false, skipped: true };
+
+  try {
+    const url = `${cfg.url}/rest/v1/store_devices?id=eq.${encodeURIComponent(
+      id
+    )}&store_id=eq.${encodeURIComponent(storeId)}`;
+    const res = await fetch(url, {
+      method: "DELETE",
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `device delete ${res.status}: ${text}` };
+    }
+    const data = await res.json();
+    // Array kosong = tidak ada baris yang cocok (id milik toko lain / sudah hilang).
+    if (Array.isArray(data) && data.length === 0) {
+      return { ok: false, error: "Device tidak ditemukan." };
+    }
+    return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err) };
   }

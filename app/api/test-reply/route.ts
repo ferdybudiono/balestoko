@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getStoreByEmail, isStoreActive } from "@/lib/supabase";
+import { getStoreByEmail, isDeviceWithinPlanLimit, isStoreActive, listStoreDevicesCompat } from "@/lib/supabase";
 import { getSessionEmail } from "@/lib/auth";
 import { checkRateLimit, runAutoReply } from "@/lib/reply-engine";
 
@@ -47,14 +47,32 @@ export async function POST(req: Request) {
       { status: 403 }
     );
   }
-  if (!store.fonnte_token) {
+  // Pilih nomor pengirim: yang diminta dashboard, atau nomor utama toko.
+  // Balasan harus keluar dari device milik toko ini, bukan account token bersama.
+  const wantDeviceId = String(body.deviceId || "").trim();
+  const { devices } = await listStoreDevicesCompat(store);
+  const device =
+    (wantDeviceId ? devices.find((d) => d.id === wantDeviceId) : undefined) ||
+    devices.find((d) => d.is_primary) ||
+    devices[0];
+
+  if (!device?.fonnte_token) {
     return NextResponse.json(
       { error: "Hubungkan WhatsApp toko terlebih dahulu sebelum menguji balasan." },
       { status: 400 }
     );
   }
+  if (!(await isDeviceWithinPlanLimit(store, device))) {
+    return NextResponse.json(
+      {
+        error:
+          "Nomor ini di luar kuota paket Anda, jadi bot tidak melayaninya. Upgrade paket atau pakai nomor lain."
+      },
+      { status: 403 }
+    );
+  }
 
-  const rate = checkRateLimit(store.id || email, sender);
+  const rate = checkRateLimit(device.id || store.id || email, sender);
   if (!rate.ok) {
     return NextResponse.json(
       { error: `Terlalu banyak percobaan. Coba lagi dalam ${rate.retryAfterSec} detik.` },
@@ -63,12 +81,18 @@ export async function POST(req: Request) {
   }
 
   try {
-    const outcome = await runAutoReply({ store, sender, messageText });
+    const outcome = await runAutoReply({
+      store,
+      sender,
+      messageText,
+      deviceToken: device.fonnte_token
+    });
     return NextResponse.json({
       success: true,
       // Nomor yang benar-benar dipakai sebagai kunci percakapan (sudah
       // dinormalisasi), supaya dashboard bisa langsung membuka thread-nya.
       sender,
+      via: device.phone,
       intent: outcome.intent,
       reply: outcome.replyText,
       delivered: outcome.delivered,

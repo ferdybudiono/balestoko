@@ -61,10 +61,16 @@ export async function runAutoReply(params: {
   store: StoreRecord;
   sender: string;
   messageText: string;
+  /**
+   * DEVICE token yang harus dipakai mengirim balasan — yaitu device yang
+   * menerima pesan itu, supaya balasan keluar dari nomor yang sama dengan yang
+   * dihubungi pembeli. Kosong = balasan hanya disusun & disimpan.
+   */
+  deviceToken?: string | null;
   /** false = hanya susun balasan, jangan kirim lewat WhatsApp. */
   send?: boolean;
 }): Promise<AutoReplyOutcome> {
-  const { store, sender, messageText, send = true } = params;
+  const { store, sender, messageText, deviceToken, send = true } = params;
   const storeId = store.id || "";
 
   const [products, conversation] = await Promise.all([
@@ -89,7 +95,10 @@ export async function runAutoReply(params: {
   let deliveryError: string | undefined;
 
   if (send) {
-    const token = store.fonnte_token || process.env.FONNTE_TOKEN;
+    // JANGAN jatuh ke FONNTE_TOKEN (account token) di sini: di deployment
+    // multi-tenant token itu bisa mengirim lewat device toko lain, jadi balasan
+    // pembeli berpotensi keluar dari nomor yang bukan miliknya.
+    const token = deviceToken || null;
     if (token) {
       const sent = await sendFonnteMessage({ target: sender, message: aiResult.replyText, token });
       delivered = sent.success;
@@ -99,7 +108,7 @@ export async function runAutoReply(params: {
       }
     } else {
       deliveryError = "Device WhatsApp toko belum terhubung.";
-      console.log("[auto-reply] tanpa token, balasan tidak dikirim:", aiResult.replyText);
+      console.log("[auto-reply] tanpa token device, balasan tidak dikirim:", aiResult.replyText);
     }
   }
 

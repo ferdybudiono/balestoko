@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-import { getStoreByEmail, upsertStore } from "@/lib/supabase";
+import { getPrimaryStoreDevice, getStoreByEmail, upsertStore } from "@/lib/supabase";
 import { hashPassword } from "@/lib/auth";
 import { sendFonnteMessage } from "@/lib/fonnte";
 
@@ -47,10 +47,17 @@ export async function POST(req: Request) {
 
   const store = await getStoreByEmail(email);
 
+  // OTP dikirim lewat device UTAMA toko. `store.fonnte_token` dipakai sebagai
+  // cadangan karena kolom itu adalah cermin device utama (dan satu-satunya sumber
+  // pada data yang belum termigrasi ke `store_devices`).
+  const primaryToken = store
+    ? (await getPrimaryStoreDevice(store))?.fonnte_token || store.fonnte_token || ""
+    : "";
+
   // Tidak ada akun / belum menghubungkan device WhatsApp → tetap balas generik
   // (anti-enumerasi). Tanpa device token milik toko, OTP tidak bisa dikirim.
-  if (!store || !store.customer_phone || !store.fonnte_token) {
-    if (store && !store.fonnte_token) {
+  if (!store || !store.customer_phone || !primaryToken) {
+    if (store && !primaryToken) {
       console.warn(
         "[reset] Toko belum menghubungkan WhatsApp — OTP tidak dapat dikirim."
       );
@@ -76,7 +83,7 @@ export async function POST(req: Request) {
   const sent = await sendFonnteMessage({
     target: store.customer_phone,
     message,
-    token: store.fonnte_token,
+    token: primaryToken,
   });
   if (!sent.success) {
     console.warn("[reset] Gagal mengirim OTP via device toko:", sent.error);

@@ -27,7 +27,15 @@ import ProductsTab from "@/components/dashboard/ProductsTab";
 import StoreTab, { type StoreForm } from "@/components/dashboard/StoreTab";
 import WhatsappTab from "@/components/dashboard/WhatsappTab";
 import { computeStats } from "@/components/dashboard/stats";
-import type { Conversation, FonnteStatus, Product, TabId } from "@/components/dashboard/types";
+import { isDeviceConnected } from "@/components/dashboard/types";
+import type {
+  Conversation,
+  FonnteStatus,
+  Product,
+  StoreDevice,
+  TabId
+} from "@/components/dashboard/types";
+import { getPlan } from "@/lib/packages";
 
 const TABS: Array<{ id: TabId; icon: typeof LayoutDashboard; label: string; short: string }> = [
   { id: "overview", icon: LayoutDashboard, label: "Ringkasan", short: "Ringkasan" },
@@ -73,6 +81,18 @@ const QR_POLL_MS = 5_000;
 /** QR Fonnte kedaluwarsa; berhenti polling setelah ~3 menit. */
 const QR_MAX_TICKS = 36;
 
+/**
+ * Endpoint QR untuk satu nomor. `deviceId` adalah jalur utama; data lama yang
+ * dibaca dari kolom `stores` (belum migrasi) tidak punya id, jadi dicocokkan
+ * lewat nomornya.
+ */
+function qrEndpoint(device: StoreDevice): string {
+  const param = device.id
+    ? `deviceId=${encodeURIComponent(device.id)}`
+    : `phone=${encodeURIComponent(device.phone)}`;
+  return `/api/fonnte/qr?${param}`;
+}
+
 export default function DashboardPage() {
   const router = useRouter();
 
@@ -98,7 +118,7 @@ export default function DashboardPage() {
   savedFormRef.current = savedForm;
 
   const [hasMengantarKey, setHasMengantarKey] = useState(false);
-  const [hasFonnteToken, setHasFonnteToken] = useState(false);
+  const [packageId, setPackageId] = useState<string>("");
   const [fonnteStatus, setFonnteStatus] = useState<FonnteStatus>({
     status: false,
     device: "DISCONNECTED",
@@ -112,8 +132,18 @@ export default function DashboardPage() {
   // kembali ke percakapan pertama.
   const [selectedPhone, setSelectedPhone] = useState<string | null>(null);
 
-  // WhatsApp / QR
-  const [connectPhone, setConnectPhone] = useState("");
+  // WhatsApp: nomor-nomor toko (Starter 1, Pro 3) + QR per nomor
+  const [devices, setDevices] = useState<StoreDevice[]>([]);
+  const [deviceLimit, setDeviceLimit] = useState(1);
+  const [devicesNeedMigration, setDevicesNeedMigration] = useState(false);
+  const [refreshingDevices, setRefreshingDevices] = useState(false);
+  const [newPhone, setNewPhone] = useState("");
+  const [newLabel, setNewLabel] = useState("");
+  const [addingDevice, setAddingDevice] = useState(false);
+  const [removingDeviceId, setRemovingDeviceId] = useState<string | null>(null);
+  // Simpan device-nya (bukan hanya id) supaya polling QR tahu endpoint mana yang
+  // harus dipanggil, termasuk untuk data lama yang belum punya id.
+  const [qrDevice, setQrDevice] = useState<StoreDevice | null>(null);
   const [qrUrl, setQrUrl] = useState<string | null>(null);
   const [loadingQr, setLoadingQr] = useState(false);
   const [qrTicks, setQrTicks] = useState(0);
@@ -121,6 +151,7 @@ export default function DashboardPage() {
   // Uji coba
   const [testPhone, setTestPhone] = useState("");
   const [testMessageText, setTestMessageText] = useState("Halo, cek ongkir ke Bandung dong");
+  const [testDeviceId, setTestDeviceId] = useState("");
   const [sendingTest, setSendingTest] = useState(false);
 
   // ── Toast: bersihkan timer lama supaya toast kedua tidak ikut terpotong ──
@@ -203,8 +234,7 @@ export default function DashboardPage() {
         setIsPaid(!!s.is_paid);
         setTrialEndsAt(s.trial_ends_at || null);
         setHasMengantarKey(!!s.has_mengantar_api_key);
-        setHasFonnteToken(!!s.has_fonnte_token);
-        if (s.customer_phone) setConnectPhone((prev) => prev || s.customer_phone);
+        setPackageId(s.package_id || "");
 
         const next: StoreForm = {
           storeName: s.store_name || "",
@@ -223,6 +253,10 @@ export default function DashboardPage() {
 
         // `light=1` mengembalikan null — pertahankan status yang sudah ada.
         if (data.fonnteStatus) setFonnteStatus(data.fonnteStatus);
+
+        if (Array.isArray(data.devices)) setDevices(data.devices as StoreDevice[]);
+        if (typeof data.deviceLimit === "number") setDeviceLimit(data.deviceLimit);
+        setDevicesNeedMigration(!!data.devicesNeedMigration);
 
         if (Array.isArray(data.products)) setProducts(data.products);
         if (Array.isArray(data.conversations)) {
@@ -267,55 +301,144 @@ export default function DashboardPage() {
     return () => clearInterval(id);
   }, []);
 
-  // ── QR WhatsApp ───────────────────────────────────────────────────────
-  const handleFetchQr = useCallback(async () => {
-    if (!hasFonnteToken && connectPhone.replace(/\D/g, "").length < 9) {
-      showToast("Masukkan nomor WhatsApp yang valid terlebih dahulu.", "error");
+  // ── Nomor WhatsApp (multi-device) ─────────────────────────────────────
+  /** `live` = ikut menanyakan status tiap nomor ke Fonnte (lebih lambat). */
+  const refreshDevices = useCallback(
+    async (opts: { live?: boolean } = {}) => {
+      const { live = false } = opts;
+      if (live) setRefreshingDevices(true);
+      try {
+        const res = await fetch(`/api/fonnte/devices${live ? "?status=1" : ""}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (Array.isArray(data.devices)) setDevices(data.devices as StoreDevice[]);
+        if (typeof data.limit === "number") setDeviceLimit(data.limit);
+        setDevicesNeedMigration(!!data.needsMigration);
+      } catch {
+        /* diamkan — polling berikutnya mencoba lagi */
+      } finally {
+        setRefreshingDevices(false);
+      }
+    },
+    []
+  );
+
+  const handleFetchQr = useCallback(
+    async (device: StoreDevice) => {
+      setLoadingQr(true);
+      setQrTicks(0);
+      setQrDevice(device);
+      try {
+        const res = await fetch(qrEndpoint(device));
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setQrDevice(null);
+          showToast(data.error || "Gagal memuat QR Code.", "error");
+          return;
+        }
+        if (data.connected) {
+          setQrUrl(null);
+          setQrDevice(null);
+          showToast("Nomor ini sudah terhubung! 🎉");
+          refreshDevices();
+          fetchStoreData({ light: true, silent: true });
+        } else if (data.qrUrl) {
+          setQrUrl(data.qrUrl);
+        } else {
+          setQrDevice(null);
+          showToast(data.error || "QR Code belum tersedia. Coba lagi sebentar.", "error");
+        }
+      } catch {
+        setQrDevice(null);
+        showToast("Gagal memuat QR Code.", "error");
+      } finally {
+        setLoadingQr(false);
+      }
+    },
+    [fetchStoreData, refreshDevices, showToast]
+  );
+
+  const handleAddDevice = useCallback(async () => {
+    if (newPhone.replace(/\D/g, "").length < 10) {
+      showToast("Masukkan nomor WhatsApp yang valid (mis. 0812xxxxxxx).", "error");
       return;
     }
-    setLoadingQr(true);
-    setQrTicks(0);
+    setAddingDevice(true);
     try {
-      const res = await fetch(`/api/fonnte/qr?phone=${encodeURIComponent(connectPhone)}`);
+      const res = await fetch("/api/fonnte/devices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: newPhone, label: newLabel })
+      });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        showToast(data.error || "Gagal memuat QR Code.", "error");
+        showToast(data.error || "Gagal menambahkan nomor.", "error");
         return;
       }
-      if (data.connected) {
-        setQrUrl(null);
-        showToast("WhatsApp sudah terhubung! 🎉");
-        fetchStoreData({ silent: true });
-      } else if (data.qrUrl) {
-        setQrUrl(data.qrUrl);
-      } else {
-        showToast(data.error || "QR Code belum tersedia. Coba lagi sebentar.", "error");
-      }
+      setNewPhone("");
+      setNewLabel("");
+      showToast("Nomor terdaftar. Scan QR untuk menghubungkan WhatsApp-nya.");
+      await refreshDevices();
+      // Langsung tampilkan QR-nya: nomor baru belum berguna sebelum di-scan.
+      if (data.device) handleFetchQr(data.device as StoreDevice);
     } catch {
-      showToast("Gagal memuat QR Code.", "error");
+      showToast("Gagal menambahkan nomor.", "error");
     } finally {
-      setLoadingQr(false);
+      setAddingDevice(false);
     }
-  }, [connectPhone, hasFonnteToken, fetchStoreData, showToast]);
+  }, [newPhone, newLabel, handleFetchQr, refreshDevices, showToast]);
+
+  const handleRemoveDevice = useCallback(
+    async (device: StoreDevice) => {
+      if (!device.id) return;
+      setRemovingDeviceId(device.id);
+      try {
+        const res = await fetch(`/api/fonnte/devices?id=${encodeURIComponent(device.id)}`, {
+          method: "DELETE"
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(data.error || "Gagal menghapus nomor.", "error");
+          return;
+        }
+        if (qrDevice?.id === device.id) {
+          setQrUrl(null);
+          setQrDevice(null);
+        }
+        // `warning` = baris DB terhapus tapi device di Fonnte belum; user perlu tahu.
+        showToast(data.warning || "Nomor berhasil dihapus.", data.warning ? "error" : "success");
+        await refreshDevices();
+        fetchStoreData({ light: true, silent: true });
+      } catch {
+        showToast("Gagal menghapus nomor.", "error");
+      } finally {
+        setRemovingDeviceId(null);
+      }
+    },
+    [qrDevice, fetchStoreData, refreshDevices, showToast]
+  );
 
   // Pantau status selama QR tampil; berhenti begitu terhubung atau kedaluwarsa.
   useEffect(() => {
-    if (!qrUrl || fonnteStatus.status) return;
+    if (!qrUrl || !qrDevice) return;
     if (qrTicks >= QR_MAX_TICKS) {
       setQrUrl(null);
-      showToast("QR Code kedaluwarsa. Klik Tampilkan QR Code lagi.", "error");
+      setQrDevice(null);
+      showToast("QR Code kedaluwarsa. Klik Scan QR lagi.", "error");
       return;
     }
     const id = setTimeout(async () => {
       setQrTicks((n) => n + 1);
       try {
-        const res = await fetch(`/api/fonnte/qr?phone=${encodeURIComponent(connectPhone)}`);
+        const res = await fetch(qrEndpoint(qrDevice));
         const data = await res.json().catch(() => ({}));
         if (!res.ok) return;
         if (data.connected) {
           setQrUrl(null);
+          setQrDevice(null);
           showToast("WhatsApp berhasil terhubung! 🎉");
-          fetchStoreData({ silent: true });
+          refreshDevices();
+          fetchStoreData({ light: true, silent: true });
         } else if (data.qrUrl) {
           setQrUrl(data.qrUrl);
         }
@@ -324,7 +447,16 @@ export default function DashboardPage() {
       }
     }, QR_POLL_MS);
     return () => clearTimeout(id);
-  }, [qrUrl, qrTicks, fonnteStatus.status, connectPhone, fetchStoreData, showToast]);
+  }, [qrUrl, qrTicks, qrDevice, fetchStoreData, refreshDevices, showToast]);
+
+  // Nomor pengirim untuk uji coba: jaga agar selalu menunjuk nomor yang valid.
+  useEffect(() => {
+    const usable = devices
+      .slice(0, deviceLimit)
+      .filter((d) => String(d.device_status).toUpperCase() === "CONNECTED");
+    if (usable.some((d) => d.id === testDeviceId)) return;
+    setTestDeviceId(usable.find((d) => d.is_primary)?.id || usable[0]?.id || "");
+  }, [devices, deviceLimit, testDeviceId]);
 
   // ── Simpan pengaturan toko ────────────────────────────────────────────
   const patchForm = useCallback((patch: Partial<StoreForm>) => {
@@ -393,7 +525,13 @@ export default function DashboardPage() {
       const res = await fetch("/api/test-reply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sender: testPhone, message: testMessageText })
+        body: JSON.stringify({
+          sender: testPhone,
+          message: testMessageText,
+          // Nomor pengirim yang dipilih user; server tetap memverifikasi bahwa
+          // device ini milik toko pemanggil dan masih di dalam kuota paket.
+          deviceId: testDeviceId
+        })
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success) {
@@ -414,7 +552,7 @@ export default function DashboardPage() {
     } finally {
       setSendingTest(false);
     }
-  }, [testPhone, testMessageText, fetchStoreData, goToTab, showToast]);
+  }, [testPhone, testMessageText, testDeviceId, fetchStoreData, goToTab, showToast]);
 
   const handleLogout = useCallback(async () => {
     try {
@@ -429,6 +567,12 @@ export default function DashboardPage() {
   const stats = useMemo(() => computeStats(conversations, products), [conversations, products]);
   const dirty = useMemo(() => !sameForm(form, savedForm), [form, savedForm]);
   const originValid = isMengantarId(savedForm.originSubdistrictId);
+
+  const planName = getPlan(packageId)?.name || "Starter";
+  // Toko dianggap terhubung bila ADA nomor yang aktif — `fonnteStatus` hanya
+  // mencerminkan nomor utama, jadi Pro dengan nomor utama mati tapi nomor kedua
+  // aktif tetap harus terbaca "terhubung".
+  const whatsappConnected = fonnteStatus.status || devices.some(isDeviceConnected);
 
   const trialMs = trialEndsAt ? new Date(trialEndsAt).getTime() - nowTs : 0;
   const trialActive = !isPaid && !!trialEndsAt && trialMs > 0;
@@ -504,11 +648,11 @@ export default function DashboardPage() {
             {isPaid && (
               <span className="hidden md:inline-flex items-center gap-1.5 bg-amber-50 border border-amber-300 text-amber-800 text-xs font-semibold px-2.5 py-1.5 rounded-full">
                 <Crown className="w-3.5 h-3.5" aria-hidden="true" />
-                Pro
+                {planName}
               </span>
             )}
 
-            {fonnteStatus.status ? (
+            {whatsappConnected ? (
               <span className="inline-flex items-center gap-1.5 bg-brand-50 border border-brand-200 text-brand-800 text-xs font-semibold px-2.5 py-1.5 rounded-full">
                 <Wifi className="w-3.5 h-3.5" aria-hidden="true" />
                 <span className="hidden sm:inline">WhatsApp Terhubung</span>
@@ -646,7 +790,7 @@ export default function DashboardPage() {
               </div>
 
               <div className="flex items-center gap-2">
-                {fonnteStatus.status ? (
+                {whatsappConnected ? (
                   <>
                     <span className="relative flex h-2.5 w-2.5" aria-hidden="true">
                       <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-brand-400 opacity-75" />
@@ -700,7 +844,7 @@ export default function DashboardPage() {
                 <OverviewTab
                   stats={stats}
                   conversations={conversations}
-                  whatsappConnected={fonnteStatus.status}
+                  whatsappConnected={whatsappConnected}
                   originValid={originValid}
                   originCityName={savedForm.originCityName || "lokasi toko"}
                   onGoTo={goToTab}
@@ -715,21 +859,35 @@ export default function DashboardPage() {
             <div role="tabpanel" id="panel-whatsapp" aria-labelledby="tab-whatsapp" hidden={activeTab !== "whatsapp"}>
               {activeTab === "whatsapp" && (
                 <WhatsappTab
-                  fonnteStatus={fonnteStatus}
-                  hasFonnteToken={hasFonnteToken}
-                  connectPhone={connectPhone}
-                  setConnectPhone={setConnectPhone}
+                  devices={devices}
+                  deviceLimit={deviceLimit}
+                  planName={planName}
+                  devicesNeedMigration={devicesNeedMigration}
+                  refreshingDevices={refreshingDevices}
+                  onRefreshDevices={() => refreshDevices({ live: true })}
+                  newPhone={newPhone}
+                  setNewPhone={setNewPhone}
+                  newLabel={newLabel}
+                  setNewLabel={setNewLabel}
+                  addingDevice={addingDevice}
+                  onAddDevice={handleAddDevice}
+                  removingDeviceId={removingDeviceId}
+                  onRemoveDevice={handleRemoveDevice}
+                  qrDeviceId={qrDevice ? qrDevice.id || qrDevice.phone : null}
                   qrUrl={qrUrl}
                   loadingQr={loadingQr}
                   onFetchQr={handleFetchQr}
                   onCancelQr={() => {
                     setQrUrl(null);
+                    setQrDevice(null);
                     setQrTicks(0);
                   }}
                   testPhone={testPhone}
                   setTestPhone={setTestPhone}
                   testMessageText={testMessageText}
                   setTestMessageText={setTestMessageText}
+                  testDeviceId={testDeviceId}
+                  setTestDeviceId={setTestDeviceId}
                   sendingTest={sendingTest}
                   onSendTest={handleSendTest}
                 />

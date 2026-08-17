@@ -22,6 +22,13 @@ export interface Plan {
   highlighted?: boolean;
   badge?: string;
   ctaLabel: string;
+  /**
+   * Batas jumlah nomor WhatsApp (device Fonnte) yang boleh disambungkan.
+   * DITEGAKKAN di server oleh `/api/fonnte/devices`, bukan cuma klaim di
+   * halaman harga — jadi angka di sini harus sama dengan yang ditulis di
+   * `features` di bawah.
+   */
+  maxDevices: number;
   features: string[];
   /** Fitur yang TIDAK termasuk (ditampilkan dicoret) — opsional. */
   notIncluded?: string[];
@@ -35,6 +42,7 @@ export const PLANS: Record<PackageId, Plan> = {
     period: "/bulan",
     tagline: "Pas untuk toko yang baru mulai otomasi chat.",
     ctaLabel: "Pilih Starter",
+    maxDevices: 1,
     features: [
       "1 nomor WhatsApp",
       "Balas chat otomatis 24/7",
@@ -54,6 +62,7 @@ export const PLANS: Record<PackageId, Plan> = {
     highlighted: true,
     badge: "Paling Populer",
     ctaLabel: "Pilih Pro",
+    maxDevices: 3,
     features: [
       "3 nomor WhatsApp",
       "Semua fitur Starter",
@@ -76,6 +85,17 @@ export function getPlan(id: string | undefined | null): Plan | undefined {
 
 export function isPackageId(id: unknown): id is PackageId {
   return id === "starter" || id === "pro";
+}
+
+/**
+ * Batas nomor WhatsApp untuk sebuah paket.
+ *
+ * Dipakai server untuk menolak penambahan device melebihi paket. Paket yang
+ * tidak dikenali (atau kosong) jatuh ke batas paling ketat — lebih baik user
+ * menghubungi support daripada sistem diam-diam membagikan kuota Pro.
+ */
+export function maxDevicesForPackage(packageId?: string | null): number {
+  return getPlan(packageId)?.maxDevices ?? PLANS.starter.maxDevices;
 }
 
 /** Format angka ke Rupiah, mis. 99000 -> "Rp99.000". */

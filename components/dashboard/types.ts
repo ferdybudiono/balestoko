@@ -33,6 +33,24 @@ export interface FonnteStatus {
   reason?: string;
 }
 
+/**
+ * Satu nomor WhatsApp milik toko. Bentuk ini sengaja TANPA token device —
+ * server tidak pernah mengirimkannya ke browser.
+ */
+export interface StoreDevice {
+  id?: string;
+  label: string | null;
+  phone: string;
+  device_status: string;
+  is_primary: boolean;
+  has_token: boolean;
+  created_at?: string;
+}
+
+export function isDeviceConnected(device: StoreDevice): boolean {
+  return String(device.device_status || "").toUpperCase() === "CONNECTED";
+}
+
 export type TabId = "overview" | "whatsapp" | "store" | "products" | "chats";
 
 export type ShowToast = (msg: string, type?: "success" | "error") => void;

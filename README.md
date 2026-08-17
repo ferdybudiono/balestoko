@@ -55,6 +55,14 @@ cp .env.example .env.local
 
 Buka **Supabase → SQL Editor**, tempel isi [`supabase/schema.sql`](./supabase/schema.sql), lalu **Run**.
 
+> ♻️ **Sudah pernah deploy versi lama? Jalankan ulang `schema.sql`.** Skrip itu
+> idempoten (`create table if not exists` / `add column if not exists`), jadi aman
+> dijalankan berkali-kali. Diperlukan untuk tabel **`store_devices`** — tanpa itu
+> fitur multi-nomor WhatsApp (Starter 1 nomor, Pro 3 nomor) tidak aktif dan tab
+> WhatsApp menampilkan peringatan "jalankan ulang `supabase/schema.sql`". Nomor
+> yang sudah terhubung tetap jalan selama masa transisi, dibaca dari kolom lama
+> di tabel `stores`.
+
 ### 4. Jalankan dev server
 
 ```bash
@@ -107,16 +115,25 @@ app/
   layout.tsx                     # root layout + inject Snap.js
   page.tsx                       # orkestrasi section + state modal checkout
   globals.css
+  dashboard/page.tsx             # dashboard toko (state + orkestrasi tab)
   api/
     checkout/route.ts            # buat Snap token + simpan order PENDING
     midtrans/notification/route.ts  # webhook verifikasi + update status
+    fonnte/devices/route.ts      # kelola nomor WA toko + TEGAKKAN batas paket
+    fonnte/qr/route.ts           # QR pairing per nomor
+    fonnte/webhook/route.ts      # penerima pesan masuk → balasan AI
+    test-reply/route.ts          # uji coba balasan dari dashboard (wajib login)
+    store/route.ts               # baca/tulis konfigurasi toko
 components/                      # Navbar, Hero, Features, Pricing, CheckoutModal, dst.
+  dashboard/                     # komponen per tab + helper tampilan
 lib/
-  packages.ts                    # sumber tunggal paket & harga
+  packages.ts                    # sumber tunggal paket, harga & batas nomor
   midtrans.ts                    # helper Snap REST + verifikasi signature
   supabase.ts                    # klien PostgREST (server-only)
+  fonnte.ts                      # provisioning device + kirim WA
+  reply-engine.ts                # intent + Gemini + pengiriman balasan
 supabase/
-  schema.sql                     # DDL tabel orders
+  schema.sql                     # DDL tabel orders, stores, store_devices, dst.
 ```
 
 ---
@@ -124,7 +141,9 @@ supabase/
 ## 🔒 Catatan Keamanan
 
 - **Harga dihitung di server** berdasarkan `packageId`, tidak pernah dari input browser — mencegah manipulasi harga.
-- **Service Role key hanya dipakai di server** (`lib/supabase.ts`). Jangan pernah meng-import file itu dari komponen client.
+- **Batas nomor WhatsApp ditegakkan di server** (`lib/packages.ts` → `maxDevicesForPackage`): penambahan nomor ditolak di `POST /api/fonnte/devices`, dan nomor di luar kuota (mis. sisa 3 nomor dari masa trial lalu berlangganan Starter) tidak dilayani webhook. Dashboard menandai nomor mana yang tidak aktif supaya bukan kematian senyap.
+- **Balasan selalu keluar dari device milik toko itu sendiri.** Tidak ada fallback ke `FONNTE_TOKEN` (account token) saat mengirim balasan, jadi pesan satu toko tidak mungkin keluar lewat nomor toko lain.
+- **Service Role key hanya dipakai di server** (`lib/supabase.ts`). Jangan pernah meng-import file itu dari komponen client. Token device tidak pernah dikirim ke browser — API selalu memetakannya lewat `toPublicDevice()` yang hanya membocorkan `has_token: true/false`.
 - **Webhook memverifikasi signature** `SHA512(order_id + status_code + gross_amount + server_key)` dengan timing-safe compare sebelum memperbarui status.
 - Tabel `orders` mengaktifkan **RLS** tanpa policy publik, sehingga hanya bisa diakses via Service Role dari server.
 

@@ -1,11 +1,18 @@
 import { NextResponse } from "next/server";
-import { getStoreByFonnteToken, getStoreByDevicePhone, isStoreActive } from "@/lib/supabase";
+import {
+  getStoreAndDeviceByPhone,
+  getStoreAndDeviceByToken,
+  isDeviceWithinPlanLimit,
+  isStoreActive,
+  type StoreDeviceRecord,
+  type StoreRecord
+} from "@/lib/supabase";
 import { checkRateLimit, runAutoReply } from "@/lib/reply-engine";
 import {
   buildFonnteWebhookUrl,
   isWebhookUrlSynced,
   resolveBaseUrl,
-  syncStoreWebhookUrl
+  syncDeviceWebhookUrl
 } from "@/lib/webhook-url";
 
 export const runtime = "nodejs";
@@ -82,21 +89,27 @@ export async function POST(req: Request) {
   }
 
   try {
-    // 1. Cari toko berdasarkan NOMOR device penerima (utama). Fallback ke token
-    //    bila suatu konfigurasi mengirimkannya via body/header.
-    let store = deviceNumber ? await getStoreByDevicePhone(deviceNumber) : null;
-    if (!store) {
+    // 1. Cari toko + DEVICE penerima berdasarkan nomor device (jalur utama).
+    //    Device-nya penting, bukan hanya tokonya: balasan harus keluar dari
+    //    nomor yang sama dengan yang dihubungi pembeli, dan satu toko kini bisa
+    //    punya beberapa nomor (Starter 1, Pro 3).
+    let match: { store: StoreRecord; device: StoreDeviceRecord } | null = deviceNumber
+      ? await getStoreAndDeviceByPhone(deviceNumber)
+      : null;
+    if (!match) {
       const maybeToken = String(body.token || req.headers.get("authorization") || "");
-      if (maybeToken) store = await getStoreByFonnteToken(maybeToken);
+      if (maybeToken) match = await getStoreAndDeviceByToken(maybeToken);
     }
 
     // Device tidak dikenal → abaikan. Jangan salah-arahkan pesan ke toko lain.
-    if (!store) {
+    if (!match) {
       console.warn(
         `[fonnte webhook] device tidak dikenal (device=${deviceNumber}), pesan diabaikan.`
       );
       return NextResponse.json({ status: "ignored", reason: "Unknown device" });
     }
+
+    const { store, device } = match;
 
     if (!secretOk) {
       // Device yang tersambung SEBELUM secret diaktifkan menyimpan URL webhook
@@ -104,7 +117,7 @@ export async function POST(req: Request) {
       // berarti bot toko itu mati tanpa jalan pulih sendiri — tab QR pun tidak
       // muncul saat status sudah terhubung. Jadi: terima sekali, perbaiki URL
       // device-nya, dan setelah tersinkron pintu ini tertutup permanen.
-      if (isWebhookUrlSynced(store)) {
+      if (isWebhookUrlSynced(device)) {
         console.warn(
           `[fonnte webhook] secret tidak valid untuk device ${deviceNumber} yang sudah tersinkron, request ditolak.`
         );
@@ -115,7 +128,11 @@ export async function POST(req: Request) {
         `[fonnte webhook] device ${deviceNumber} belum memakai URL ber-secret — ` +
           "pesan diproses sekali sambil menyinkronkan URL webhook device."
       );
-      const synced = await syncStoreWebhookUrl(store, buildFonnteWebhookUrl(resolveBaseUrl(req)));
+      const synced = await syncDeviceWebhookUrl({
+        store,
+        device,
+        desired: buildFonnteWebhookUrl(resolveBaseUrl(req))
+      });
       if (!synced) {
         console.warn(
           "[fonnte webhook] sinkronisasi URL gagal; buka tab WhatsApp di dashboard toko tersebut untuk memperbaiki."
@@ -129,8 +146,20 @@ export async function POST(req: Request) {
       return NextResponse.json({ status: "ignored", reason: "Store inactive or trial expired" });
     }
 
+    // Nomor di luar kuota paket (mis. sisa 3 nomor dari masa trial, tapi sekarang
+    // berlangganan Starter yang hanya 1 nomor). Dashboard menandai nomor mana yang
+    // tidak dilayani, jadi ini bukan kematian senyap.
+    if (!(await isDeviceWithinPlanLimit(store, device))) {
+      console.warn(
+        `[fonnte webhook] device ${deviceNumber} di luar kuota paket toko, pesan diabaikan.`
+      );
+      return NextResponse.json({ status: "ignored", reason: "Device over plan limit" });
+    }
+
     // Bendung banjir pesan dari satu nomor (termasuk loop balasan antar-bot).
-    const rate = checkRateLimit(store.id || deviceNumber, sender);
+    // Dibatasi per-device: tiap nomor toko adalah kanal terpisah, jadi pembeli
+    // yang ramai di satu nomor tidak ikut memblokir nomor lainnya.
+    const rate = checkRateLimit(device.id || store.id || deviceNumber, sender);
     if (!rate.ok) {
       console.warn(`[fonnte webhook] batas laju tercapai untuk ${sender}, pesan diabaikan.`);
       return NextResponse.json(
@@ -139,7 +168,12 @@ export async function POST(req: Request) {
       );
     }
 
-    const outcome = await runAutoReply({ store, sender, messageText });
+    const outcome = await runAutoReply({
+      store,
+      sender,
+      messageText,
+      deviceToken: device.fonnte_token
+    });
 
     return NextResponse.json({
       success: true,

@@ -88,6 +88,36 @@ create table if not exists public.conversations (
   constraint store_phone_unique unique (store_id, customer_phone)
 );
 
+-- 5. Tabel Store Devices (Nomor WhatsApp per toko — Starter 1, Pro 3)
+--
+--    Sebelumnya satu toko hanya bisa satu nomor karena token device disimpan di
+--    kolom tunggal `stores.fonnte_token`. Tabel ini memisahkannya jadi satu baris
+--    per nomor. `stores.fonnte_token` / `fonnte_device_status` / `webhook_url`
+--    tetap diisi sebagai CERMIN device utama supaya kode lama (mis. OTP reset
+--    password) tidak perlu ikut berubah.
+create table if not exists public.store_devices (
+  id                    uuid primary key default gen_random_uuid(),
+  store_id              uuid not null references public.stores(id) on delete cascade,
+  label                 text,                            -- nama bebas, mis. 'CS 1', 'Admin Gudang'
+  phone                 text not null,                   -- nomor device, disimpan 62xxx
+  fonnte_token          text,                            -- DEVICE token hasil add-device
+  device_status         text not null default 'DISCONNECTED',
+  webhook_url           text,                            -- URL webhook yang sudah tersinkron ke device ini
+  is_primary            boolean not null default false,  -- device untuk pesan non-percakapan (OTP reset)
+  created_at            timestamptz not null default now(),
+  updated_at            timestamptz not null default now()
+);
+
+-- Nomor WhatsApp wajib unik lintas seluruh sistem: Fonnte menolak device dengan
+-- nomor kembar, dan webhook merutekan pesan masuk berdasarkan nomor penerima —
+-- nomor yang dipakai dua toko akan mengirim pesan pembeli ke toko yang salah.
+create unique index if not exists store_devices_phone_uidx on public.store_devices (phone);
+create index if not exists store_devices_store_idx on public.store_devices (store_id);
+create index if not exists store_devices_token_idx on public.store_devices (fonnte_token);
+-- Tepat satu device utama per toko.
+create unique index if not exists store_devices_primary_uidx
+  on public.store_devices (store_id) where is_primary;
+
 -- Indexing
 create index if not exists orders_order_id_idx on public.orders (order_id);
 create index if not exists orders_status_idx on public.orders (status);
@@ -98,6 +128,7 @@ create index if not exists conversations_store_phone_idx on public.conversations
 -- RLS Enablement
 alter table public.orders enable row level security;
 alter table public.stores enable row level security;
+alter table public.store_devices enable row level security;
 
 -- Auto-update timestamp trigger
 create or replace function public.set_updated_at()
@@ -117,6 +148,9 @@ create trigger trg_stores_updated_at before update on public.stores for each row
 drop trigger if exists trg_conversations_updated_at on public.conversations;
 create trigger trg_conversations_updated_at before update on public.conversations for each row execute function public.set_updated_at();
 
+drop trigger if exists trg_store_devices_updated_at on public.store_devices;
+create trigger trg_store_devices_updated_at before update on public.store_devices for each row execute function public.set_updated_at();
+
 -- =====================================================================
 --  MIGRASI untuk DB yang sudah ada (aman dijalankan berulang)
 -- =====================================================================
@@ -128,3 +162,37 @@ alter table public.stores add column if not exists coupon_used text;
 alter table public.stores add column if not exists reset_otp_hash text;
 alter table public.stores add column if not exists reset_otp_expires timestamptz;
 alter table public.stores add column if not exists webhook_url text;
+
+-- Pindahkan device yang sudah ada di `stores` menjadi baris `store_devices`
+-- utama. Hanya jalan untuk toko yang belum punya baris device sama sekali,
+-- jadi aman diulang dan tidak menimpa nomor yang ditambahkan lewat dashboard.
+--
+-- Syarat `fonnte_token` terisi itu penting: hanya token yang membuktikan device
+-- benar-benar ada di Fonnte. `customer_phone` selalu terisi sejak pendaftaran,
+-- jadi toko yang belum pernah scan QR justru harus dibiarkan kosong supaya
+-- dashboard menampilkan form "tambah nomor" (yang membuat device-nya), bukan
+-- baris tanpa token yang tombol Scan QR-nya mentok.
+insert into public.store_devices (store_id, label, phone, fonnte_token, device_status, webhook_url, is_primary)
+select
+  s.id,
+  'Nomor utama',
+  -- Normalkan ke 62xxx supaya cocok dengan field `device` pada webhook Fonnte.
+  case
+    when regexp_replace(s.customer_phone, '\D', '', 'g') like '62%'
+      then regexp_replace(s.customer_phone, '\D', '', 'g')
+    when regexp_replace(s.customer_phone, '\D', '', 'g') like '0%'
+      then '62' || substr(regexp_replace(s.customer_phone, '\D', '', 'g'), 2)
+    else '62' || regexp_replace(s.customer_phone, '\D', '', 'g')
+  end,
+  s.fonnte_token,
+  coalesce(s.fonnte_device_status, 'DISCONNECTED'),
+  s.webhook_url,
+  true
+from public.stores s
+where s.customer_phone is not null
+  and length(regexp_replace(s.customer_phone, '\D', '', 'g')) >= 9
+  and s.fonnte_token is not null
+  and s.fonnte_token <> ''
+  and not exists (select 1 from public.store_devices d where d.store_id = s.id)
+on conflict (phone) do nothing;
+

@@ -79,6 +79,46 @@ export async function createFonnteDevice(
 }
 
 /**
+ * Hapus Device di Fonnte memakai Account Token.
+ *
+ * Dipanggil saat pemilik toko melepas salah satu nomornya. Penting karena Fonnte
+ * menolak `add-device` untuk nomor yang masih terdaftar — tanpa penghapusan ini,
+ * nomor yang pernah dilepas tidak bisa disambungkan lagi.
+ *
+ * Kegagalan di sini TIDAK fatal: baris device tetap dihapus dari database supaya
+ * kuota paket user langsung bebas. Konsekuensinya nomor itu mungkin masih
+ * tersangkut di akun Fonnte dan perlu dihapus manual dari dashboard Fonnte.
+ */
+export async function deleteFonnteDevice(phone: string): Promise<{ success: boolean; error?: string }> {
+  const accountToken = process.env.FONNTE_TOKEN;
+  if (!accountToken) return { success: false, error: "FONNTE_TOKEN (account token) belum diatur." };
+
+  const devicePhone = formatFonntePhone(phone);
+  if (!devicePhone || devicePhone.replace(/\D/g, "").length < 8) {
+    return { success: false, error: "Nomor device tidak valid." };
+  }
+
+  try {
+    const formData = new URLSearchParams();
+    formData.append("device", devicePhone);
+
+    const res = await fetch("https://api.fonnte.com/delete-device", {
+      method: "POST",
+      headers: { Authorization: accountToken },
+      body: formData,
+      cache: "no-store"
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.status) return { success: true };
+    return { success: false, error: data.reason || data.message || "Gagal menghapus device Fonnte." };
+  } catch (err) {
+    console.error("[fonnte] Exception deleting device:", err);
+    return { success: false, error: String(err) };
+  }
+}
+
+/**
  * Set/Update URL webhook "incoming chat" pada sebuah device Fonnte secara
  * otomatis (tanpa user perlu setting manual di dashboard Fonnte).
  *
