@@ -1,25 +1,11 @@
 import { NextResponse } from "next/server";
-import { getFonnteQRCode, getFonnteDeviceStatus, createFonnteDevice, setFonnteWebhook, formatFonntePhone } from "@/lib/fonnte";
+import { getFonnteQRCode, getFonnteDeviceStatus, createFonnteDevice, formatFonntePhone } from "@/lib/fonnte";
 import { getStoreByEmail, upsertStore } from "@/lib/supabase";
 import { getSessionEmail } from "@/lib/auth";
+import { buildFonnteWebhookUrl, resolveBaseUrl, syncStoreWebhookUrl } from "@/lib/webhook-url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-/** URL webhook publik yang harus dituju device (dari ENV, fallback origin request). */
-function resolveWebhookUrl(req: Request): string {
-  const base =
-    process.env.NEXT_PUBLIC_BASE_URL ||
-    req.headers.get("origin") ||
-    new URL(req.url).origin;
-  const url = `${base.replace(/\/+$/, "")}/api/fonnte/webhook`;
-  // Sertakan shared secret bila dikonfigurasi. Webhook menolak request tanpa
-  // secret yang benar, jadi tanpa ini device tidak akan bisa mengirim pesan.
-  // Karena URL webhook disinkronkan otomatis (idempoten, lihat di bawah),
-  // device lama ikut diperbarui saat user membuka tab WhatsApp berikutnya.
-  const secret = process.env.FONNTE_WEBHOOK_SECRET;
-  return secret ? `${url}?secret=${encodeURIComponent(secret)}` : url;
-}
 
 /**
  * Ambil QR Code WhatsApp untuk di-scan di dalam Dashboard.
@@ -40,7 +26,7 @@ export async function GET(req: Request) {
   }
 
   let token = store.fonnte_token || "";
-  const desiredWebhook = resolveWebhookUrl(req);
+  const desiredWebhook = buildFonnteWebhookUrl(resolveBaseUrl(req));
   // Nomor device untuk parameter update-device (wajib oleh Fonnte).
   const deviceNumber = formatFonntePhone(phone || store.customer_phone || "");
   const deviceName = `${store.store_name || "Toko"}-${(store.id || "").slice(0, 8)}`;
@@ -71,15 +57,13 @@ export async function GET(req: Request) {
   }
 
   // Set/sinkronkan URL webhook ke device secara OTOMATIS (idempoten): hanya
-  // panggil update-device bila URL tujuan berubah dari yang tersimpan.
-  if (deviceNumber.replace(/\D/g, "").length >= 10 && store.webhook_url !== desiredWebhook) {
-    const hook = await setFonnteWebhook(token, deviceName, deviceNumber, desiredWebhook);
-    if (hook.success) {
-      await upsertStore({ email, webhook_url: desiredWebhook });
-    } else {
-      console.warn("[fonnte qr] gagal set webhook otomatis:", hook.error);
-    }
-  }
+  // panggil update-device bila URL tujuan berubah dari yang tersimpan. Pakai
+  // token & nomor terbaru, karena `store` bisa sudah usang setelah blok di atas
+  // membuat device baru.
+  await syncStoreWebhookUrl(
+    { ...store, fonnte_token: token, customer_phone: deviceNumber || store.customer_phone },
+    desiredWebhook
+  );
 
   const status = await getFonnteDeviceStatus(token);
   if (status.status) {
