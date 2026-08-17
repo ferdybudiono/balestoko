@@ -12,8 +12,41 @@ import { cookies } from "next/headers";
 export const SESSION_COOKIE = "bt_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 hari
 
+let warnedAuthSecretFallback = false;
+
+/**
+ * Kunci HMAC penanda tangan sesi.
+ *
+ * Urutan resolusi ini HARUS sama dengan yang ada di `middleware.ts`, kalau
+ * berbeda cookie yang diterbitkan di sini akan ditolak middleware.
+ */
 function getSecret(): string {
-  return process.env.AUTH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "dev-insecure-secret-change-me";
+  const explicit = process.env.AUTH_SECRET;
+  if (explicit) return explicit;
+
+  // Fallback ke service role key dipertahankan agar sesi yang sudah terbit
+  // tidak langsung batal. Bukan praktik yang baik: merotasi kunci database
+  // ikut memaksa semua user login ulang, dan satu rahasia dipakai dua tujuan.
+  const fallback = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (fallback) {
+    if (!warnedAuthSecretFallback) {
+      warnedAuthSecretFallback = true;
+      console.warn(
+        "[auth] AUTH_SECRET belum di-set — memakai SUPABASE_SERVICE_ROLE_KEY sebagai kunci HMAC. " +
+          "Set AUTH_SECRET agar rotasi kunci database tidak membatalkan seluruh sesi login."
+      );
+    }
+    return fallback;
+  }
+
+  // Konstanta di bawah ada di dalam repo publik: siapa pun bisa memalsukan
+  // cookie sesi untuk email mana pun. Hanya boleh dipakai saat development.
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "AUTH_SECRET (atau SUPABASE_SERVICE_ROLE_KEY) wajib di-set di produksi untuk menandatangani sesi login."
+    );
+  }
+  return "dev-insecure-secret-change-me";
 }
 
 // ---------------- PASSWORD ----------------

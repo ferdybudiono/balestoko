@@ -32,7 +32,27 @@ async function verifyToken(token: string | undefined, secret: string): Promise<b
 }
 
 export async function middleware(req: NextRequest) {
-  const secret = process.env.AUTH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "dev-insecure-secret-change-me";
+  // Urutan resolusi HARUS sama dengan getSecret() di lib/auth.ts.
+  const secret = process.env.AUTH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  // Tanpa rahasia, satu-satunya kunci yang tersisa adalah konstanta publik di
+  // repo — cookie sesi bisa dipalsukan siapa pun. Gagal tertutup: perlakukan
+  // sebagai belum login alih-alih memakai kunci yang sudah bocor.
+  if (!secret) {
+    if (process.env.NODE_ENV === "production") {
+      console.error("[middleware] AUTH_SECRET belum di-set; akses dashboard ditolak.");
+      const url = req.nextUrl.clone();
+      url.pathname = "/login";
+      url.search = "";
+      return NextResponse.redirect(url);
+    }
+    return handle(req, "dev-insecure-secret-change-me");
+  }
+
+  return handle(req, secret);
+}
+
+async function handle(req: NextRequest, secret: string) {
   const token = req.cookies.get(SESSION_COOKIE)?.value;
 
   if (!(await verifyToken(token, secret))) {

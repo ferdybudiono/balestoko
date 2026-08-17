@@ -334,7 +334,11 @@ export default function StoreTab({
           <p className="text-xs text-slate-400 mt-1.5">
             {hasMengantarKey
               ? "Key sudah tersimpan dan tidak pernah dikirim balik ke browser. Kosongkan kolom ini untuk membiarkannya, atau ketik key baru untuk menggantinya."
-              : "Tanpa key, sistem memakai endpoint publik Mengantar yang bisa dibatasi — akibatnya ongkir jatuh ke mode perkiraan."}
+              : "Opsional. Cek ongkir memakai endpoint publik Mengantar yang tidak butuh key, jadi tarif tetap live walau kolom ini kosong."}
+          </p>
+          <p className="text-xs text-slate-400 mt-1">
+            Ongkir jatuh ke mode <strong>perkiraan</strong> bukan karena key ini, melainkan karena
+            lokasi asal toko belum dipilih dari hasil pencarian Mengantar.
           </p>
 
           {/* Kolom kosong sengaja TIDAK menghapus key — penghapusan harus disengaja. */}
