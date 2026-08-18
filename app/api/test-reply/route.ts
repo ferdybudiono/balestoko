@@ -72,7 +72,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const rate = checkRateLimit(device.id || store.id || email, sender);
+  const rate = await checkRateLimit(device.id || store.id || email, sender);
   if (!rate.ok) {
     return NextResponse.json(
       { error: `Terlalu banyak percobaan. Coba lagi dalam ${rate.retryAfterSec} detik.` },

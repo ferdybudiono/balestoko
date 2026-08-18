@@ -175,3 +175,42 @@ export function formatIDR(amount: number): string {
     maximumFractionDigits: 0,
   }).format(amount);
 }
+
+// ── Periode langganan ────────────────────────────────────────────────────
+
+/**
+ * Panjang satu periode berbayar. Halaman harga menulis `/bulan`, jadi angka ini
+ * adalah satu-satunya tempat yang boleh mendefinisikan arti "satu bulan" itu.
+ */
+export const BILLING_PERIOD_DAYS = 30;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Akhir periode berbayar setelah satu pembayaran diterima.
+ *
+ * Dihitung dari titik AKHIR yang masih berlaku, bukan dari "sekarang": pelanggan
+ * yang memperpanjang lebih awal (atau upgrade di tengah periode) tidak kehilangan
+ * sisa hari yang sudah dibayarnya. Kalau langganan sudah lewat, periode baru
+ * dimulai dari sekarang — bukan menambal masa lalu.
+ */
+export function subscriptionEndAfterPayment(
+  currentEndsAt?: string | null,
+  nowMs: number = Date.now()
+): string {
+  const current = currentEndsAt ? new Date(currentEndsAt).getTime() : NaN;
+  const base = Number.isFinite(current) && current > nowMs ? current : nowMs;
+  return new Date(base + BILLING_PERIOD_DAYS * DAY_MS).toISOString();
+}
+
+/**
+ * Sisa hari langganan (dibulatkan ke atas). `null` bila tidak ada tanggal akhir.
+ * Nilai 0 atau negatif berarti sudah kedaluwarsa.
+ */
+export function daysUntil(endsAt?: string | null, nowMs: number = Date.now()): number | null {
+  if (!endsAt) return null;
+  const end = new Date(endsAt).getTime();
+  if (!Number.isFinite(end)) return null;
+  return Math.ceil((end - nowMs) / DAY_MS);
+}
+

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-import { getPrimaryStoreDevice, getStoreByEmail, upsertStore } from "@/lib/supabase";
+import { bumpRateLimit, getPrimaryStoreDevice, getStoreByEmail, upsertStore } from "@/lib/supabase";
 import { hashPassword } from "@/lib/auth";
 import { sendFonnteMessage } from "@/lib/fonnte";
 
@@ -9,10 +9,16 @@ export const dynamic = "force-dynamic";
 
 const OTP_TTL_MINUTES = 10;
 
-/** Sembunyikan sebagian nomor untuk ditampilkan: 6281234xxxx89. */
-function maskPhone(phone: string): string {
-  if (phone.length <= 6) return "••••";
-  return `${phone.slice(0, 5)}••••${phone.slice(-2)}`;
+/** Maksimal permintaan OTP per email per jam. */
+const REQUEST_MAX_PER_HOUR = 5;
+/** Maksimal permintaan OTP per alamat IP per jam (menghambat penyapuan email). */
+const REQUEST_MAX_PER_IP_PER_HOUR = 20;
+const HOUR_SECONDS = 3600;
+
+/** IP pemanggil di belakang proxy Vercel. */
+function clientIp(req: Request): string {
+  const fwd = req.headers.get("x-forwarded-for") || "";
+  return fwd.split(",")[0].trim() || req.headers.get("x-real-ip") || "unknown";
 }
 
 /**
@@ -25,7 +31,10 @@ function maskPhone(phone: string): string {
  * Konsekuensinya, reset via WhatsApp hanya tersedia bila toko sudah pernah
  * menghubungkan device WhatsApp-nya.
  *
- * Respons SELALU generik supaya tidak membocorkan apakah email terdaftar.
+ * Respons SELALU generik & IDENTIK, apa pun yang terjadi di belakang: tidak ada
+ * petunjuk nomor, tidak ada perbedaan pesan, dan jalur "email tidak ada" tidak
+ * lebih cepat mencolok daripada jalur normal. Membocorkan email mana yang
+ * terdaftar berarti menyerahkan daftar pelanggan ke siapa pun yang mau menebak.
  */
 export async function POST(req: Request) {
   let body: { email?: string };
@@ -38,11 +47,36 @@ export async function POST(req: Request) {
   const email = (body.email || "").trim();
   const GENERIC = {
     success: true,
-    message: "Jika email terdaftar, kode OTP telah dikirim ke WhatsApp yang terdaftar.",
+    message:
+      "Jika email terdaftar dan WhatsApp-nya sudah terhubung, kode OTP telah dikirim " +
+      "ke nomor WhatsApp yang terdaftar pada akun tersebut.",
   };
 
   if (!email) {
     return NextResponse.json({ error: "Email wajib diisi." }, { status: 400 });
+  }
+
+  // Batasi per IP lebih dulu — ini yang membendung penyapuan banyak email
+  // sekaligus. Ditegakkan di database supaya berlaku lintas instance serverless.
+  const byIp = await bumpRateLimit(`reset-req:ip:${clientIp(req)}`, HOUR_SECONDS, REQUEST_MAX_PER_IP_PER_HOUR);
+  if (!byIp.allowed) {
+    return NextResponse.json(
+      { error: "Terlalu banyak permintaan reset. Coba lagi nanti." },
+      { status: 429, headers: { "Retry-After": String(byIp.retryAfterSec) } }
+    );
+  }
+
+  // Batas per email: mencegah satu akun dibanjiri OTP (biaya kirim WA + gangguan
+  // ke pemilik toko). Dijalankan sebelum lookup, jadi tidak membocorkan apa pun.
+  const byEmail = await bumpRateLimit(
+    `reset-req:email:${email.toLowerCase()}`,
+    HOUR_SECONDS,
+    REQUEST_MAX_PER_HOUR
+  );
+  if (!byEmail.allowed) {
+    // Tetap balasan generik: kalau di sini bunyinya berbeda dari jalur normal,
+    // penyerang tahu email itu ada hanya dengan menembaknya 6 kali.
+    return NextResponse.json(GENERIC);
   }
 
   const store = await getStoreByEmail(email);
@@ -73,6 +107,9 @@ export async function POST(req: Request) {
     email,
     reset_otp_hash: hashPassword(otp),
     reset_otp_expires: expires,
+    // OTP baru = jatah percobaan baru. Tanpa reset ini, satu akun yang pernah
+    // kena batas percobaan tidak akan pernah bisa reset password lagi.
+    reset_otp_attempts: 0,
   });
 
   // Kirim OTP lewat device WhatsApp milik toko itu sendiri, ke nomor terdaftarnya.
@@ -89,5 +126,5 @@ export async function POST(req: Request) {
     console.warn("[reset] Gagal mengirim OTP via device toko:", sent.error);
   }
 
-  return NextResponse.json({ ...GENERIC, phoneHint: maskPhone(store.customer_phone) });
+  return NextResponse.json(GENERIC);
 }

@@ -2,6 +2,7 @@ import { processAICustomerService, type AIProcessResult } from "@/lib/ai";
 import { sendFonnteMessage } from "@/lib/fonnte";
 import { aiContextMessagesForPackage, monthlyConversationLimit, monthStartMs } from "@/lib/packages";
 import {
+  bumpRateLimit,
   countConversationsThisMonth,
   getConversation,
   getProductsByStoreId,
@@ -27,8 +28,12 @@ export interface AutoReplyOutcome {
 // ── Pembatas laju ────────────────────────────────────────────────────────
 // Tiap pesan masuk memicu panggilan Gemini + kirim WhatsApp berbayar, jadi
 // satu pengirim yang membanjiri (atau loop balasan antar-bot) harus dibendung.
-// Peta in-memory: cukup untuk satu instance serverless; pembatas lintas-region
-// butuh Redis, tapi ini sudah memblokir kasus banjir yang nyata.
+//
+// Penegakan UTAMA ada di database (`bump_rate_limit`), bukan di memori proses:
+// satu deployment serverless berjalan di banyak instance sekaligus, jadi peta
+// in-memory sebenarnya berarti "batas × jumlah instance". Peta lokal tetap
+// dipertahankan sebagai jaring kedua untuk saat RPC-nya tidak tersedia (env
+// belum di-set, atau `schema.sql` versi baru belum dijalankan).
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX_PER_SENDER = 8;
 const rateBuckets = new Map<string, number[]>();
@@ -41,7 +46,8 @@ function sweepRateBuckets(now: number): void {
   }
 }
 
-export function checkRateLimit(storeId: string, sender: string): { ok: boolean; retryAfterSec: number } {
+/** Pembatas cadangan: hanya berlaku untuk instance ini. */
+function checkRateLimitLocal(storeId: string, sender: string): { ok: boolean; retryAfterSec: number } {
   const now = Date.now();
   sweepRateBuckets(now);
   const key = `${storeId}:${sender}`;
@@ -53,6 +59,21 @@ export function checkRateLimit(storeId: string, sender: string): { ok: boolean; 
   hits.push(now);
   rateBuckets.set(key, hits);
   return { ok: true, retryAfterSec: 0 };
+}
+
+export async function checkRateLimit(
+  storeId: string,
+  sender: string
+): Promise<{ ok: boolean; retryAfterSec: number }> {
+  const verdict = await bumpRateLimit(
+    `wa:${storeId}:${sender}`,
+    Math.round(RATE_WINDOW_MS / 1000),
+    RATE_MAX_PER_SENDER
+  );
+  if (verdict.enforced) {
+    return { ok: verdict.allowed, retryAfterSec: verdict.retryAfterSec };
+  }
+  return checkRateLimitLocal(storeId, sender);
 }
 
 // ── Kuota percakapan bulanan ─────────────────────────────────────────────

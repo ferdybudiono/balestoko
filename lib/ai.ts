@@ -42,6 +42,102 @@ export interface AIProcessResult {
   detectedCity?: string;
   /** `mock` = tarif simulasi (lokasi asal toko belum valid), bukan tarif kurir asli. */
   rateSource?: RateSource;
+  /** Berat (gram) yang dipakai menghitung ongkir — berguna untuk audit tarif. */
+  shippingWeightGram?: number;
+}
+
+type ProductLike = { name: string; price: number; weight: number; description?: string };
+
+/** Di atas ini hampir pasti salah parse, dan kurir memang beda skema tarif. */
+const MAX_SHIPPING_WEIGHT_GRAM = 50_000;
+/** Batas jumlah unit yang diakui dari satu penyebutan produk. */
+const MAX_UNITS_PER_PRODUCT = 20;
+
+function normalizeForMatch(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Jumlah unit yang disebut di sekitar nama produk: "2 kaos", "kaos x3",
+ * "kaos 2 pcs". Tidak yakin → 1, karena menebak terlalu banyak berarti mengutip
+ * ongkir lebih mahal dari seharusnya.
+ */
+function unitsMentioned(haystack: string, needle: string): number {
+  const idx = haystack.indexOf(needle);
+  if (idx < 0) return 1;
+  const before = haystack.slice(Math.max(0, idx - 14), idx);
+  const after = haystack.slice(idx + needle.length, idx + needle.length + 14);
+
+  // `(?!\d)` / `(?:^|\D)` menjaga agar "kaos 250 gram" tidak dibaca 25 unit.
+  const raw =
+    /(?:^|\D)(\d{1,2})\s*(?:pcs|pes|buah|biji|unit|x)?\s*$/.exec(before)?.[1] ||
+    /^\s*(?:x|sebanyak)?\s*(\d{1,2})(?!\d)\s*(?:pcs|pes|buah|biji|unit)?/.exec(after)?.[1];
+
+  const n = raw ? parseInt(raw, 10) : 1;
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, MAX_UNITS_PER_PRODUCT);
+}
+
+export interface ShippingWeightBasis {
+  weightGram: number;
+  matched: Array<{ name: string; units: number; weight: number }>;
+  /** `matched` = berat produk yang disebut pembeli; `default` = asumsi toko. */
+  source: "matched" | "default";
+}
+
+/**
+ * Tentukan berat paket untuk kutipan ongkir.
+ *
+ * Dulu fungsi ini efektif `products[0].weight` — berat produk PERTAMA di katalog,
+ * siapa pun yang bertanya dan apa pun yang ditanyakan. Untuk toko dengan produk
+ * campur (misal gantungan kunci 50 g dan karpet 8 kg) itu salah kutip di setiap
+ * percakapan: terlalu murah = toko nombok, terlalu mahal = pembeli kabur.
+ *
+ * Sekarang: cocokkan nama produk terhadap pesan pembeli, jumlahkan berat yang
+ * cocok (kali jumlah unit bila disebut), dan bila TIDAK ADA yang cocok pakai
+ * `default_weight` yang diatur pemilik toko di dashboard — bukan produk acak.
+ */
+export function resolveShippingWeight(
+  message: string,
+  products: ProductLike[] = [],
+  defaultWeight?: number
+): ShippingWeightBasis {
+  const fallback = defaultWeight && defaultWeight > 0 ? defaultWeight : 1000;
+  const haystack = normalizeForMatch(message);
+  const matched: ShippingWeightBasis["matched"] = [];
+  let total = 0;
+
+  for (const p of products) {
+    const needle = normalizeForMatch(p?.name || "");
+    // Nama sangat pendek ("XL", "A") terlalu mudah cocok dengan kata biasa.
+    if (needle.length < 3 || !haystack.includes(needle)) continue;
+    const weight = Number(p?.weight);
+    if (!Number.isFinite(weight) || weight <= 0) continue;
+
+    const units = unitsMentioned(haystack, needle);
+    matched.push({ name: p.name, units, weight });
+    total += weight * units;
+  }
+
+  if (matched.length === 0 || total <= 0) {
+    return { weightGram: fallback, matched: [], source: "default" };
+  }
+  return {
+    weightGram: Math.min(total, MAX_SHIPPING_WEIGHT_GRAM),
+    matched,
+    source: "matched"
+  };
+}
+
+/** "1.200 gram" → "1,2 kg"; di bawah 1 kg tetap dalam gram. */
+function formatWeight(gram: number): string {
+  if (gram < 1000) return `${gram} gram`;
+  const kg = gram / 1000;
+  return `${kg.toLocaleString("id-ID", { maximumFractionDigits: 2 })} kg`;
 }
 
 /**
@@ -58,14 +154,27 @@ function formatOngkirWhatsApp(
   options: ShippingOption[],
   destinationCity: string,
   originCity: string,
-  source: RateSource
+  source: RateSource,
+  weight: ShippingWeightBasis
 ): string {
   const isEstimate = source === "mock";
 
   let text = isEstimate
     ? `📦 *Perkiraan Ongkir ke ${destinationCity}*\n`
     : `📦 *Informasi Tarif Ongkir ke ${destinationCity}*\n`;
-  text += `📍 *Pengiriman dari:* ${originCity}\n\n`;
+  text += `📍 *Pengiriman dari:* ${originCity}\n`;
+
+  // Selalu sebutkan berat yang dipakai. Ongkir tanpa dasar berat mudah jadi
+  // sengketa: pembeli merasa dikutip mahal, toko merasa sudah benar.
+  if (weight.source === "matched") {
+    const detail = weight.matched
+      .map((m) => (m.units > 1 ? `${m.units}× ${m.name}` : m.name))
+      .join(" + ");
+    text += `⚖️ *Berat paket:* ${formatWeight(weight.weightGram)} (${detail})\n\n`;
+  } else {
+    text += `⚖️ *Berat paket:* ${formatWeight(weight.weightGram)} (perkiraan)\n\n`;
+  }
+
   text += isEstimate
     ? `Berikut *perkiraan* ongkos kirim ya Kak:\n\n`
     : `Berikut adalah daftar pilihan ekspedisi & ongkos kirim:\n\n`;
@@ -90,6 +199,12 @@ function formatOngkirWhatsApp(
 
   if (isEstimate) {
     text += `_Catatan: angka di atas masih perkiraan. Tarif pastinya kami konfirmasi ulang sebelum pesanan diproses ya Kak._\n\n`;
+  }
+
+  if (weight.source === "default") {
+    // Pembeli belum menyebut produknya, jadi beratnya masih asumsi toko. Katakan
+    // terus terang — lebih murah daripada revisi ongkir setelah pembeli setuju.
+    text += `_Ongkir di atas dihitung untuk berat ${formatWeight(weight.weightGram)}. Sebutkan produk & jumlahnya supaya kami hitung ulang lebih tepat ya Kak._\n\n`;
   }
 
   text += `Silakan beri tahu kami ekspedisi pilihan Kakak atau jika ingin langsung lanjut ke pemesanan ya! 😊`;
@@ -221,27 +336,34 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     const destName = destLoc ? `${destLoc.subdistrict_name}, ${destLoc.city_name}` : targetLocationQuery;
     const destId = destLoc ? destLoc.id : "3273010";
 
-    // Berat estimasi: pakai berat produk bila ada, jika tidak pakai berat default
-    // toko yang diatur di dashboard (bukan lagi hardcode 1 kg).
-    const totalWeight = products.length > 0 ? products[0].weight : (defaultWeight || 1000);
+    // Berat paket: dari produk yang DISEBUT pembeli, bukan produk pertama di
+    // katalog. Tidak ada yang cocok → berat default toko dari dashboard.
+    const weightBasis = resolveShippingWeight(rawMessage, products, defaultWeight);
 
     const { rates, source: rateSource } = await calculateMengantarOngkir({
       originSubdistrictId,
       destinationSubdistrictId: destId,
-      weightGram: totalWeight,
+      weightGram: weightBasis.weightGram,
       apiKey: mengantarApiKey
     });
 
     // Kalau pencarian lokasi saja sudah jatuh ke mock, tarifnya pasti bukan live.
     const effectiveSource: RateSource = locSource === "mock" ? "mock" : rateSource;
-    const formattedOngkir = formatOngkirWhatsApp(rates, destName, originCityName, effectiveSource);
+    const formattedOngkir = formatOngkirWhatsApp(
+      rates,
+      destName,
+      originCityName,
+      effectiveSource,
+      weightBasis
+    );
 
     return {
       replyText: formattedOngkir,
       intent: "ONGKIR_CHECK",
       shippingDetails: rates,
       detectedCity: destName,
-      rateSource: effectiveSource
+      rateSource: effectiveSource,
+      shippingWeightGram: weightBasis.weightGram
     };
   }
 

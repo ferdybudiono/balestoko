@@ -4,6 +4,26 @@ import type { NextRequest } from "next/server";
 const SESSION_COOKIE = "bt_session";
 
 /**
+ * Penjaga rute dashboard.
+ *
+ * SENGAJA hanya memeriksa tanda tangan + kedaluwarsa cookie, tidak menyentuh
+ * database. Middleware berjalan di Edge runtime: `lib/supabase.ts`,
+ * `crypto.scryptSync`, dan pencabutan sesi lewat `password_changed_at` tidak
+ * tersedia di sini. Jadi lapisan ini hanya mencegah pengunjung tanpa cookie
+ * melihat kerangka dashboard — bukan lapisan otorisasi.
+ *
+ * Penegakan yang sebenarnya ada di dua tempat yang berjalan di Node runtime:
+ *   • `getSessionEmail()` di setiap route API — memverifikasi tanda tangan LAGI,
+ *     lalu menolak token yang terbit sebelum password terakhir diubah;
+ *   • status masa aktif dari `/api/store` — dashboard menampilkan layar terkunci
+ *     dan webhook menolak memproses pesan untuk akun nonaktif.
+ *
+ * Artinya: JANGAN pernah menaruh satu-satunya pemeriksaan kepemilikan data di
+ * file ini. Semua data toko tetap harus diambil lewat route yang memanggil
+ * `getSessionEmail()`.
+ */
+
+/**
  * Verifikasi tanda tangan token session pakai Web Crypto (kompatibel Edge runtime).
  * Token: base64url(payload).base64url(hmacSHA256(payload)).
  */

@@ -5,7 +5,7 @@
  * Semua fungsi di sini SERVER-ONLY karena memakai SERVICE_ROLE_KEY.
  */
 
-import { maxDevicesForPackage, monthStartMs } from "@/lib/packages";
+import { maxDevicesForPackage, monthStartMs, subscriptionEndAfterPayment } from "@/lib/packages";
 
 function getConfig(): { url: string; key: string } | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -29,11 +29,17 @@ export interface StoreRecord {
   package_id?: string;
   /** Akhir masa uji coba 7 hari (ISO). Null bila bukan trial / sudah bayar. */
   trial_ends_at?: string | null;
+  /** Akhir periode berbayar (ISO). Ditegakkan `isStoreActive` — lihat catatan di sana. */
+  subscription_ends_at?: string | null;
   /** Kode kupon yang sudah pernah dipakai akun ini (sekali pakai). */
   coupon_used?: string | null;
   /** Hash (scrypt) OTP reset password + kedaluwarsanya. */
   reset_otp_hash?: string | null;
   reset_otp_expires?: string | null;
+  /** Percobaan OTP gagal berturut-turut; OTP dibatalkan setelah batas. */
+  reset_otp_attempts?: number | null;
+  /** Sesi yang diterbitkan sebelum waktu ini ditolak (mencabut sesi lama). */
+  password_changed_at?: string | null;
   fonnte_token?: string;
   fonnte_device_status?: string;
   /** URL webhook incoming chat yang sudah disinkronkan ke device (idempotensi). */
@@ -101,19 +107,45 @@ export interface OrderRecord {
   customer_phone: string;
   customer_email: string;
   store_name: string;
-  password_hash?: string;
+  /** Hash password akun BARU. Null pada perpanjangan — lihat `is_renewal`. */
+  password_hash?: string | null;
   coupon_code?: string | null;
+  /**
+   * Order ini memperpanjang / meng-upgrade akun yang SUDAH ada.
+   * Dipakai untuk audit; penegakannya sendiri tidak bergantung pada flag ini
+   * (`applyPaidOrderToStore` selalu memeriksa ulang keberadaan toko).
+   */
+  is_renewal?: boolean;
   snap_token?: string | null;
   raw_notification?: Record<string, unknown> | null;
 }
 
+/** Field langganan yang dibutuhkan untuk menilai keaktifan sebuah toko. */
+type ActivityFields = Pick<StoreRecord, "is_paid" | "trial_ends_at" | "subscription_ends_at">;
+
 /**
  * Apakah toko masih boleh mengakses layanan?
- * Aktif bila sudah berbayar ATAU masih dalam masa uji coba yang belum kedaluwarsa.
+ *
+ * Aktif bila **periode berbayarnya belum lewat**, atau masih dalam masa uji coba
+ * yang belum kedaluwarsa.
+ *
+ * Catatan penting soal `subscription_ends_at` yang kosong: halaman harga menjual
+ * `/bulan`, jadi `is_paid` saja TIDAK boleh berarti akses selamanya. Tetapi baris
+ * peninggalan versi lama (dan DB yang belum menjalankan migrasi kolom ini) tidak
+ * punya tanggal akhir sama sekali — memperlakukannya sebagai kedaluwarsa akan
+ * mematikan pelanggan yang sedang membayar. Jadi kolom kosong = masih aktif, dan
+ * `schema.sql` mengisinya satu periode ke depan saat migrasi dijalankan.
  */
-export function isStoreActive(store: Pick<StoreRecord, "is_paid" | "trial_ends_at"> | null | undefined): boolean {
+export function isStoreActive(store: ActivityFields | null | undefined): boolean {
   if (!store) return false;
-  if (store.is_paid) return true;
+
+  if (store.is_paid) {
+    if (!store.subscription_ends_at) return true; // baris lama / belum termigrasi
+    const ends = new Date(store.subscription_ends_at).getTime();
+    if (Number.isFinite(ends) && ends > Date.now()) return true;
+    // Langganan berbayar lewat — masih boleh lanjut kalau trialnya (jarang) aktif.
+  }
+
   if (store.trial_ends_at) {
     const ends = new Date(store.trial_ends_at).getTime();
     return Number.isFinite(ends) && ends > Date.now();
@@ -121,11 +153,36 @@ export function isStoreActive(store: Pick<StoreRecord, "is_paid" | "trial_ends_a
   return false;
 }
 
+/**
+ * Kenapa toko tidak aktif — supaya dashboard bisa membedakan "trial habis, ayo
+ * langganan" dari "langganan habis, ayo perpanjang". Keduanya sama-sama diblokir
+ * bot, tapi kalimat yang benar berbeda.
+ */
+export type StoreActivityState = "active" | "trial" | "trial_expired" | "subscription_expired" | "inactive";
+
+export function storeActivityState(store: ActivityFields | null | undefined): StoreActivityState {
+  if (!store) return "inactive";
+  const paidActive =
+    !!store.is_paid &&
+    (!store.subscription_ends_at || new Date(store.subscription_ends_at).getTime() > Date.now());
+  if (paidActive) return "active";
+
+  const trialEnds = store.trial_ends_at ? new Date(store.trial_ends_at).getTime() : NaN;
+  const trialActive = Number.isFinite(trialEnds) && trialEnds > Date.now();
+  if (trialActive) return "trial";
+
+  if (store.is_paid) return "subscription_expired";
+  if (Number.isFinite(trialEnds)) return "trial_expired";
+  return "inactive";
+}
+
 interface DbResult<T = unknown> {
   ok: boolean;
   data?: T;
   error?: string;
   skipped?: boolean;
+  /** Operasi tidak dijalankan karena state-nya sudah tercapai (notifikasi duplikat). */
+  duplicate?: boolean;
 }
 
 function headers(key: string, prefer: string = "return=representation"): HeadersInit {
@@ -165,6 +222,58 @@ export async function insertPendingOrder(order: OrderRecord): Promise<DbResult> 
   }
 }
 
+/**
+ * Terapkan sebuah order yang LUNAS ke tabel `stores`.
+ *
+ * Dua aturan yang tidak boleh dilanggar di sini:
+ *
+ * 1. **Kalau tokonya sudah ada, jangan pernah menimpa kredensial & identitasnya.**
+ *    Order menyimpan `password_hash` dari form checkout. Menyalinnya ke baris yang
+ *    sudah ada berarti: (a) pelanggan sah yang checkout ulang untuk upgrade tanpa
+ *    sadar mereset password / nama toko / nomornya sendiri, dan (b) siapa pun yang
+ *    tahu email orang lain bisa membayar paket lalu mengambil alih akun itu dengan
+ *    password pilihannya. Perpanjangan hanya menyentuh field HAK PAKAI.
+ *
+ * 2. **Masa berlaku dihitung dari akhir periode yang masih ada**, supaya
+ *    perpanjangan lebih awal tidak menghanguskan sisa hari yang sudah dibayar.
+ */
+async function applyPaidOrderToStore(order: OrderRecord): Promise<DbResult<StoreRecord>> {
+  const email = (order.customer_email || "").trim();
+  if (!email) return { ok: false, error: "order tanpa customer_email" };
+
+  const existing = await getStoreByEmail(email);
+  const subscriptionEndsAt = subscriptionEndAfterPayment(existing?.subscription_ends_at);
+
+  // Field hak pakai — satu-satunya yang boleh berubah pada perpanjangan.
+  const entitlement = {
+    is_paid: true,
+    package_id: order.package_id,
+    subscription_ends_at: subscriptionEndsAt,
+    // Pembayaran lunas → hentikan masa trial (akun sudah penuh).
+    trial_ends_at: null,
+    // Tandai kupon terpakai supaya tidak bisa dipakai lagi oleh akun ini.
+    ...(order.coupon_code ? { coupon_used: order.coupon_code } : {})
+  };
+
+  if (existing) {
+    console.info(
+      `[supabase] order ${order.order_id} diterapkan sebagai PERPANJANGAN untuk ${email} ` +
+        `(paket ${order.package_id}, aktif s/d ${subscriptionEndsAt}).`
+    );
+    return upsertStore({ email, ...entitlement });
+  }
+
+  // Akun baru: di sinilah — dan hanya di sini — kredensial dari form dipakai.
+  return upsertStore({
+    email,
+    store_name: order.store_name,
+    customer_name: order.customer_name,
+    customer_phone: order.customer_phone,
+    ...(order.password_hash ? { password_hash: order.password_hash } : {}),
+    ...entitlement
+  });
+}
+
 export async function updateOrderStatus(
   orderId: string,
   status: string,
@@ -174,7 +283,16 @@ export async function updateOrderStatus(
   if (!cfg) return { ok: false, skipped: true };
 
   try {
-    const url = `${cfg.url}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`;
+    // Midtrans boleh mengirim notifikasi yang SAMA berkali-kali (retry, atau
+    // settlement menyusul capture). Untuk PAID, transisinya dikunci dengan
+    // `status=neq.PAID`: hanya request yang benar-benar mengubah status akan
+    // mengembalikan baris, jadi masa langganan mustahil diperpanjang dua kali
+    // oleh satu pembayaran.
+    const paidTransition = status === "PAID";
+    const url =
+      `${cfg.url}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}` +
+      (paidTransition ? "&status=neq.PAID" : "");
+
     const res = await fetch(url, {
       method: "PATCH",
       headers: headers(cfg.key, "return=representation"),
@@ -192,23 +310,20 @@ export async function updateOrderStatus(
     }
 
     const updated = await res.json();
+    const rows = Array.isArray(updated) ? updated : [];
 
-    // Jika pembayaran sukses, otomatis buat/aktifkan akun toko di tabel `stores`
-    if (status === "PAID" && Array.isArray(updated) && updated.length > 0) {
-      const order = updated[0] as OrderRecord;
-      await upsertStore({
-        email: order.customer_email,
-        store_name: order.store_name,
-        customer_name: order.customer_name,
-        customer_phone: order.customer_phone,
-        password_hash: order.password_hash,
-        is_paid: true,
-        // Pembayaran lunas → hentikan masa trial (akun sudah penuh).
-        trial_ends_at: null,
-        // Tandai kupon terpakai supaya tidak bisa dipakai lagi oleh akun ini.
-        ...(order.coupon_code ? { coupon_used: order.coupon_code } : {}),
-        package_id: order.package_id
-      });
+    if (paidTransition && rows.length === 0) {
+      // Sudah PAID sebelumnya (notifikasi duplikat) — bukan error, dan TIDAK
+      // boleh diterapkan ulang ke `stores`.
+      console.info(`[supabase] order ${orderId} sudah berstatus PAID, notifikasi duplikat diabaikan.`);
+      return { ok: true, data: [], duplicate: true };
+    }
+
+    if (paidTransition && rows.length > 0) {
+      const applied = await applyPaidOrderToStore(rows[0] as OrderRecord);
+      if (!applied.ok) {
+        console.error(`[supabase] order ${orderId} PAID tapi gagal mengaktifkan toko:`, applied.error);
+      }
     }
 
     return { ok: true, data: updated };
@@ -811,12 +926,59 @@ export async function countConversationsThisMonth(storeId: string): Promise<numb
   }
 }
 
-export async function getAllConversations(storeId: string): Promise<ConversationRecord[]> {
+/**
+ * Jumlah produk milik satu toko.
+ *
+ * Dipakai menegakkan batas jumlah produk saat menambah. Mengembalikan `null`
+ * bila hitungan gagal — pemanggilnya yang memutuskan; di sini kegagalan hitung
+ * TIDAK boleh diperlakukan sebagai "sudah penuh", karena itu memblokir pemilik
+ * toko menambah produk hanya gara-gara satu query bermasalah.
+ */
+export async function countProducts(storeId: string): Promise<number | null> {
+  const cfg = getConfig();
+  if (!cfg || !storeId) return null;
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/products?store_id=eq.${encodeURIComponent(storeId)}` +
+      `&select=id&limit=1`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "count=exact"),
+      cache: "no-store"
+    });
+    if (!res.ok) return null;
+
+    const total = (res.headers.get("content-range") || "").split("/")[1];
+    const parsed = Number(total);
+    return Number.isFinite(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Percakapan terbaru sebuah toko, terurut dari yang paling baru diperbarui.
+ *
+ * `limit` wajib punya nilai default yang masuk akal: dashboard memuat ulang
+ * daftar ini setiap kali polling, dan toko yang sudah lama jalan bisa punya
+ * puluhan ribu percakapan — mengirim semuanya ke browser tiap 30 detik membuat
+ * dashboard makin berat seiring toko makin sukses.
+ */
+export const CONVERSATIONS_PAGE_SIZE = 200;
+
+export async function getAllConversations(
+  storeId: string,
+  limit: number = CONVERSATIONS_PAGE_SIZE
+): Promise<ConversationRecord[]> {
   const cfg = getConfig();
   if (!cfg) return [];
 
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+
   try {
-    const url = `${cfg.url}/rest/v1/conversations?store_id=eq.${encodeURIComponent(storeId)}&order=updated_at.desc`;
+    const url =
+      `${cfg.url}/rest/v1/conversations?store_id=eq.${encodeURIComponent(storeId)}` +
+      `&order=updated_at.desc&limit=${safeLimit}`;
     const res = await fetch(url, {
       headers: headers(cfg.key, "return=representation"),
       cache: "no-store"
@@ -829,7 +991,73 @@ export async function getAllConversations(storeId: string): Promise<Conversation
   }
 }
 
+/**
+ * Batas panjang riwayat per percakapan yang disimpan di DB.
+ *
+ * Kolom `messages` dibaca & ditulis ulang setiap balasan, jadi riwayat yang
+ * tumbuh tanpa batas membuat setiap balasan makin mahal — untuk percakapan yang
+ * paling aktif, yang justru paling sering dibalas.
+ */
+const MAX_STORED_MESSAGES = 200;
+
+/**
+ * Simpan satu pasang pesan (pembeli + balasan bot) ke sebuah percakapan.
+ *
+ * Jalur utama memakai RPC `append_conversation_message` yang melakukan
+ * upsert + append + pemangkasan dalam SATU pernyataan SQL. Ini penting: dua
+ * pesan yang datang hampir bersamaan tidak boleh saling menimpa.
+ *
+ * Bila RPC belum ada (DB belum menjalankan `supabase/schema.sql` versi terbaru),
+ * fungsi ini jatuh ke jalur baca-ubah-tulis yang lama supaya bot tetap membalas —
+ * dengan peringatan di log, karena jalur itu punya celah lost-update.
+ */
 export async function saveConversationMessage(
+  storeId: string,
+  phone: string,
+  userMsg: string,
+  assistantReply: string,
+  intent?: string,
+  destinationCity?: string
+): Promise<DbResult> {
+  const cfg = getConfig();
+  if (!cfg) return { ok: false, skipped: true };
+
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/rpc/append_conversation_message`, {
+      method: "POST",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify({
+        p_store_id: storeId,
+        p_phone: phone,
+        p_user_msg: userMsg,
+        p_assistant_reply: assistantReply,
+        p_intent: intent ?? null,
+        p_destination_city: destinationCity ?? null,
+        p_max_messages: MAX_STORED_MESSAGES
+      }),
+      cache: "no-store"
+    });
+
+    if (res.ok) return { ok: true };
+
+    // 404 = fungsi belum ada di DB ini. Selain itu, kegagalan nyata.
+    if (res.status !== 404) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `append rpc ${res.status}: ${text}` };
+    }
+
+    console.warn(
+      "[supabase] RPC append_conversation_message belum ada — memakai jalur baca-ubah-tulis " +
+        "yang bisa kehilangan pesan saat dua chat datang bersamaan. Jalankan ulang supabase/schema.sql."
+    );
+    return saveConversationMessageLegacy(storeId, phone, userMsg, assistantReply, intent, destinationCity);
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Jalur lama: baca array, tambah di memori, tulis ulang. Rawan lost-update. */
+async function saveConversationMessageLegacy(
   storeId: string,
   phone: string,
   userMsg: string,
@@ -849,6 +1077,8 @@ export async function saveConversationMessage(
     newMessages.push({ role: "user", content: userMsg, timestamp: nowStr });
     newMessages.push({ role: "assistant", content: assistantReply, timestamp: nowStr });
 
+    const trimmed = newMessages.slice(-MAX_STORED_MESSAGES);
+
     let res: Response;
     if (existing && existing.id) {
       const url = `${cfg.url}/rest/v1/conversations?id=eq.${existing.id}`;
@@ -856,7 +1086,7 @@ export async function saveConversationMessage(
         method: "PATCH",
         headers: headers(cfg.key, "return=representation"),
         body: JSON.stringify({
-          messages: newMessages,
+          messages: trimmed,
           last_intent: intent || existing.last_intent,
           destination_city: destinationCity || existing.destination_city,
           updated_at: nowStr
@@ -870,7 +1100,7 @@ export async function saveConversationMessage(
         body: JSON.stringify({
           store_id: storeId,
           customer_phone: phone,
-          messages: newMessages,
+          messages: trimmed,
           last_intent: intent,
           destination_city: destinationCity
         }),
@@ -883,3 +1113,91 @@ export async function saveConversationMessage(
     return { ok: false, error: String(err) };
   }
 }
+
+// ---------------- RATE LIMIT (lintas instance) ----------------
+
+export interface RateLimitVerdict {
+  allowed: boolean;
+  hits: number;
+  retryAfterSec: number;
+  /** `false` = pemeriksaan DB tidak tersedia; pemanggil harus pakai cadangan lokal. */
+  enforced: boolean;
+}
+
+/**
+ * Naikkan hitungan untuk sebuah kunci dan putuskan apakah masih di bawah batas.
+ *
+ * Ditegakkan di database, bukan di memori proses, karena satu deployment
+ * serverless bisa berjalan di banyak instance sekaligus — batas in-memory
+ * sebenarnya berarti "batas × jumlah instance".
+ *
+ * Kalau DB/RPC tidak tersedia, `enforced: false` dikembalikan dan permintaan
+ * DIIZINKAN: pembatas laju adalah pelindung biaya, bukan gerbang kebenaran, dan
+ * memblokir seluruh bot pelanggan karena satu query gagal lebih merugikan.
+ */
+export async function bumpRateLimit(
+  key: string,
+  windowSeconds: number,
+  max: number
+): Promise<RateLimitVerdict> {
+  const cfg = getConfig();
+  const fallback: RateLimitVerdict = { allowed: true, hits: 0, retryAfterSec: 0, enforced: false };
+  if (!cfg || !key) return fallback;
+
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/rpc/bump_rate_limit`, {
+      method: "POST",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify({ p_key: key, p_window_seconds: windowSeconds, p_max: max }),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      if (res.status === 404) {
+        console.warn(
+          "[supabase] RPC bump_rate_limit belum ada — pembatas laju hanya berlaku per instance. " +
+            "Jalankan ulang supabase/schema.sql."
+        );
+      }
+      return fallback;
+    }
+
+    const data = (await res.json()) as { allowed?: boolean; hits?: number; retry_after?: number };
+    return {
+      allowed: data.allowed !== false,
+      hits: Number(data.hits) || 0,
+      retryAfterSec: Math.max(0, Number(data.retry_after) || 0),
+      enforced: true
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Metadata autentikasi sebuah akun — query ringan khusus untuk validasi sesi.
+ * Sengaja hanya memilih kolom yang dibutuhkan supaya tidak menarik seluruh baris
+ * (termasuk token pihak ketiga) di setiap request yang terautentikasi.
+ *
+ * `undefined` = query gagal / env belum di-set (pemanggil harus gagal-terbuka),
+ * `null` = akunnya memang tidak ada.
+ */
+export async function getStoreAuthMeta(
+  email: string
+): Promise<{ password_changed_at: string | null } | null | undefined> {
+  const cfg = getConfig();
+  if (!cfg || !email) return undefined;
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/stores?email=eq.${encodeURIComponent(email)}` +
+      `&select=password_changed_at&limit=1`;
+    const res = await fetch(url, { headers: headers(cfg.key, "return=representation"), cache: "no-store" });
+    if (!res.ok) return undefined;
+    const list = await res.json();
+    if (!Array.isArray(list) || list.length === 0) return null;
+    return { password_changed_at: list[0]?.password_changed_at ?? null };
+  } catch {
+    return undefined;
+  }
+}
+

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import {
+  countProducts,
   insertProduct,
   updateProduct,
   deleteProduct,
@@ -15,6 +16,16 @@ export const dynamic = "force-dynamic";
 const MAX_PRICE = 1_000_000_000; // Rp 1 miliar
 const MAX_WEIGHT = 50_000; // 50 kg
 const MAX_STOCK = 1_000_000;
+
+/**
+ * Batas jumlah produk per toko.
+ *
+ * Bukan soal ruang penyimpanan: SELURUH katalog ikut masuk ke prompt Gemini pada
+ * pertanyaan produk (lihat `lib/ai.ts`). Katalog tanpa batas berarti prompt tanpa
+ * batas — biaya token membengkak, balasan makin lambat, dan pada titik tertentu
+ * permintaannya ditolak model. 300 sudah jauh di atas kebutuhan toko WA biasa.
+ */
+const MAX_PRODUCTS = 300;
 
 /** Ambil store milik user yang sedang login, atau null. */
 async function getSessionStore() {
@@ -106,6 +117,19 @@ export async function POST(req: Request) {
     const parsed = parseProductFields(body, false);
     if (!parsed.ok) {
       return NextResponse.json({ error: parsed.error }, { status: 400 });
+    }
+
+    // Hitungan gagal (`null`) dibiarkan lewat: memblokir pemilik toko menambah
+    // produk karena satu query bermasalah lebih merugikan daripada kelebihan
+    // beberapa baris di atas batas.
+    const existing = await countProducts(store.id);
+    if (existing !== null && existing >= MAX_PRODUCTS) {
+      return NextResponse.json(
+        {
+          error: `Katalog sudah mencapai batas ${MAX_PRODUCTS} produk. Hapus produk yang tidak dipakai lebih dulu.`
+        },
+        { status: 409 }
+      );
     }
 
     // store_id dikunci ke store milik session — abaikan store_id dari client.

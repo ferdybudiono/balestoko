@@ -5,10 +5,11 @@ import {
   getAllConversations,
   getProductsByStoreId,
   listStoreDevicesCompat,
+  storeActivityState,
   toPublicDevice
 } from "@/lib/supabase";
 import { getFonnteDeviceStatus } from "@/lib/fonnte";
-import { maxDevicesForPackage } from "@/lib/packages";
+import { daysUntil, maxDevicesForPackage } from "@/lib/packages";
 import { getSessionEmail } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -41,7 +42,8 @@ export async function GET(req: Request) {
         products: [],
         devices: [],
         deviceLimit: maxDevicesForPackage(null),
-        devicesNeedMigration: false
+        devicesNeedMigration: false,
+        activity: { state: "inactive", active: false, endsAt: null, daysLeft: null }
       });
     }
 
@@ -79,10 +81,20 @@ export async function GET(req: Request) {
       password_hash: _omitPw,
       reset_otp_hash: _omitOtp,
       reset_otp_expires: _omitOtpExp,
+      reset_otp_attempts: _omitOtpTries,
       fonnte_token: fonnteToken,
       mengantar_api_key: mengantarKey,
       ...safeStore
     } = store;
+
+    // Status masa aktif: dashboard perlu ini untuk menampilkan layar terkunci &
+    // peringatan "langganan habis dalam N hari". Dihitung di server supaya
+    // aturannya satu — sama dengan yang dipakai webhook menolak pesan masuk.
+    const state = storeActivityState(store);
+    const endsAt =
+      state === "trial" || state === "trial_expired"
+        ? store.trial_ends_at || null
+        : store.subscription_ends_at || null;
 
     return NextResponse.json({
       store: {
@@ -95,7 +107,13 @@ export async function GET(req: Request) {
       products,
       devices: devices.map(toPublicDevice),
       deviceLimit: maxDevicesForPackage(store.package_id),
-      devicesNeedMigration: legacy
+      devicesNeedMigration: legacy,
+      activity: {
+        state,
+        active: state === "active" || state === "trial",
+        endsAt,
+        daysLeft: daysUntil(endsAt)
+      }
     });
   } catch (err) {
     console.error("[store] GET gagal:", err);

@@ -14,7 +14,6 @@ export default function ResetPasswordPage() {
   const [otp, setOtp] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [phoneHint, setPhoneHint] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
@@ -36,7 +35,8 @@ export default function ResetPasswordPage() {
         setError(data?.error || "Gagal mengirim OTP.");
         return;
       }
-      setPhoneHint(data?.phoneHint || "");
+      // Sengaja tidak ada petunjuk nomor tujuan di sini: server tidak lagi
+      // mengirimkannya supaya respons tidak membocorkan email mana yang terdaftar.
       setInfo(data?.message || "OTP telah dikirim.");
       setStep("verify");
     } catch {
@@ -93,7 +93,7 @@ export default function ResetPasswordPage() {
           )}
           {info && step === "verify" && (
             <div className="mb-4 rounded-xl bg-emerald-50 border border-emerald-200 px-3.5 py-2.5 text-sm text-emerald-700">
-              {info}{phoneHint ? ` (${phoneHint})` : ""}
+              {info}
             </div>
           )}
 

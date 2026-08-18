@@ -27,7 +27,12 @@ type Status =
   | { kind: "paying" }
   | { kind: "success"; orderId: string }
   | { kind: "pending"; orderId: string }
-  | { kind: "error"; message: string };
+  /**
+   * `needsLogin` = email sudah punya akun, jadi ini PERPANJANGAN dan server minta
+   * bukti kepemilikan (sesi) sebelum menerima pembayaran. Tanpa tautan login di
+   * sini, pelanggan lama yang mau memperpanjang mentok tanpa jalan keluar.
+   */
+  | { kind: "error"; message: string; needsLogin?: boolean };
 
 interface CheckoutModalProps {
   plan: Plan | null;
@@ -63,9 +68,16 @@ export default function CheckoutModal({
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [errors, setErrors] = useState<Partial<FormState>>({});
   const [status, setStatus] = useState<Status>({ kind: "idle" });
+  /**
+   * Email pemilik sesi yang sedang login, bila ada. Kehadirannya mengubah arti
+   * formulir ini: pembayaran menjadi PERPANJANGAN akun tersebut, bukan pendaftaran
+   * akun baru — jadi kata sandi tidak lagi diminta dan email dikunci.
+   */
+  const [sessionEmail, setSessionEmail] = useState<string | null>(null);
   const firstFieldRef = useRef<HTMLInputElement>(null);
 
   const busy = status.kind === "submitting" || status.kind === "paying";
+  const isRenewal = !!sessionEmail;
 
   // Reset saat modal dibuka untuk paket baru.
   useEffect(() => {
@@ -77,6 +89,27 @@ export default function CheckoutModal({
       return () => clearTimeout(t);
     }
   }, [open, plan?.id]);
+
+  // Cek sesi hanya saat modal dibuka — halaman harga tidak perlu membayar
+  // permintaan ini sampai pengunjung benar-benar berniat membayar.
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    fetch("/api/auth/session")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!alive || !d?.email) return;
+        setSessionEmail(d.email);
+        setForm((f) => ({ ...f, email: d.email }));
+      })
+      .catch(() => {
+        // Gagal mengecek sesi → perlakukan sebagai pengunjung baru. Server tetap
+        // jadi otoritas: perpanjangan tanpa sesi akan ditolak dengan 409.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open]);
 
   // Tutup dengan tombol ESC.
   useEffect(() => {
@@ -122,7 +155,8 @@ export default function CheckoutModal({
     if (!EMAIL_RE.test(form.email)) next.email = "Format email salah.";
     if (form.storeName.trim().length < 2)
       next.storeName = "Nama toko wajib diisi.";
-    if (form.password.length < 6)
+    // Perpanjangan memakai akun yang sudah ada, jadi tidak ada kata sandi baru.
+    if (!isRenewal && form.password.length < 6)
       next.password = "Kata sandi minimal 6 karakter.";
     setErrors(next);
     return Object.keys(next).length === 0;
@@ -145,7 +179,7 @@ export default function CheckoutModal({
           whatsapp: form.whatsapp,
           email: form.email,
           storeName: form.storeName,
-          password: form.password,
+          password: isRenewal ? undefined : form.password,
           coupon: form.coupon.trim() || undefined,
         }),
       });
@@ -156,6 +190,7 @@ export default function CheckoutModal({
         setStatus({
           kind: "error",
           message: data?.error || "Gagal memproses checkout.",
+          needsLogin: !!data?.needsLogin,
         });
         return;
       }
@@ -268,6 +303,17 @@ export default function CheckoutModal({
             </div>
 
             <div className="space-y-3.5">
+              {isRenewal && (
+                <div className="flex items-start gap-2 rounded-xl bg-brand-50 px-3.5 py-3 text-sm text-brand-800">
+                  <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>
+                    Pembayaran ini masuk ke akun{" "}
+                    <strong className="break-all">{sessionEmail}</strong> yang sedang login — bukan
+                    akun baru. Produk, nomor WhatsApp, dan riwayat chat Anda tetap utuh. Masa aktif
+                    30 hari; bila langganan sekarang masih berjalan, sisa harinya ditambahkan.
+                  </span>
+                </div>
+              )}
               <Field
                 ref={firstFieldRef}
                 icon={<User className="h-4 w-4" />}
@@ -298,6 +344,8 @@ export default function CheckoutModal({
                 type="email"
                 inputMode="email"
                 autoComplete="email"
+                readOnly={isRenewal}
+                hint={isRenewal ? "Terkunci ke akun yang sedang login." : undefined}
               />
               <Field
                 icon={<Store className="h-4 w-4" />}
@@ -308,18 +356,21 @@ export default function CheckoutModal({
                 error={errors.storeName}
                 autoComplete="organization"
               />
-              <Field
-                icon={<Lock className="h-4 w-4" />}
-                label="Kata Sandi (untuk login dashboard)"
-                placeholder="min. 6 karakter"
-                value={form.password}
-                onChange={(v) => update("password", v)}
-                error={errors.password}
-                type="password"
-                revealable
-                autoComplete="new-password"
-              />
-              <div>
+              {/* Perpanjangan tidak membuat akun baru, jadi tidak ada kata sandi
+                  baru — dan server memang mengabaikannya untuk kasus ini. */}
+              {!isRenewal && (
+                <Field
+                  icon={<Lock className="h-4 w-4" />}
+                  label="Kata Sandi (untuk login dashboard)"
+                  placeholder="min. 6 karakter"
+                  value={form.password}
+                  onChange={(v) => update("password", v)}
+                  error={errors.password}
+                  type="password"
+                  revealable
+                  autoComplete="new-password"
+                />
+              )}              <div>
                 <Field
                   icon={<Ticket className="h-4 w-4" />}
                   label="Kode Kupon (opsional)"
@@ -344,7 +395,17 @@ export default function CheckoutModal({
             {status.kind === "error" && (
               <div className="mt-4 flex items-start gap-2 rounded-xl bg-red-50 px-3.5 py-3 text-sm text-red-700">
                 <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                <span>{status.message}</span>
+                <div className="min-w-0">
+                  <span>{status.message}</span>
+                  {status.needsLogin && (
+                    <a
+                      href="/login"
+                      className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-red-700"
+                    >
+                      Login ke akun saya <ArrowRight className="h-3.5 w-3.5" />
+                    </a>
+                  )}
+                </div>
               </div>
             )}
 
@@ -395,6 +456,10 @@ interface FieldProps {
   revealable?: boolean;
   inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
   autoComplete?: string;
+  /** Nilainya sudah ditentukan (mis. email dari sesi yang sedang login). */
+  readOnly?: boolean;
+  /** Keterangan kecil di bawah input; disembunyikan bila ada `error`. */
+  hint?: string;
 }
 
 const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
@@ -409,6 +474,8 @@ const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
     revealable = false,
     inputMode,
     autoComplete,
+    readOnly = false,
+    hint,
   },
   ref
 ) {
@@ -430,10 +497,11 @@ const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
           autoComplete={autoComplete}
           placeholder={placeholder}
           value={value}
+          readOnly={readOnly}
           onChange={(e) => onChange(e.target.value)}
-          className={`w-full rounded-xl border bg-white py-2.5 pl-10 text-sm text-ink outline-none transition placeholder:text-slate-400 focus:ring-4 ${
-            revealable ? "pr-10" : "pr-3.5"
-          } ${
+          className={`w-full rounded-xl border py-2.5 pl-10 text-sm text-ink outline-none transition placeholder:text-slate-400 focus:ring-4 ${
+            readOnly ? "bg-slate-50 text-ink-soft" : "bg-white"
+          } ${revealable ? "pr-10" : "pr-3.5"} ${
             error
               ? "border-red-300 focus:border-red-400 focus:ring-red-100"
               : "border-slate-200 focus:border-brand-400 focus:ring-brand-100"
@@ -452,6 +520,9 @@ const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
       </div>
       {error && (
         <span className="mt-1 block text-xs text-red-600">{error}</span>
+      )}
+      {!error && hint && (
+        <span className="mt-1 block text-xs text-slate-400">{hint}</span>
       )}
     </label>
   );

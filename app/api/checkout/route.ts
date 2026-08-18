@@ -3,7 +3,7 @@ import crypto from "crypto";
 import { getPlan, isPackageId } from "@/lib/packages";
 import { createSnapTransaction } from "@/lib/midtrans";
 import { insertPendingOrder, getStoreByEmail } from "@/lib/supabase";
-import { hashPassword } from "@/lib/auth";
+import { hashPassword, getSessionEmail } from "@/lib/auth";
 import { validateCouponForPlan, applyDiscount } from "@/lib/coupons";
 
 // Route ini butuh Node runtime (pakai crypto & Buffer) dan selalu dinamis.
@@ -81,7 +81,38 @@ export async function POST(req: Request) {
       { status: 400 }
     );
   }
-  if (!password || password.length < 6) {
+
+  const cleanEmail = email.trim();
+
+  // ---- Akun baru atau perpanjangan? ----
+  //
+  // Pemeriksaan ini dilakukan SEBELUM apa pun dan tanpa syarat (dulu hanya ada di
+  // dalam cabang kupon). Order menyimpan hash password dari form ini, dan order
+  // yang lunas akan diterapkan ke tabel `stores` — jadi checkout atas email yang
+  // sudah terdaftar wajib membuktikan kepemilikan lebih dulu. Kalau tidak, siapa
+  // pun yang tahu email orang lain bisa membayar paket dan mengambil alih akunnya.
+  const existing = await getStoreByEmail(cleanEmail);
+  const isRenewal = !!existing;
+
+  if (isRenewal) {
+    const sessionEmail = await getSessionEmail();
+    if (sessionEmail?.toLowerCase() !== cleanEmail.toLowerCase()) {
+      return NextResponse.json(
+        {
+          error:
+            "Email ini sudah terdaftar. Silakan login dulu, lalu ulangi pembayaran dari dashboard " +
+            "untuk memperpanjang atau upgrade paket.",
+          needsLogin: true,
+        },
+        { status: 409 }
+      );
+    }
+  }
+
+  // Password hanya relevan untuk akun BARU. Pada perpanjangan, apa pun yang
+  // diisi di form diabaikan — kredensial akun yang sudah ada tidak boleh
+  // tersentuh oleh alur pembayaran.
+  if (!isRenewal && (!password || password.length < 6)) {
     return NextResponse.json(
       { error: "Kata sandi wajib diisi (min. 6 karakter)." },
       { status: 400 }
@@ -105,8 +136,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // Kupon hanya untuk AKUN BARU & sekali pakai. Cek toko yang sudah ada.
-    const existing = await getStoreByEmail(email.trim());
+    // Kupon hanya untuk AKUN BARU & sekali pakai. `existing` sudah diambil di atas.
     if (existing?.is_paid) {
       return NextResponse.json(
         { error: "Kupon hanya berlaku untuk akun baru yang belum berlangganan." },
@@ -141,14 +171,19 @@ export async function POST(req: Request) {
       customer: {
         first_name: firstName,
         last_name: rest.join(" ") || undefined,
-        email: email.trim(),
+        email: cleanEmail,
         phone,
       },
       items: [
         {
           id: plan.id,
+          // Nama item ini muncul di struk Midtrans pembeli, jadi harus jujur:
+          // "perpanjangan" hanya benar bila langganannya memang sudah berjalan.
+          // Akun uji coba yang baru berbayar pertama kali BUKAN perpanjangan.
           name: appliedCoupon
             ? `Paket ${plan.name} (Kupon ${appliedCoupon})`
+            : existing?.is_paid
+            ? `Perpanjangan Paket ${plan.name} - Bot WA CS AI`
             : `Paket ${plan.name} - Bot WA CS AI`,
           price: grossAmount,
           quantity: 1,
@@ -160,6 +195,7 @@ export async function POST(req: Request) {
         store_name: storeName.trim(),
         whatsapp: phone,
         coupon: appliedCoupon,
+        is_renewal: isRenewal,
       },
       callbackFinishUrl: `${baseUrl}/?order=${orderId}`,
     });
@@ -173,10 +209,13 @@ export async function POST(req: Request) {
       status: "PENDING",
       customer_name: cleanName,
       customer_phone: phone,
-      customer_email: email.trim(),
+      customer_email: cleanEmail,
       store_name: storeName.trim(),
-      password_hash: hashPassword(password),
+      // Perpanjangan tidak pernah membawa hash password. Kalaupun logika di
+      // hilir berubah, tidak ada kredensial di order ini yang bisa menimpa akun.
+      password_hash: isRenewal ? null : hashPassword(password!),
       coupon_code: appliedCoupon,
+      is_renewal: isRenewal,
       snap_token: snap.token,
     });
 
@@ -186,6 +225,7 @@ export async function POST(req: Request) {
       redirect_url: snap.redirect_url,
       order_id: orderId,
       persisted: saved.ok,
+      is_renewal: isRenewal,
     });
   } catch (err) {
     console.error("[checkout] error:", err);

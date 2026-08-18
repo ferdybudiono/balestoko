@@ -15,8 +15,9 @@ create table if not exists public.orders (
   customer_phone    text not null,
   customer_email    text not null,
   store_name        text not null,
-  password_hash     text,                           -- hash password (scrypt) — disalin ke stores saat PAID
+  password_hash     text,                           -- hash password (scrypt) — HANYA untuk akun baru; null pada perpanjangan
   coupon_code       text,                           -- kode kupon yang dipakai (mis. 'ferdybudiono'), null jika tanpa kupon
+  is_renewal        boolean not null default false, -- true = perpanjangan/upgrade akun yang SUDAH ada
   snap_token        text,
   raw_notification  jsonb,                          -- payload webhook Midtrans terakhir
   created_at        timestamptz not null default now(),
@@ -32,15 +33,26 @@ create table if not exists public.stores (
   customer_name         text,
   customer_phone        text,
   is_paid               boolean not null default false,
-  package_id            text default 'pro',
+  -- Default sengaja paket TERKECIL: baris yang package_id-nya gagal terisi tidak
+  -- boleh otomatis mendapat hak paket termahal.
+  package_id            text default 'starter',
 
-  -- Trial & Kupon
-  trial_ends_at         timestamptz,                    -- akhir masa uji coba 7 hari (null jika bukan/atau sudah bayar)
+  -- Langganan & Trial
+  --   trial_ends_at        : akhir masa uji coba 7 hari
+  --   subscription_ends_at : akhir periode berbayar. `/bulan` di halaman harga
+  --                          hanya jujur kalau kolom ini ada dan ditegakkan —
+  --                          tanpa ini satu kali bayar = akses selamanya.
+  trial_ends_at         timestamptz,
+  subscription_ends_at  timestamptz,
   coupon_used           text,                           -- kode kupon yang sudah pernah dipakai akun ini (sekali pakai)
 
   -- Reset Password via WhatsApp OTP
   reset_otp_hash        text,                           -- hash (scrypt) dari OTP reset password
   reset_otp_expires     timestamptz,                    -- kedaluwarsa OTP reset (mis. 10 menit)
+  reset_otp_attempts    integer not null default 0,     -- percobaan OTP gagal; OTP dibatalkan setelah batas
+  -- Sesi yang diterbitkan SEBELUM waktu ini ditolak. Diisi setiap password
+  -- berubah, supaya reset password benar-benar mengeluarkan penyerang.
+  password_changed_at   timestamptz,
 
   -- Fonnte WA Settings
   fonnte_token          text,
@@ -118,17 +130,42 @@ create index if not exists store_devices_token_idx on public.store_devices (fonn
 create unique index if not exists store_devices_primary_uidx
   on public.store_devices (store_id) where is_primary;
 
+-- 6. Tabel Rate Limits (pembatas laju lintas-instance)
+--
+--    Peta in-memory hanya berlaku per instance serverless: dua region yang
+--    melayani nomor yang sama masing-masing punya hitungan sendiri, jadi batas
+--    8 pesan/menit bisa jadi 8 × jumlah instance. Tabel ini memindahkan
+--    hitungannya ke satu tempat yang dilihat semua instance.
+create table if not exists public.rate_limits (
+  key           text primary key,
+  window_start  timestamptz not null default now(),
+  hits          integer not null default 0,
+  updated_at    timestamptz not null default now()
+);
+
+create index if not exists rate_limits_updated_idx on public.rate_limits (updated_at);
+
 -- Indexing
 create index if not exists orders_order_id_idx on public.orders (order_id);
 create index if not exists orders_status_idx on public.orders (status);
 create index if not exists stores_email_idx on public.stores (email);
 create index if not exists stores_fonnte_token_idx on public.stores (fonnte_token);
 create index if not exists conversations_store_phone_idx on public.conversations (store_id, customer_phone);
+-- Dipakai hitungan kuota bulanan (store_id + updated_at >= awal bulan) dan
+-- pemuatan daftar percakapan dashboard yang selalu diurutkan updated_at desc.
+create index if not exists conversations_store_updated_idx
+  on public.conversations (store_id, updated_at desc);
 
 -- RLS Enablement
+-- Tanpa policy publik = hanya bisa diakses Service Role dari server. `products`
+-- dan `conversations` ikut dinyalakan: aplikasi memang tidak memakai anon key,
+-- tapi RLS yang mati akan membuka kedua tabel itu begitu ada satu saja yang pakai.
 alter table public.orders enable row level security;
 alter table public.stores enable row level security;
 alter table public.store_devices enable row level security;
+alter table public.products enable row level security;
+alter table public.conversations enable row level security;
+alter table public.rate_limits enable row level security;
 
 -- Auto-update timestamp trigger
 create or replace function public.set_updated_at()
@@ -152,6 +189,113 @@ drop trigger if exists trg_store_devices_updated_at on public.store_devices;
 create trigger trg_store_devices_updated_at before update on public.store_devices for each row execute function public.set_updated_at();
 
 -- =====================================================================
+--  FUNGSI RPC (dipanggil server lewat /rest/v1/rpc/<nama>)
+-- =====================================================================
+
+-- Ambil `p_max` elemen TERAKHIR sebuah array jsonb, urutannya dipertahankan.
+create or replace function public.trim_jsonb_tail(p_arr jsonb, p_max integer)
+returns jsonb language sql immutable as $$
+  select case
+    when p_max is null or p_arr is null or jsonb_array_length(p_arr) <= p_max then p_arr
+    else (
+      select coalesce(jsonb_agg(elem order by ord), '[]'::jsonb)
+      from jsonb_array_elements(p_arr) with ordinality as t(elem, ord)
+      where ord > jsonb_array_length(p_arr) - p_max
+    )
+  end;
+$$;
+
+-- Tambahkan satu pasang pesan (pembeli + balasan bot) ke sebuah percakapan.
+--
+-- KENAPA RPC, bukan PATCH biasa: `messages` adalah satu kolom jsonb, jadi
+-- menambah pesan lewat PostgREST berarti baca-array → tambah di memori →
+-- tulis-ulang seluruh array. Dua pesan yang datang hampir bersamaan (pembeli
+-- mengirim dua chat beruntun, atau dua instance serverless memproses paralel)
+-- akan saling menimpa dan satu pesan hilang. Di dalam fungsi ini seluruh
+-- operasi terjadi dalam SATU pernyataan SQL, jadi tidak ada celah lost-update.
+--
+-- `p_max_messages` memangkas riwayat lama supaya satu baris tidak tumbuh tanpa
+-- batas (setiap balasan membaca & menulis ulang kolom ini).
+create or replace function public.append_conversation_message(
+  p_store_id uuid,
+  p_phone text,
+  p_user_msg text,
+  p_assistant_reply text,
+  p_intent text default null,
+  p_destination_city text default null,
+  p_max_messages integer default 200
+) returns setof public.conversations
+language plpgsql as $$
+declare
+  v_now timestamptz := now();
+  v_stamp text := to_char(v_now at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+  v_new jsonb;
+begin
+  v_new := jsonb_build_array(
+    jsonb_build_object('role', 'user', 'content', p_user_msg, 'timestamp', v_stamp),
+    jsonb_build_object('role', 'assistant', 'content', p_assistant_reply, 'timestamp', v_stamp)
+  );
+
+  return query
+  insert into public.conversations (
+    store_id, customer_phone, messages, last_intent, destination_city, updated_at
+  )
+  values (
+    p_store_id, p_phone, public.trim_jsonb_tail(v_new, p_max_messages),
+    p_intent, p_destination_city, v_now
+  )
+  on conflict (store_id, customer_phone) do update
+    set messages         = public.trim_jsonb_tail(conversations.messages || v_new, p_max_messages),
+        last_intent      = coalesce(p_intent, conversations.last_intent),
+        destination_city = coalesce(p_destination_city, conversations.destination_city),
+        updated_at       = v_now
+  returning *;
+end;
+$$;
+
+-- Pembatas laju sliding-window sederhana yang dilihat SEMUA instance.
+-- Mengembalikan {allowed, hits, retry_after}. Satu pernyataan upsert, jadi dua
+-- request bersamaan tidak bisa sama-sama lolos dengan hitungan yang sama.
+create or replace function public.bump_rate_limit(
+  p_key text,
+  p_window_seconds integer,
+  p_max integer
+) returns jsonb
+language plpgsql as $$
+declare
+  v_now    timestamptz := now();
+  v_cutoff timestamptz := now() - make_interval(secs => p_window_seconds);
+  v_hits   integer;
+  v_start  timestamptz;
+begin
+  -- Bersihkan sisa kunci lama sesekali supaya tabel tidak tumbuh tanpa batas
+  -- (tanpa perlu cron). 1 dari ~200 pemanggilan sudah lebih dari cukup.
+  if random() < 0.005 then
+    delete from public.rate_limits where updated_at < v_now - interval '1 day';
+  end if;
+
+  insert into public.rate_limits as rl (key, window_start, hits, updated_at)
+  values (p_key, v_now, 1, v_now)
+  on conflict (key) do update
+    set hits         = case when rl.window_start < v_cutoff then 1 else rl.hits + 1 end,
+        window_start = case when rl.window_start < v_cutoff then v_now else rl.window_start end,
+        updated_at   = v_now
+  returning rl.hits, rl.window_start into v_hits, v_start;
+
+  return jsonb_build_object(
+    'allowed', v_hits <= p_max,
+    'hits', v_hits,
+    'retry_after',
+      greatest(0, ceil(extract(epoch from (v_start + make_interval(secs => p_window_seconds)) - v_now))::integer)
+  );
+end;
+$$;
+
+grant execute on function public.trim_jsonb_tail(jsonb, integer) to service_role;
+grant execute on function public.append_conversation_message(uuid, text, text, text, text, text, integer) to service_role;
+grant execute on function public.bump_rate_limit(text, integer, integer) to service_role;
+
+-- =====================================================================
 --  MIGRASI untuk DB yang sudah ada (aman dijalankan berulang)
 -- =====================================================================
 alter table public.orders add column if not exists password_hash text;
@@ -162,6 +306,24 @@ alter table public.stores add column if not exists coupon_used text;
 alter table public.stores add column if not exists reset_otp_hash text;
 alter table public.stores add column if not exists reset_otp_expires timestamptz;
 alter table public.stores add column if not exists webhook_url text;
+
+-- Langganan berbayar & pengerasan reset password.
+alter table public.orders add column if not exists is_renewal boolean not null default false;
+alter table public.stores add column if not exists subscription_ends_at timestamptz;
+alter table public.stores add column if not exists reset_otp_attempts integer not null default 0;
+alter table public.stores add column if not exists password_changed_at timestamptz;
+
+-- Default paket diturunkan ke yang TERKECIL. Baris lama tidak ikut berubah;
+-- ini hanya menutup jalur "kolom tidak terisi → dapat Pro" untuk baris baru.
+alter table public.stores alter column package_id set default 'starter';
+
+-- Toko yang SUDAH berbayar sebelum kolom masa berlaku ada: beri satu periode
+-- penuh dihitung dari sekarang. Jangan pakai created_at — itu akan langsung
+-- menonaktifkan pelanggan yang sedang aktif dan membayar dengan itikad baik.
+update public.stores
+   set subscription_ends_at = now() + interval '30 days'
+ where is_paid is true
+   and subscription_ends_at is null;
 
 -- Pindahkan device yang sudah ada di `stores` menjadi baris `store_devices`
 -- utama. Hanya jalan untuk toko yang belum punya baris device sama sekali,

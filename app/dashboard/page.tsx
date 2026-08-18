@@ -47,6 +47,16 @@ const TABS: Array<{ id: TabId; icon: typeof LayoutDashboard; label: string; shor
 
 const TAB_IDS = TABS.map((t) => t.id);
 
+/**
+ * Status masa aktif toko — cerminan `storeActivityState()` di server.
+ * Hanya "active" & "trial" yang berarti bot benar-benar melayani pesan masuk.
+ */
+type ActivityState = "active" | "trial" | "trial_expired" | "subscription_expired" | "inactive";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** Sisa hari ketika peringatan langganan mulai ditampilkan. */
+const RENEWAL_WARNING_DAYS = 7;
+
 const DEFAULT_AI_PROMPT =
   "Kamu adalah Customer Service AI yang ramah dan profesional. Tugasmu adalah menyapa pembeli dengan hangat, menjawab pertanyaan produk, dan membantu mengecek tarif ongkos kirim (ongkir) menggunakan kurir ekspedisi.";
 const DEFAULT_GREETING =
@@ -107,6 +117,11 @@ export default function DashboardPage() {
   const [userEmail, setUserEmail] = useState("");
   const [isPaid, setIsPaid] = useState(false);
   const [trialEndsAt, setTrialEndsAt] = useState<string | null>(null);
+  const [subscriptionEndsAt, setSubscriptionEndsAt] = useState<string | null>(null);
+  // Status masa aktif menurut SERVER — aturan yang sama dipakai webhook untuk
+  // memutuskan apakah bot masih melayani pesan masuk. Default "active" supaya
+  // satu respons gagal tidak mengunci dashboard pelanggan yang sah.
+  const [activityState, setActivityState] = useState<ActivityState>("active");
   const [nowTs, setNowTs] = useState(() => Date.now());
 
   // Konfigurasi toko: `form` = yang diedit, `savedForm` = kondisi di server.
@@ -233,6 +248,8 @@ export default function DashboardPage() {
         setUserEmail(s.email || "");
         setIsPaid(!!s.is_paid);
         setTrialEndsAt(s.trial_ends_at || null);
+        setSubscriptionEndsAt(s.subscription_ends_at || null);
+        if (data.activity?.state) setActivityState(data.activity.state as ActivityState);
         setHasMengantarKey(!!s.has_mengantar_api_key);
         setPackageId(s.package_id || "");
 
@@ -587,6 +604,26 @@ export default function DashboardPage() {
       : `${Math.ceil(trialMs / (24 * 60 * 60 * 1000))} hari tersisa`
     : "";
 
+  // Langganan berbayar: masa aktifnya 30 hari per pembayaran, jadi dashboard
+  // harus bisa memberi tahu SEBELUM mati — bukan hanya sesudah. Dihitung dari
+  // `nowTs` yang berdetak supaya tab yang dibiarkan terbuka ikut berubah.
+  const subMs = subscriptionEndsAt ? new Date(subscriptionEndsAt).getTime() - nowTs : 0;
+  const subActive = isPaid && !!subscriptionEndsAt && subMs > 0;
+  const subExpired = isPaid && !!subscriptionEndsAt && subMs <= 0;
+  const subDaysLeft = Math.max(0, Math.ceil(subMs / DAY_MS));
+  const subEndingSoon = subActive && subDaysLeft <= RENEWAL_WARNING_DAYS;
+
+  // Terkunci = server bilang masa aktif habis, ATAU hitungan lokal sudah lewat
+  // (tab yang dibiarkan terbuka melewati tengah malam tanpa polling baru).
+  const lockedByServer =
+    activityState === "trial_expired" ||
+    activityState === "subscription_expired" ||
+    activityState === "inactive";
+  const locked = lockedByServer || trialExpired || subExpired;
+  // Bedakan salinan teksnya: "uji coba habis" dan "langganan habis" adalah dua
+  // situasi berbeda, dan menyebutnya keliru membuat pelanggan berbayar bingung.
+  const lockedIsTrial = activityState === "trial_expired" || (trialExpired && !isPaid);
+
   const tabCounts: Partial<Record<TabId, number>> = {
     products: products.length,
     chats: conversations.length
@@ -701,24 +738,54 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {trialExpired ? (
-        /* ── Gate: uji coba berakhir ─────────────────────────────────── */
+      {/* ── Banner langganan hampir habis ─────────────────────────────── */}
+      {subEndingSoon && (
+        <div className="bg-amber-50 border-b border-amber-200">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-2 text-sm font-medium text-amber-900">
+              <Clock className="w-4 h-4 shrink-0" aria-hidden="true" />
+              Langganan berakhir dalam{" "}
+              <strong>{subDaysLeft <= 1 ? "kurang dari 1 hari" : `${subDaysLeft} hari`}</strong>.
+              Perpanjang supaya bot tidak berhenti membalas.
+            </span>
+            <Link
+              href="/#harga"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold px-3 py-1.5 transition-colors"
+            >
+              <Crown className="w-3.5 h-3.5" aria-hidden="true" /> Perpanjang
+            </Link>
+          </div>
+        </div>
+      )}
+
+      {locked ? (
+        /* ── Gate: masa aktif berakhir ───────────────────────────────── */
         <div className="max-w-2xl mx-auto px-4 sm:px-6 py-16">
           <div className="bg-white border border-amber-200 rounded-3xl shadow-card p-8 text-center space-y-5">
             <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-amber-100">
               <TriangleAlert className="h-8 w-8 text-amber-600" aria-hidden="true" />
             </div>
-            <h2 className="text-xl font-bold text-ink">Masa uji coba telah berakhir</h2>
+            <h2 className="text-xl font-bold text-ink">
+              {lockedIsTrial ? "Masa uji coba telah berakhir" : "Masa langganan telah berakhir"}
+            </h2>
             <p className="text-sm text-slate-500 max-w-sm mx-auto">
-              Terima kasih telah mencoba BalesToko.ai. Untuk melanjutkan bot WhatsApp AI dan cek ongkir
-              otomatis, silakan berlangganan salah satu paket.
+              {lockedIsTrial
+                ? "Terima kasih telah mencoba BalesToko.ai. Untuk melanjutkan bot WhatsApp AI dan cek ongkir otomatis, silakan berlangganan salah satu paket."
+                : "Bot WhatsApp Anda sementara berhenti membalas pesan pembeli. Perpanjang langganan untuk mengaktifkannya kembali — semua produk, nomor, dan riwayat chat Anda tetap tersimpan."}
             </p>
             <Link
               href="/#harga"
               className="inline-flex items-center justify-center gap-2 rounded-2xl bg-brand-600 hover:bg-brand-700 px-6 py-3.5 text-sm font-semibold text-white shadow-card transition-colors"
             >
-              <Crown className="h-4 w-4" aria-hidden="true" /> Lihat paket berlangganan
+              <Crown className="h-4 w-4" aria-hidden="true" />
+              {lockedIsTrial ? "Lihat paket berlangganan" : "Perpanjang langganan"}
             </Link>
+            {!lockedIsTrial && (
+              <p className="text-xs text-slate-400">
+                Gunakan email <strong className="text-slate-500">{userEmail}</strong> saat
+                memperpanjang agar langganan menempel ke toko ini.
+              </p>
+            )}
           </div>
         </div>
       ) : (
@@ -838,6 +905,26 @@ export default function DashboardPage() {
                   <div className="text-[11px] text-slate-400 mt-1">Percakapan</div>
                 </div>
               </div>
+
+              {subActive && (
+                <div className="pt-3 border-t border-slate-100">
+                  <div className="text-xs text-slate-400">Langganan aktif sampai</div>
+                  <div
+                    className={`text-sm font-semibold mt-0.5 ${
+                      subEndingSoon ? "text-amber-700" : "text-ink"
+                    }`}
+                  >
+                    {new Date(subscriptionEndsAt as string).toLocaleDateString("id-ID", {
+                      day: "numeric",
+                      month: "long",
+                      year: "numeric"
+                    })}
+                  </div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">
+                    {subDaysLeft <= 1 ? "kurang dari 1 hari lagi" : `${subDaysLeft} hari lagi`}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 

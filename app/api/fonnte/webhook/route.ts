@@ -79,7 +79,7 @@ export async function POST(req: Request) {
   // bawah kita masih perlu satu lookup untuk membedakan device lama yang URL-nya
   // belum tersinkron dari penyerang.
   if (!secretOk) {
-    const pre = checkRateLimit(`unverified:${deviceNumber || "unknown"}`, sender);
+    const pre = await checkRateLimit(`unverified:${deviceNumber || "unknown"}`, sender);
     if (!pre.ok) {
       return NextResponse.json(
         { error: "Unauthorized." },
@@ -170,7 +170,7 @@ export async function POST(req: Request) {
     // Bendung banjir pesan dari satu nomor (termasuk loop balasan antar-bot).
     // Dibatasi per-device: tiap nomor toko adalah kanal terpisah, jadi pembeli
     // yang ramai di satu nomor tidak ikut memblokir nomor lainnya.
-    const rate = checkRateLimit(device.id || store.id || deviceNumber, sender);
+    const rate = await checkRateLimit(device.id || store.id || deviceNumber, sender);
     if (!rate.ok) {
       console.warn(`[fonnte webhook] batas laju tercapai untuk ${sender}, pesan diabaikan.`);
       return NextResponse.json(
