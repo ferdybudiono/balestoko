@@ -152,9 +152,13 @@ export async function POST(req: Request) {
       settings.ai_prompt_system = body.ai_prompt_system.slice(0, 4000);
     if (typeof body.greeting_message === "string")
       settings.greeting_message = body.greeting_message.slice(0, 1000);
-    // String kosong = hapus key (pakai endpoint publik Mengantar lagi).
-    if (typeof body.mengantar_api_key === "string")
-      settings.mengantar_api_key = body.mengantar_api_key.trim().slice(0, 200) || null;
+    // `mengantar_api_key` SENGAJA tidak ada di whitelist ini. Kedua endpoint
+    // Mengantar yang dipakai aplikasi (`address/search` & `allEstimatePublic`)
+    // tidak memvalidasi key, jadi kolom itu tidak pernah menentukan akurasi
+    // ongkir — yang menentukan adalah lokasi asal toko. Inputnya sudah dihapus
+    // dari dashboard supaya pemilik toko tidak mengira sedang memperbaiki
+    // sesuatu; nilai yang sudah tersimpan tetap dipakai apa adanya, dan key
+    // tingkat sistem diatur lewat ENV `MENGANTAR_API_KEY`.
 
     // ── Ekspedisi, kurir toko, pembayaran, & gaya jawaban AI ────────────────
     // Semua nilai di bawah ini akhirnya DIKIRIM KE PEMBELI lewat WhatsApp, jadi

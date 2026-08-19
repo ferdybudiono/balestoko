@@ -74,8 +74,6 @@ const EMPTY_FORM: StoreForm = {
   defaultWeight: "1000",
   aiPromptSystem: DEFAULT_AI_PROMPT,
   greetingMessage: DEFAULT_GREETING,
-  mengantarApiKey: "",
-  clearMengantarKey: false,
 
   // Kosong = SEMUA ekspedisi ditawarkan ke pembeli (bukan "tidak ada satu pun").
   activeCouriers: [],
@@ -182,7 +180,6 @@ export default function DashboardPage() {
   formRef.current = form;
   savedFormRef.current = savedForm;
 
-  const [hasMengantarKey, setHasMengantarKey] = useState(false);
   const [packageId, setPackageId] = useState<string>("");
   const [fonnteStatus, setFonnteStatus] = useState<FonnteStatus>({
     status: false,
@@ -305,7 +302,6 @@ export default function DashboardPage() {
         setTrialEndsAt(s.trial_ends_at || null);
         setSubscriptionEndsAt(s.subscription_ends_at || null);
         if (data.activity?.state) setActivityState(data.activity.state as ActivityState);
-        setHasMengantarKey(!!s.has_mengantar_api_key);
         setPackageId(s.package_id || "");
 
         const local = normalizeLocalCourier(s.local_courier);
@@ -316,8 +312,6 @@ export default function DashboardPage() {
           defaultWeight: String(s.default_weight || 1000),
           aiPromptSystem: s.ai_prompt_system || DEFAULT_AI_PROMPT,
           greetingMessage: s.greeting_message || DEFAULT_GREETING,
-          mengantarApiKey: "",
-          clearMengantarKey: false,
 
           activeCouriers: normalizeActiveCouriers(s.active_couriers),
           localCourierEnabled: local.enabled,
@@ -657,10 +651,6 @@ export default function DashboardPage() {
         ai_include_total: form.includeTotal,
         ai_include_payment: form.includePayment
       };
-      // Kolom kosong = biarkan key lama. String kosong dikirim HANYA bila user
-      // memang meminta penghapusan.
-      if (form.mengantarApiKey.trim()) body.mengantar_api_key = form.mengantarApiKey.trim();
-      else if (form.clearMengantarKey) body.mengantar_api_key = "";
 
       const res = await fetch("/api/store", {
         method: "POST",
@@ -1158,7 +1148,6 @@ export default function DashboardPage() {
                   onSave={handleSaveStoreConfig}
                   onReset={() => setForm(savedForm)}
                   originValid={originValid}
-                  hasMengantarKey={hasMengantarKey}
                   showToast={showToast}
                 />
               )}

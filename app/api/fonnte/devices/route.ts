@@ -20,10 +20,10 @@ import {
   fonnteDeviceName,
   isReachableBaseUrl,
   isWebhookUrlSynced,
+  provisionDeviceInbound,
   redactWebhookUrl,
   reconcileDeviceInbound,
   resolveBaseUrl,
-  syncDeviceWebhookUrl,
   type DeviceInboundHealth
 } from "@/lib/webhook-url";
 
@@ -290,11 +290,12 @@ export async function POST(req: Request) {
   }
 
   const device = inserted.data;
-  // Daftarkan URL webhook + nyalakan `auto read` sejak nomor dibuat. Auto read
-  // adalah syarat Fonnte untuk mengirim pesan masuk ke webhook; tanpa itu nomor
-  // ini bisa mengirim balasan uji coba tapi tidak akan pernah menerima chat
-  // pembeli — kegagalan yang paling membingungkan karena semuanya tampak normal.
-  const synced = await syncDeviceWebhookUrl({
+  // Daftarkan URL webhook + nyalakan `auto read` sejak nomor dibuat, lalu
+  // verifikasi hasilnya langsung ke Fonnte. Auto read adalah syarat Fonnte untuk
+  // mengirim pesan masuk ke webhook; tanpa itu nomor ini bisa mengirim balasan
+  // uji coba tapi tidak akan pernah menerima chat pembeli — kegagalan yang paling
+  // membingungkan karena semuanya tampak normal.
+  const inbound = await provisionDeviceInbound({
     store,
     device,
     desired: buildFonnteWebhookUrl(resolveBaseUrl(req))
@@ -310,9 +311,9 @@ export async function POST(req: Request) {
     device: toPublicDevice(device),
     // Nomor tetap dibuat: kegagalan sinkronisasi bisa diperbaiki dari tombol
     // "Perbaiki otomatis" tanpa menambah nomor lagi.
-    warning: synced.ok
+    warning: inbound.ok
       ? undefined
-      : `Nomor tersimpan, tapi jalur pesan masuk belum siap: ${synced.error || "penyebab tidak diketahui"}`
+      : `Nomor tersimpan, tapi jalur pesan masuk belum siap: ${inbound.error || "penyebab tidak diketahui"}`
   });
 }
 

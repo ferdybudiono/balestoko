@@ -203,6 +203,124 @@ export async function syncDeviceWebhookUrl(params: {
   return { ok: true, url: desired };
 }
 
+/**
+ * Nyalakan `autoread` di Fonnte TANPA menyentuh setelan webhook.
+ *
+ * Dipakai ketika URL publik aplikasi belum tersedia: URL webhook memang belum
+ * bisa dipasang, tapi autoread tidak perlu ikut menunggu — dan menundanya
+ * berbahaya, karena device yang lahir dengan autoread mati akan tetap bisu nanti
+ * meski URL-nya sudah dibetulkan, sampai ada yang menekan "Perbaiki otomatis".
+ */
+async function enableAutoreadOnly(
+  store: StoreRecord,
+  device: StoreDeviceRecord
+): Promise<{ success: boolean; error?: string }> {
+  if (!device.fonnte_token) return { success: false, error: "Nomor ini belum punya device Fonnte." };
+
+  const phone = formatFonntePhone(device.phone || "");
+  if (phone.replace(/\D/g, "").length < 10) {
+    return { success: false, error: "Nomor device tidak valid." };
+  }
+
+  const applied = await applyFonnteDeviceSettings(device.fonnte_token, {
+    name: fonnteDeviceName(store.store_name, phone),
+    deviceNumber: phone,
+    webhookUrl: null,
+    autoread: true
+  });
+  if (!applied.success) return applied;
+
+  if (device.id) await updateStoreDevice(device.id, { autoread: true });
+  device.autoread = true;
+  return { success: true };
+}
+
+export interface InboundProvisionResult {
+  /** Jalur terima siap: webhook terpasang DAN autoread tidak dilaporkan mati. */
+  ok: boolean;
+  /** Kondisi `autoread` hasil pembacaan ulang dari Fonnte; `null` = tidak dilaporkan. */
+  autoread: boolean | null;
+  /** URL webhook berhasil dipasang di Fonnte. */
+  webhookSynced: boolean;
+  /** Kendala yang perlu dibaca pemilik toko. */
+  error?: string;
+}
+
+/**
+ * Siapkan jalur TERIMA sebuah device yang baru dibuat: pasang URL webhook,
+ * nyalakan `autoread`, lalu VERIFIKASI dengan membaca ulang dari Fonnte.
+ *
+ * Tiga hal yang membedakannya dari `syncDeviceWebhookUrl` biasa:
+ *
+ * 1. `autoread` dinyalakan walaupun URL webhook belum bisa dipasang. Dulu satu
+ *    `NEXT_PUBLIC_BASE_URL` yang belum diisi membuat fungsi sinkronisasi pulang
+ *    lebih awal, jadi `update-device` tidak pernah terpanggil dan device lahir
+ *    dengan autoread mati.
+ * 2. Hasilnya diperiksa ulang ke Fonnte, bukan disimpulkan dari "request kami
+ *    tidak error". Autoread adalah setelan yang paling mahal kalau salah: device
+ *    tampak sehat, uji kirim sukses, tapi tidak satu pun chat pembeli sampai.
+ * 3. Catatan `autoread` di database dikoreksi menjadi `false` bila Fonnte
+ *    ternyata melaporkannya mati — supaya rekonsiliasi berikutnya tidak
+ *    melewatinya lewat pintasan "sudah tersinkron".
+ */
+export async function provisionDeviceInbound(params: {
+  store: StoreRecord;
+  device: StoreDeviceRecord;
+  desired: string;
+}): Promise<InboundProvisionResult> {
+  const { store, device, desired } = params;
+
+  if (!device.fonnte_token) {
+    return {
+      ok: false,
+      autoread: null,
+      webhookSynced: false,
+      error: "Nomor ini belum punya device Fonnte."
+    };
+  }
+
+  const reachable = isReachableBaseUrl(desired);
+  let webhookSynced = false;
+  let error: string | undefined;
+
+  if (reachable) {
+    // `force` karena device ini baru lahir: tidak ada setelan lama yang layak
+    // dipercaya, dan pintasan "sudah sesuai" hanya akan melewatkan panggilan yang
+    // justru wajib terjadi sekali ini.
+    const sync = await syncDeviceWebhookUrl({ store, device, desired, force: true });
+    webhookSynced = sync.ok;
+    error = sync.error;
+  } else {
+    const applied = await enableAutoreadOnly(store, device);
+    error =
+      applied.error ||
+      `URL webhook (${desired}) menunjuk ke localhost/jaringan privat, jadi Fonnte belum bisa ` +
+        "mengirim pesan masuk ke sana. Auto read sudah dinyalakan, tapi isi NEXT_PUBLIC_BASE_URL " +
+        "dengan domain publik aplikasi lalu deploy ulang agar chat pembeli bisa masuk.";
+  }
+
+  // Baca ulang kondisi sebenarnya. Sekali gagal → coba lagi sekali, lalu baca ulang.
+  let live = await getFonnteDeviceStatus(device.fonnte_token);
+  if (live.autoread === false) {
+    if (reachable) await syncDeviceWebhookUrl({ store, device, desired, force: true });
+    else await enableAutoreadOnly(store, device);
+    live = await getFonnteDeviceStatus(device.fonnte_token);
+  }
+
+  const autoread = live.autoread ?? null;
+
+  if (autoread === false) {
+    if (device.id) await updateStoreDevice(device.id, { autoread: false });
+    device.autoread = false;
+    error =
+      "Fonnte masih melaporkan Auto read MATI untuk nomor ini. Tanpa Auto read, chat pembeli " +
+      "tidak akan pernah sampai ke aplikasi — nyalakan manual di dashboard Fonnte, atau tekan " +
+      "\"Perbaiki otomatis\" di tab WhatsApp.";
+  }
+
+  return { ok: webhookSynced && autoread !== false, autoread, webhookSynced, error };
+}
+
 export interface DeviceInboundHealth {
   /** WhatsApp benar-benar login (hasil pembacaan langsung ke Fonnte). */
   connected: boolean;

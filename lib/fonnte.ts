@@ -252,12 +252,26 @@ export async function deleteFonnteDevice(
  */
 export async function applyFonnteDeviceSettings(
   deviceToken: string,
-  settings: { name: string; deviceNumber: string; webhookUrl: string; autoread?: boolean }
+  settings: {
+    name: string;
+    deviceNumber: string;
+    /**
+     * URL webhook pesan masuk.
+     *
+     * `null` = JANGAN sentuh setelan webhook di Fonnte — dipakai saat yang perlu
+     * dinyalakan hanya `autoread` sementara URL publik aplikasi belum tersedia.
+     * String KOSONG tetap ditolak: itu selalu berarti pemanggil kehilangan
+     * URL-nya, bukan bermaksud membiarkannya, dan mengirimnya ke Fonnte akan
+     * menghapus webhook yang sudah benar.
+     */
+    webhookUrl: string | null;
+    autoread?: boolean;
+  }
 ): Promise<{ success: boolean; error?: string }> {
   const { name: rawName, deviceNumber, webhookUrl, autoread = true } = settings;
 
   if (!deviceToken) return { success: false, error: "Device token kosong." };
-  if (!webhookUrl) return { success: false, error: "URL webhook kosong." };
+  if (webhookUrl !== null && !webhookUrl) return { success: false, error: "URL webhook kosong." };
 
   const name = (rawName || "Device").trim().slice(0, 30) || "Device";
   const device = formatFonntePhone(deviceNumber);
@@ -266,7 +280,7 @@ export async function applyFonnteDeviceSettings(
     const formData = new URLSearchParams();
     formData.append("name", name);
     formData.append("device", device);
-    formData.append("webhook", webhookUrl);
+    if (webhookUrl !== null) formData.append("webhook", webhookUrl);
     formData.append("autoread", autoread ? "true" : "false");
 
     const res = await fetch("https://api.fonnte.com/update-device", {

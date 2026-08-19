@@ -13,7 +13,11 @@ import {
   OrderDraftLine,
   PaymentAccount,
   PaymentSettings,
+  QuoteOption,
   buildOngkirReply,
+  formatOrderSummary,
+  formatWeight,
+  mergeQuoteOptions,
   normalizeAiTone,
   normalizePaymentAccounts
 } from "./reply-format";
@@ -306,6 +310,322 @@ async function generateGeminiReply(prompt: string, apiKey: string): Promise<stri
   return null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Pagar angka untuk balasan yang disusun AI
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Di bawah nilai ini sebuah angka bukan klaim uang: jumlah unit ("2 pcs"),
+ * estimasi hari ("2-3 hari"), atau ukuran. Angka sekecil itu tidak perlu
+ * dicocokkan ke data toko.
+ */
+const MONEY_SCALE_MIN = 1000;
+
+/**
+ * Angka berskala uang yang benar-benar tertulis di sebuah teks.
+ *
+ * Penulisan Indonesia dipakai apa adanya: titik = pemisah ribuan
+ * ("180.000" → 180000), koma = desimal ("1,2" → 1.2).
+ */
+function extractMoneyClaims(text: string): Array<{ raw: string; value: number }> {
+  const out: Array<{ raw: string; value: number }> = [];
+  for (const m of text.matchAll(/\d[\d.,]*/g)) {
+    const raw = m[0];
+    const normalized = raw.replace(/\.(?=\d{3}\b)/g, "").replace(",", ".");
+    const value = Number(normalized);
+    if (Number.isFinite(value) && value >= MONEY_SCALE_MIN) {
+      out.push({ raw, value: Math.round(value) });
+    }
+  }
+  return out;
+}
+
+/** Kumpulan angka yang SAH dikutip sebuah balasan. */
+interface NumberGuard {
+  /** Nilai rupiah & berat yang dihitung sistem. */
+  amounts: Set<number>;
+  /** Deretan digit yang bukan uang tapi sah dikutip (nomor rekening/HP). */
+  digitStrings: Set<string>;
+}
+
+function emptyGuard(): NumberGuard {
+  return { amounts: new Set<number>(), digitStrings: new Set<string>() };
+}
+
+/** Nomor rekening/e-wallet sah dikutip walau bentuknya deretan digit panjang. */
+function allowPaymentDigits(guard: NumberGuard, payment: PaymentSettings): void {
+  for (const a of payment.accounts) {
+    const digits = a.number.replace(/\D/g, "");
+    if (digits) guard.digitStrings.add(digits);
+  }
+}
+
+/**
+ * Izinkan angka yang berasal dari teks yang BUKAN karangan model: instruksi
+ * pemilik toko, catatan pembayaran, pesan pembeli sendiri, dan riwayat chat.
+ *
+ * Tanpa ini pagar angka jadi terlalu galak dan justru merugikan: pemilik toko
+ * yang menulis "minimal order Rp 50.000" di instruksinya akan melihat balasan
+ * AI-nya dibuang terus-menerus, dan mengulang angka yang baru saja ditulis
+ * pembeli ("budget 200rb") pun dianggap pelanggaran. Yang ingin dicegah pagar
+ * ini adalah angka yang muncul dari ketiadaan — bukan angka yang memang sudah
+ * ada di percakapan.
+ */
+function allowTextNumbers(guard: NumberGuard, text?: string | null): void {
+  const src = (text || "").trim();
+  if (!src) return;
+  for (const claim of extractMoneyClaims(src)) {
+    guard.amounts.add(claim.value);
+    const digits = claim.raw.replace(/\D/g, "");
+    if (digits) guard.digitStrings.add(digits);
+  }
+}
+
+/**
+ * Apakah balasan ini hanya memakai angka yang memang dihitung sistem?
+ *
+ * Ini pagar yang membuat AI boleh menyusun kalimat soal harga, ongkir, dan
+ * total tanpa risiko mengarang angka. Model tidak "diminta jujur" lalu
+ * dipercaya — hasilnya DIPERIKSA, dan balasan yang menyelipkan angka rupiah
+ * yang tidak ada dasarnya dibuang, bukan dikirim ke pembeli.
+ *
+ * Sengaja ketat: satu angka asing → seluruh balasan ditolak dan versi
+ * deterministik yang dipakai. Kehilangan gaya bahasa AI jauh lebih murah
+ * daripada mengutip harga yang salah ke pembeli.
+ */
+function replyKeepsNumbersHonest(
+  text: string,
+  guard: NumberGuard
+): { ok: true } | { ok: false; offender: string } {
+  for (const claim of extractMoneyClaims(text)) {
+    const digits = claim.raw.replace(/\D/g, "");
+    if (guard.digitStrings.has(digits)) continue;
+    if (guard.amounts.has(claim.value)) continue;
+    return { ok: false, offender: claim.raw };
+  }
+  return { ok: true };
+}
+
+/**
+ * Minta Gemini menuliskan ulang sebuah balasan, lalu pakai hasilnya HANYA bila
+ * angkanya lolos pemeriksaan. Gagal apa pun (API mati, balasan kosong, angka
+ * asing) → balasan deterministik yang sudah disiapkan pemanggil.
+ *
+ * Urutannya penting: versi deterministik dihitung LEBIH DULU dan selalu ada,
+ * jadi jalur AI tidak pernah menjadi titik tunggal kegagalan bot.
+ */
+async function narrateWithGemini(params: {
+  apiKey: string;
+  prompt: string;
+  fallback: string;
+  guard: NumberGuard;
+  label: string;
+}): Promise<string> {
+  const { apiKey, prompt, fallback, guard, label } = params;
+
+  const draftText = await generateGeminiReply(prompt, apiKey);
+  if (!draftText) {
+    console.warn(`[ai] ${label}: Gemini tidak membalas — pakai format deterministik.`);
+    return fallback;
+  }
+
+  const verdict = replyKeepsNumbersHonest(draftText, guard);
+  if (!verdict.ok) {
+    console.warn(
+      `[ai] ${label}: balasan Gemini memuat angka tanpa dasar ("${verdict.offender}") — dibuang, pakai format deterministik.`
+    );
+    return fallback;
+  }
+
+  return draftText;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Konteks toko untuk model
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface StoreVoice {
+  storeName: string;
+  instructions?: string;
+  tone: AiTone;
+  originCityName: string;
+  activeGroups: string[];
+  payment: PaymentSettings;
+  includePayment: boolean;
+  historyStr: string;
+}
+
+/**
+ * Blok pembuka prompt yang sama untuk SEMUA jalur balasan AI.
+ *
+ * Disatukan supaya "Instruksi khusus untuk AI CS" dan nada bicara dari tab
+ * Pengaturan Toko berlaku di mana pun AI ikut menyusun kalimat — dulu keduanya
+ * hanya sampai ke jalur obrolan umum, jadi justru balasan terpenting (harga,
+ * ongkir, total) tidak pernah mengikuti instruksi pemilik toko.
+ */
+function renderStoreVoice(v: StoreVoice): string {
+  const lines: string[] = [];
+
+  lines.push(`Kamu adalah Customer Service WhatsApp untuk toko "${v.storeName}".`);
+  lines.push(`Barang dikirim dari: ${v.originCityName}.`);
+  lines.push(`Nada bicara: ${AI_TONE_INSTRUCTIONS[v.tone]}`);
+
+  if (v.instructions && v.instructions.trim()) {
+    lines.push(
+      `
+INSTRUKSI PEMILIK TOKO (prioritas tertinggi selain aturan angka di bawah):
+${v.instructions.trim()}`
+    );
+  }
+
+  if (v.activeGroups.length > 0) {
+    lines.push(
+      `Ekspedisi yang dilayani toko: ${v.activeGroups
+        .map((c) => courierLabel(c))
+        .join(", ")}. Jangan menawarkan ekspedisi di luar daftar itu.`
+    );
+  }
+
+  if (v.includePayment) {
+    const summary = [
+      ...v.payment.accounts.map(
+        (a) => `${a.type === "ewallet" ? "" : "Transfer "}${a.name} ${a.number}${a.holder ? ` (a.n. ${a.holder})` : ""}`
+      ),
+      v.payment.codEnabled ? "COD (bayar di tempat)" : ""
+    ]
+      .filter(Boolean)
+      .join("; ");
+    if (summary) lines.push(`Metode pembayaran yang tersedia: ${summary}.`);
+    const note = (v.payment.note || "").trim();
+    if (note) lines.push(`Catatan pembayaran dari toko: ${note}`);
+  }
+
+  if (v.historyStr) {
+    lines.push(
+      `
+Riwayat percakapan sebelumnya dengan pembeli ini (terlama ke terbaru):
+${v.historyStr}
+
+Gunakan riwayat itu sebagai konteks: jangan menyapa ulang seperti pesan
+pertama, jangan menanyakan hal yang sudah dijawab pembeli, dan rujuk produk
+atau kota yang sudah disebut bila pembeli memakai kata seperti "itu"/"tadi".`
+    );
+  }
+
+  return lines.join("\n");
+}
+
+/** Aturan angka yang berlaku di setiap jalur AI. */
+const NUMBER_RULES = `ATURAN ANGKA — WAJIB DIPATUHI:
+- Angka rupiah HANYA boleh disalin dari DATA di atas. Jangan menghitung ulang,
+  jangan membulatkan, jangan memperkirakan, dan jangan mengarang.
+- Jangan menyebut angka rupiah yang tidak ada di DATA, sekecil apa pun.
+- Kalau pembeli menanyakan sesuatu yang angkanya tidak ada di DATA, katakan
+  akan dicek dahulu — jangan menyebut angka apa pun.`;
+
+/**
+ * Rincian pesanan sebagai DATA untuk model: jumlah unit, harga satuan, dan
+ * subtotal per baris. Ini yang membuat AI bisa menjawab "2 kaos berapa?"
+ * dengan angka yang benar alih-alih menolak menjawab.
+ */
+function renderOrderFacts(draft: OrderDraft, guard: NumberGuard): string {
+  if (draft.lines.length === 0) return "";
+
+  const rows = draft.lines.map((l) => {
+    guard.amounts.add(l.price);
+    guard.amounts.add(l.lineTotal);
+    const unit = l.price > 0 ? `Rp ${l.price.toLocaleString("id-ID")}` : "harga belum ada";
+    const total = l.lineTotal > 0 ? `Rp ${l.lineTotal.toLocaleString("id-ID")}` : "belum bisa dihitung";
+    return `- ${l.name}: ${l.units} × ${unit} = ${total}`;
+  });
+
+  guard.amounts.add(draft.subtotal);
+  guard.amounts.add(draft.weightGram);
+
+  return `Produk yang disebut pembeli:
+${rows.join("\n")}
+Subtotal produk: Rp ${draft.subtotal.toLocaleString("id-ID")}
+Berat paket: ${formatWeight(draft.weightGram)}${
+    draft.weightSource === "default" ? " (perkiraan, bukan dari data produk)" : ""
+  }`;
+}
+
+/** Katalog sebagai DATA, sekaligus mendaftarkan harganya ke pagar angka. */
+function renderCatalogFacts(products: ProductLike[], guard: NumberGuard): string {
+  if (products.length === 0) return "Belum ada katalog produk.";
+  return products
+    .map((p) => {
+      const price = Number(p.price);
+      if (Number.isFinite(price) && price > 0) guard.amounts.add(Math.round(price));
+      const weight = Number(p.weight);
+      if (Number.isFinite(weight) && weight > 0) guard.amounts.add(Math.round(weight));
+      return `- ${p.name}: Rp ${price.toLocaleString("id-ID")} · ${p.weight} gram${
+        p.description ? ` · ${p.description}` : ""
+      }`;
+    })
+    .join("\n");
+}
+
+/**
+ * Ongkir per ekspedisi (dan total bayarnya) sebagai DATA.
+ *
+ * Total dihitung DI SINI, bukan oleh model. Model hanya menyalin — itulah yang
+ * membuat "harga barang + ongkir = total bayar" bisa dijawab dengan lancar
+ * tanpa membuka peluang salah hitung.
+ */
+function renderQuoteFacts(
+  options: QuoteOption[],
+  subtotal: number,
+  withTotal: boolean,
+  guard: NumberGuard
+): string {
+  if (options.length === 0) return "Tidak ada layanan kurir yang tersedia ke tujuan itu.";
+
+  return options
+    .map((o) => {
+      if (o.askForRate) {
+        return `- ${o.courier_name} (${o.service_name}): ongkir menyesuaikan jarak, angkanya BELUM ada`;
+      }
+      const cost = Math.round(o.cost);
+      guard.amounts.add(cost);
+      let line = `- ${o.courier_name} (${o.service_name}): ongkir Rp ${cost.toLocaleString("id-ID")}`;
+      if (o.etd) line += `, estimasi ${o.etd}`;
+      if (withTotal && subtotal > 0) {
+        const total = subtotal + cost;
+        guard.amounts.add(total);
+        line += `, total bayar Rp ${total.toLocaleString("id-ID")}`;
+      }
+      if (o.belowMinimumWeight) line += ` (kena tarif minimum karena paket terlalu ringan)`;
+      return line;
+    })
+    .join("\n");
+}
+
+/**
+ * Bungkus balasan deterministik menjadi tugas "tulis ulang" untuk model.
+ *
+ * Isi balasan sudah lengkap dan angkanya sudah benar sebelum model dipanggil;
+ * model hanya mengatur ulang bahasanya mengikuti instruksi & nada toko. Ini
+ * membalik urutan yang lazim (model mengarang lalu diperiksa) menjadi: sistem
+ * yang menentukan fakta, model yang menentukan gaya.
+ */
+function rewriteTask(deterministic: string): string {
+  return `BALASAN VERSI SISTEM (isi dan seluruh angkanya sudah benar):
+"""
+${deterministic}
+"""
+
+Tugasmu: sampaikan ULANG isi balasan di atas dengan bahasa dan nada toko
+seperti diminta di awal, mengikuti instruksi pemilik toko bila ada.
+- Semua informasi penting harus tetap tersampaikan: rincian pesanan, ongkir
+  tiap ekspedisi, total bayar, dan cara pembayaran (bila ada di atas).
+- Semua angka disalin PERSIS, termasuk pemisah ribuan. Jangan menambah,
+  mengurangi, membulatkan, atau menghitung ulang.
+- Tulis untuk WhatsApp: gunakan *tebal* satu bintang, bukan markdown **, dan
+  jangan memakai tabel.
+- Balas hanya dengan teks pesannya, tanpa kalimat pengantar apa pun.`;
+}
+
 /**
  * Proses pesan pembeli yang masuk melalui WhatsApp
  */
@@ -344,6 +664,47 @@ export async function processAICustomerService(params: AIProcessParams): Promise
 
   const rawMessage = messageText.trim();
   const lowerMsg = rawMessage.toLowerCase();
+
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (!geminiApiKey) {
+    console.warn("[ai] GEMINI_API_KEY belum di-set — balasan dipakai apa adanya dari format deterministik.");
+  }
+
+  // Riwayat percakapan — hanya untuk paket yang berhak (Pro). Tanpa blok ini
+  // model tidak tahu apa pun yang sudah dibicarakan, jadi pembeli yang bertanya
+  // "yang tadi itu berapa?" akan dibalas seolah pesan pertama. Dipotong dari
+  // BELAKANG supaya yang terbaru selalu ikut, dan tiap isi pesan dipangkas agar
+  // satu pesan panjang tidak menelan seluruh konteks.
+  const contextTurns = Math.max(0, Math.floor(aiContextMessages));
+  const recent = contextTurns > 0 ? chatHistory.slice(-contextTurns) : [];
+  const historyStr = recent
+    .filter((m) => m.role === "user" || m.role === "assistant")
+    .map((m) => `${m.role === "user" ? "Pembeli" : "CS"}: ${m.content.slice(0, 400)}`)
+    .join("\n");
+
+  // Identitas & aturan toko, dipakai SEMUA jalur balasan AI di bawah.
+  const voiceText = renderStoreVoice({
+    storeName,
+    instructions: aiPromptSystem,
+    tone,
+    originCityName,
+    activeGroups,
+    payment,
+    includePayment,
+    historyStr
+  });
+
+  /** Pagar angka dasar: apa pun yang sudah ada di percakapan & pengaturan toko. */
+  const baseGuard = (): NumberGuard => {
+    const guard = emptyGuard();
+    allowPaymentDigits(guard, payment);
+    allowTextNumbers(guard, aiPromptSystem);
+    allowTextNumbers(guard, payment.note);
+    allowTextNumbers(guard, greetingMessage);
+    allowTextNumbers(guard, rawMessage);
+    allowTextNumbers(guard, historyStr);
+    return guard;
+  };
 
   // 1. Deteksi Kata Kunci Ongkir / Kota / Alamat
   const isOngkirQuery =
@@ -397,12 +758,46 @@ export async function processAICustomerService(params: AIProcessParams): Promise
 
   // Jika kata kunci ongkir ditemukan dan ada lokasi tujuan
   if (isOngkirQuery || targetLocationQuery) {
+    // Draf pesanan: produk yang DISEBUT pembeli beserta jumlah & harganya, bukan
+    // produk pertama di katalog. Tidak ada yang cocok → berat default toko.
+    const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
+
     if (!targetLocationQuery) {
-      // Jika menanyakan ongkir tanpa menyebutkan kota
-      return {
-        replyText: `Tentu Kak! Untuk mengecek tarif ongkir dari toko kami (*${originCityName}*), boleh minta informasi nama *Kecamatan* atau *Kota* tujuan pengirimannya Kak? 🚚`,
-        intent: "ONGKIR_CHECK"
-      };
+      // Menanyakan ongkir tanpa menyebut kota. Ongkirnya belum bisa dihitung,
+      // tapi subtotal produknya sudah bisa — jadi pembeli tetap dapat sesuatu
+      // yang berguna sambil dimintai kota tujuan.
+      const ask =
+        `Tentu Kak! Untuk mengecek tarif ongkir dari toko kami (*${originCityName}*), ` +
+        `boleh minta informasi nama *Kecamatan* atau *Kota* tujuan pengirimannya Kak? 🚚`;
+      const fallback = draft.lines.length > 0 ? `${formatOrderSummary(draft)}\n\n${ask}` : ask;
+
+      if (!geminiApiKey) return { replyText: fallback, intent: "ONGKIR_CHECK" };
+
+      const guard = baseGuard();
+      const orderFacts = renderOrderFacts(draft, guard);
+      const replyText = await narrateWithGemini({
+        apiKey: geminiApiKey,
+        guard,
+        fallback,
+        label: "ongkir-tanpa-tujuan",
+        prompt: `${voiceText}
+
+DATA:
+${orderFacts || "Pembeli belum menyebut produk tertentu."}
+Ongkir dan total bayar BELUM bisa dihitung karena kecamatan/kota tujuan belum diketahui.
+
+${NUMBER_RULES}
+- Jangan menyebut angka ongkir maupun total bayar sama sekali; angkanya belum ada.
+
+Pesan pembeli: "${rawMessage}"
+
+Tugasmu: minta nama kecamatan atau kota tujuan pengiriman supaya sistem bisa
+menghitung ongkirnya. Kalau DATA memuat rincian produk, sebutkan dulu rincian
+dan subtotalnya. Tulis untuk WhatsApp (*tebal* satu bintang), tanpa kalimat
+pengantar.`
+      });
+
+      return { replyText, intent: "ONGKIR_CHECK" };
     }
 
     // Cari lokasi di Mengantar
@@ -410,10 +805,6 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     const destLoc = locations[0];
     const destName = destLoc ? `${destLoc.subdistrict_name}, ${destLoc.city_name}` : targetLocationQuery;
     const destId = destLoc ? destLoc.id : "3273010";
-
-    // Draf pesanan: produk yang DISEBUT pembeli beserta jumlah & harganya, bukan
-    // produk pertama di katalog. Tidak ada yang cocok → berat default toko.
-    const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
 
     const { rates, source: rateSource } = await calculateMengantarOngkir({
       originSubdistrictId,
@@ -426,7 +817,10 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     // Kalau pencarian lokasi saja sudah jatuh ke mock, tarifnya pasti bukan live.
     const effectiveSource: RateSource = locSource === "mock" ? "mock" : rateSource;
 
-    const replyText = buildOngkirReply({
+    // Versi deterministik dihitung LEBIH DULU dan selalu lengkap: rincian
+    // pesanan, ongkir per ekspedisi, total bayar, cara bayar. Ini yang dikirim
+    // kalau AI tidak tersedia atau balasannya tidak lolos pemeriksaan angka.
+    const deterministic = buildOngkirReply({
       draft,
       rates,
       localCourier,
@@ -438,6 +832,47 @@ export async function processAICustomerService(params: AIProcessParams): Promise
       includePayment,
       courierFilterActive: activeGroups.length > 0
     });
+
+    let replyText = deterministic;
+
+    if (geminiApiKey) {
+      const guard = baseGuard();
+      const orderFacts = renderOrderFacts(draft, guard);
+      const { shown, hidden } = mergeQuoteOptions(rates, localCourier);
+      const withTotal = includeTotal && draft.lines.length > 0;
+      const quoteFacts = renderQuoteFacts(shown, draft.subtotal, withTotal, guard);
+
+      replyText = await narrateWithGemini({
+        apiKey: geminiApiKey,
+        guard,
+        fallback: deterministic,
+        label: "ongkir",
+        prompt: `${voiceText}
+
+DATA — dihitung sistem, bukan olehmu:
+${orderFacts ? `${orderFacts}\n` : ""}Tujuan pengiriman: ${destName}
+Ongkir per ekspedisi${withTotal ? " beserta total bayarnya" : ""}:
+${quoteFacts}${
+          hidden > 0 ? `\nMasih ada ${hidden} pilihan ekspedisi lain yang tidak ditampilkan.` : ""
+        }${
+          effectiveSource === "mock"
+            ? "\nCATATAN: tarif di atas masih PERKIRAAN, bukan tarif kurir pasti. Sampaikan itu ke pembeli."
+            : ""
+        }${
+          draft.ambiguous.length > 0
+            ? `\nPRODUK AMBIGU: pembeli menyebut sesuatu yang cocok dengan beberapa produk (${draft.ambiguous.join(
+                ", "
+              )}). Tanyakan yang mana sebelum memastikan pesanan.`
+            : ""
+        }
+
+${NUMBER_RULES}
+
+Pesan pembeli: "${rawMessage}"
+
+${rewriteTask(deterministic)}`
+      });
+    }
 
     return {
       replyText,
@@ -462,120 +897,133 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     });
     prodText += `Mau pesan produk yang mana Kak? Bisa sekalian sebutkan lokasi kota untuk langsung kami hitungkan ongkirnya ya! 🚚`;
 
-    return {
-      replyText: prodText,
-      intent: "PRODUCT_INQUIRY"
-    };
+    if (!geminiApiKey) return { replyText: prodText, intent: "PRODUCT_INQUIRY" };
+
+    // Draf pesanan ikut dikirim supaya "harga 2 kaos berapa?" dijawab dengan
+    // hitungannya, bukan dengan seluruh katalog yang harus dihitung pembeli.
+    const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
+    const guard = baseGuard();
+    const catalogFacts = renderCatalogFacts(products, guard);
+    const orderFacts = renderOrderFacts(draft, guard);
+
+    const replyText = await narrateWithGemini({
+      apiKey: geminiApiKey,
+      guard,
+      fallback: prodText,
+      label: "katalog",
+      prompt: `${voiceText}
+
+DATA — katalog produk toko:
+${catalogFacts}
+${orderFacts ? `\n${orderFacts}\n` : ""}${
+        draft.ambiguous.length > 0
+          ? `\nPRODUK AMBIGU: yang disebut pembeli cocok dengan beberapa produk (${draft.ambiguous.join(
+              ", "
+            )}). Tanyakan yang mana.\n`
+          : ""
+      }
+Ongkir dan total bayar belum bisa dihitung sampai pembeli menyebut kecamatan/kota tujuan.
+
+${NUMBER_RULES}
+- Jangan menyebut angka ongkir maupun total bayar; angkanya belum ada.
+
+Pesan pembeli: "${rawMessage}"
+
+Tugasmu: jawab pertanyaan pembeli soal produk/harga memakai DATA di atas.
+- Kalau pembeli menyebut produk dan jumlahnya, sebutkan rincian dan subtotalnya.
+- Kalau pertanyaannya umum ("ada apa saja?"), sebutkan produknya beserta harga.
+- Tutup dengan menawarkan pengecekan ongkir bila pembeli menyebut kota tujuan.
+- Tulis untuk WhatsApp (*tebal* satu bintang), tanpa tabel dan tanpa kalimat
+  pengantar.`
+    });
+
+    return { replyText, intent: "PRODUCT_INQUIRY" };
   }
 
   // 3. Jika Pesan adalah Sapaan Awal
   if (isGreetingQuery) {
-    const defaultGreeting = greetingMessage || `Halo! Selamat datang di *${storeName}* 👋 Ada yang bisa kami bantu mengenai produk kami atau mau langsung cek tarif ongkir ke lokasi Kakak?`;
-    return {
-      replyText: defaultGreeting,
-      intent: "GREETING"
-    };
-  }
-
-  // 4. Menggunakan Google Gemini Generative AI jika GEMINI_API_KEY tersedia di ENV
-  const geminiApiKey = process.env.GEMINI_API_KEY;
-  if (geminiApiKey) {
-    const productCatalogStr = products.map((p) => `- ${p.name}: Rp ${p.price} (${p.weight}g)`).join("\n");
-
-    // Riwayat percakapan — hanya untuk paket yang berhak (Pro). Tanpa blok ini
-    // model tidak tahu apa pun yang sudah dibicarakan, jadi pembeli yang
-    // bertanya "yang tadi itu berapa?" akan dibalas seolah pesan pertama.
-    // Dipotong dari BELAKANG supaya yang terbaru selalu ikut, dan tiap isi
-    // pesan dipangkas agar satu pesan panjang tidak menelan seluruh konteks.
-    const contextTurns = Math.max(0, Math.floor(aiContextMessages));
-    const recent = contextTurns > 0 ? chatHistory.slice(-contextTurns) : [];
-    const historyStr = recent
-      .filter((m) => m.role === "user" || m.role === "assistant")
-      .map((m) => `${m.role === "user" ? "Pembeli" : "CS"}: ${m.content.slice(0, 400)}`)
-      .join("\n");
-
-    // Rekening disebut LENGKAP ke model supaya ia tidak perlu (dan tidak boleh)
-    // mengarang nomor. Aturan "jangan mengarang" di bawah baru berarti kalau
-    // data yang benar memang tersedia untuk dikutip.
-    const paymentSummary = [
-      ...payment.accounts.map(
-        (a) => `${a.name} ${a.number}${a.holder ? ` (a.n. ${a.holder})` : ""}`
-      ),
-      payment.codEnabled ? "COD (bayar di tempat)" : ""
-    ]
-      .filter(Boolean)
-      .join("; ");
-
-    const aiPrompt = `
-System Prompt: ${aiPromptSystem || "Kamu adalah CS AI yang ramah."}
-Toko: ${storeName}
-Pengiriman dari: ${originCityName}
-Nada bicara: ${AI_TONE_INSTRUCTIONS[tone]}
-Katalog Produk:
-${productCatalogStr || "Belum ada katalog"}
-${
-  activeGroups.length > 0
-    ? `Ekspedisi yang dilayani toko: ${activeGroups.map((c) => courierLabel(c)).join(", ")}.
-Jangan menawarkan ekspedisi di luar daftar itu.
-`
-    : ""
-}${
-  paymentSummary
-    ? `Metode pembayaran yang tersedia: ${paymentSummary}.
-`
-    : ""
-}${
-  payment.note ? `Catatan pembayaran dari toko: ${payment.note}\n` : ""
-}${
-  historyStr
-    ? `
-Riwayat percakapan sebelumnya dengan pembeli ini (terlama ke terbaru):
-${historyStr}
-
-Gunakan riwayat di atas sebagai konteks: jangan menyapa ulang seperti pesan
-pertama, jangan menanyakan hal yang sudah dijawab pembeli, dan rujuk produk
-atau kota yang sudah disebut bila pembeli memakai kata seperti "itu"/"tadi".
-`
-    : ""
-}
-Pesan Pembeli: "${rawMessage}"
-
-ATURAN ANGKA — WAJIB DIPATUHI:
-- JANGAN mengarang harga produk, ongkir, total, nomor rekening, atau nama bank.
-  Pakai HANYA angka dan data yang tertulis di atas.
-- Ongkir tidak boleh ditebak. Kalau pembeli menanyakan ongkir atau total,
-  mintalah nama kecamatan/kota tujuannya supaya sistem yang menghitung.
-- Kalau harga suatu produk tidak ada di katalog di atas, katakan akan dicek
-  dahulu — jangan menyebut angka apa pun.
-${
-  payment.accounts.length > 0 || payment.codEnabled
-    ? `- Nomor rekening hanya boleh disebut persis seperti yang tertulis di atas.
-`
-    : `- Toko belum mencantumkan rekening. Jangan memberi nomor rekening apa pun.
-`
-}
-Balaslah sebagai Customer Service WhatsApp yang sopan dan solutif. Sertakan ajakan untuk mengecek ongkir atau pemesanan produk jika relevan.
-`;
-
-    const geminiReply = await generateGeminiReply(aiPrompt, geminiApiKey);
-    if (geminiReply) {
-      return {
-        replyText: geminiReply,
-        intent: "GENERAL_CHAT"
-      };
+    // Sapaan yang ditulis sendiri pemilik toko dikirim APA ADANYA. Itu teks yang
+    // dia karang dan setujui; menyuruh AI "memperbaiki"-nya justru mengubah
+    // sesuatu yang tidak diminta diubah.
+    if (greetingMessage && greetingMessage.trim()) {
+      return { replyText: greetingMessage, intent: "GREETING" };
     }
-    console.warn("[ai] Gemini tidak mengembalikan balasan — pakai fallback rule-based.");
-  } else {
-    console.warn("[ai] GEMINI_API_KEY belum di-set — AI Gemini nonaktif, pakai fallback rule-based.");
+
+    const defaultGreeting = `Halo! Selamat datang di *${storeName}* 👋 Ada yang bisa kami bantu mengenai produk kami atau mau langsung cek tarif ongkir ke lokasi Kakak?`;
+    if (!geminiApiKey) return { replyText: defaultGreeting, intent: "GREETING" };
+
+    const guard = baseGuard();
+    const catalogFacts = renderCatalogFacts(products, guard);
+    const replyText = await narrateWithGemini({
+      apiKey: geminiApiKey,
+      guard,
+      fallback: defaultGreeting,
+      label: "sapaan",
+      prompt: `${voiceText}
+
+DATA — katalog produk toko:
+${catalogFacts}
+
+${NUMBER_RULES}
+- Ini pesan sapaan. Jangan menyebut angka rupiah kecuali pembeli menanyakannya.
+
+Pesan pembeli: "${rawMessage}"
+
+Tugasmu: balas sebagai sapaan pembuka yang singkat — sambut pembeli, sebutkan
+nama toko, dan tawarkan bantuan soal produk atau pengecekan ongkir. Maksimal
+tiga kalimat. Tulis untuk WhatsApp (*tebal* satu bintang), tanpa kalimat
+pengantar.`
+    });
+
+    return { replyText, intent: "GREETING" };
   }
 
-  // 5. Default Smart Rule Engine Fallback
-  let fallbackReply = `Terima kasih sudah menghubungi *${storeName}*! 😊\n\n`;
-  fallbackReply += `Pesan Kakak sudah kami terima. Kami siap membantu pertanyaan seputar produk maupun pengecekan tarif ongkos kirim (ongkir) kurir ke seluruh wilayah Indonesia.\n\n`;
-  fallbackReply += `Boleh diinfokan nama kota/kecamatan tujuan Kakak agar langsung kami bantu cek tarif ongkirnya? 📍`;
+  // 4. Obrolan umum — AI menyusun jawabannya, dengan katalog & draf pesanan
+  //    sebagai satu-satunya sumber angka.
+  const fallbackReply =
+    `Terima kasih sudah menghubungi *${storeName}*! 😊\n\n` +
+    `Pesan Kakak sudah kami terima. Kami siap membantu pertanyaan seputar produk maupun pengecekan tarif ongkos kirim (ongkir) kurir ke seluruh wilayah Indonesia.\n\n` +
+    `Boleh diinfokan nama kota/kecamatan tujuan Kakak agar langsung kami bantu cek tarif ongkirnya? 📍`;
 
-  return {
-    replyText: fallbackReply,
-    intent: "GENERAL_CHAT"
-  };
+  if (!geminiApiKey) {
+    return { replyText: fallbackReply, intent: "GENERAL_CHAT" };
+  }
+
+  const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
+  const guard = baseGuard();
+  const catalogFacts = renderCatalogFacts(products, guard);
+  const orderFacts = renderOrderFacts(draft, guard);
+
+  const replyText = await narrateWithGemini({
+    apiKey: geminiApiKey,
+    guard,
+    fallback: fallbackReply,
+    label: "obrolan",
+    prompt: `${voiceText}
+
+DATA — katalog produk toko:
+${catalogFacts}
+${orderFacts ? `\n${orderFacts}\n` : ""}${
+      draft.ambiguous.length > 0
+        ? `\nPRODUK AMBIGU: yang disebut pembeli cocok dengan beberapa produk (${draft.ambiguous.join(
+            ", "
+          )}). Tanyakan yang mana.\n`
+        : ""
+    }
+${NUMBER_RULES}
+- Ongkir dan total bayar TIDAK ADA di DATA dan tidak boleh ditebak. Kalau
+  pembeli menanyakannya, minta nama kecamatan/kota tujuan supaya sistem yang
+  menghitung — jangan menyebut angka ongkir apa pun.
+
+Pesan pembeli: "${rawMessage}"
+
+Tugasmu: balas sebagai Customer Service WhatsApp yang solutif.
+- Kalau pembeli menyebut produk dan jumlahnya, sebutkan rincian dan subtotalnya
+  dari DATA.
+- Ajak mengecek ongkir atau melanjutkan pesanan bila relevan.
+- Tulis untuk WhatsApp (*tebal* satu bintang), tanpa tabel dan tanpa kalimat
+  pengantar.`
+  });
+
+  return { replyText, intent: "GENERAL_CHAT" };
 }

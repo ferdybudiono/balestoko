@@ -6,7 +6,6 @@ import {
   Calculator,
   CheckCircle,
   ChevronRight,
-  KeyRound,
   MapPin,
   MessageSquare,
   Plus,
@@ -60,10 +59,6 @@ export interface StoreForm {
   defaultWeight: string;
   aiPromptSystem: string;
   greetingMessage: string;
-  /** Kosong = biarkan key yang sudah tersimpan di server apa adanya. */
-  mengantarApiKey: string;
-  /** Minta server menghapus key tersimpan (kolom kosong saja tidak menghapus). */
-  clearMengantarKey: boolean;
 
   /**
    * Kode grup ekspedisi yang dilayani toko. Array KOSONG = semua ekspedisi
@@ -99,8 +94,6 @@ interface StoreTabProps {
   onReset: () => void;
   /** Origin sudah berupa `_id` Mengantar asli (24 hex) → ongkir akurat. */
   originValid: boolean;
-  /** Toko sudah punya API key Mengantar tersimpan di server. */
-  hasMengantarKey: boolean;
   showToast: ShowToast;
 }
 
@@ -116,7 +109,6 @@ export default function StoreTab({
   onSave,
   onReset,
   originValid,
-  hasMengantarKey,
   showToast
 }: StoreTabProps) {
   // Pencarian lokasi asal
@@ -406,7 +398,8 @@ export default function StoreTab({
           {locationSource === "mock" && locationResults.length > 0 && (
             <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2">
               Daftar ini <strong>contoh offline</strong>, bukan dari Mengantar — memilihnya tidak akan
-              membuat ongkir jadi akurat. Isi API key Mengantar di bawah, lalu cari lagi.
+              membuat ongkir jadi akurat. Layanan pencarian wilayah sedang tidak bisa dihubungi; coba
+              cari lagi beberapa saat lagi.
             </p>
           )}
 
@@ -448,64 +441,6 @@ export default function StoreTab({
               {form.originCityName || "Belum diatur"}
             </span>
           </div>
-        </div>
-
-        {/* ── API key Mengantar ──────────────────────────────────────── */}
-        <div>
-          <label htmlFor="mengantar-key" className={labelCls}>
-            API key Mengantar{" "}
-            <span className="font-normal normal-case tracking-normal text-slate-400">(opsional)</span>
-          </label>
-          <div className="relative">
-            <KeyRound
-              className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400"
-              aria-hidden="true"
-            />
-            <input
-              id="mengantar-key"
-              type="password"
-              autoComplete="off"
-              placeholder={hasMengantarKey ? "•••••••• (tersimpan — isi untuk mengganti)" : "Tempel API key di sini"}
-              value={form.mengantarApiKey}
-              onChange={(e) => setForm({ mengantarApiKey: e.target.value, clearMengantarKey: false })}
-              className={`${inputCls} pl-9`}
-            />
-          </div>
-          <p className="text-xs text-slate-400 mt-1.5">
-            {hasMengantarKey
-              ? "Key sudah tersimpan dan tidak pernah dikirim balik ke browser. Kosongkan kolom ini untuk membiarkannya, atau ketik key baru untuk menggantinya."
-              : "Opsional. Cek ongkir memakai endpoint publik Mengantar yang tidak butuh key, jadi tarif tetap live walau kolom ini kosong."}
-          </p>
-          <p className="text-xs text-slate-400 mt-1">
-            Ongkir jatuh ke mode <strong>perkiraan</strong> bukan karena key ini, melainkan karena
-            lokasi asal toko belum dipilih dari hasil pencarian Mengantar.
-          </p>
-
-          {/* Kolom kosong sengaja TIDAK menghapus key — penghapusan harus disengaja. */}
-          {hasMengantarKey && !form.mengantarApiKey && (
-            <div className="mt-2">
-              {form.clearMengantarKey ? (
-                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2 inline-flex flex-wrap items-center gap-2">
-                  Key akan dihapus saat Anda menyimpan.
-                  <button
-                    type="button"
-                    onClick={() => setForm({ clearMengantarKey: false })}
-                    className="font-semibold underline hover:no-underline"
-                  >
-                    Batalkan
-                  </button>
-                </p>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setForm({ clearMengantarKey: true })}
-                  className="text-xs font-medium text-slate-400 hover:text-red-600 underline"
-                >
-                  Hapus key tersimpan
-                </button>
-              )}
-            </div>
-          )}
         </div>
 
         {/* ── Berat default ──────────────────────────────────────────── */}
@@ -885,8 +820,9 @@ export default function StoreTab({
               className={`${inputCls} py-3`}
             />
             <p className="text-xs text-slate-400 mt-1.5">
-              Tentukan gaya bahasa, aturan khusus toko, hal yang tidak boleh dijanjikan, dll.{" "}
-              {form.aiPromptSystem.length}/4000
+              Tentukan gaya bahasa, aturan khusus toko, hal yang tidak boleh dijanjikan, dll.
+              Berlaku untuk semua balasan &mdash; termasuk saat AI menyebut harga, ongkir, total
+              bayar, dan cara pembayaran. {form.aiPromptSystem.length}/4000
             </p>
           </div>
 
@@ -922,11 +858,14 @@ export default function StoreTab({
           </div>
 
           {/* Pratinjau dirender oleh buildOngkirReply — fungsi yang SAMA dengan
-              yang dipakai bot menyusun balasan asli. Jadi pratinjau ini tidak
-              bisa menyimpang dari yang diterima pembeli: kalau formatnya
-              berubah, keduanya berubah bersamaan. */}
+              yang dipakai bot menyusun ISI balasan. Jadi rincian, ongkir, total,
+              dan cara bayar di sini persis seperti yang dihitung untuk pembeli.
+              Yang bisa berbeda hanya kalimatnya: bila GEMINI_API_KEY terpasang,
+              AI menyampaikan ulang isi ini mengikuti instruksi & nada di atas.
+              Angkanya tidak pernah berubah — balasan AI yang menyelipkan angka
+              di luar hitungan sistem dibuang dan versi inilah yang dikirim. */}
           <div>
-            <span className={labelCls}>Pratinjau balasan WhatsApp</span>
+            <span className={labelCls}>Pratinjau isi balasan WhatsApp</span>
             <div className="p-4 bg-emerald-50/70 border border-emerald-100 rounded-2xl overflow-x-auto">
               <p className="text-[13px] leading-relaxed text-ink whitespace-pre-wrap">
                 {previewReply}
@@ -935,6 +874,11 @@ export default function StoreTab({
             <p className="text-xs text-slate-400 mt-1.5">
               Contoh dengan data karangan (2 produk, tujuan Coblong &mdash; Bandung) dan tarif
               contoh. Ongkir asli selalu diambil dari Mengantar saat pembeli bertanya.
+            </p>
+            <p className="text-xs text-slate-400 mt-1">
+              Ini <strong>isi</strong> balasannya, bukan kalimat finalnya. AI CS menyampaikan ulang
+              isi yang sama dengan gaya bahasa sesuai instruksi &amp; nada di atas &mdash; semua
+              angka tetap dari hitungan sistem, tidak pernah dari AI.
             </p>
           </div>
         </div>
