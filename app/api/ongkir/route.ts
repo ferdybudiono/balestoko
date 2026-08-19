@@ -67,6 +67,10 @@ export async function POST(req: Request) {
       originSubdistrictId: originId,
       destinationSubdistrictId: destinationId,
       weightGram,
+      // Tes ongkir harus memperlihatkan APA YANG DILIHAT PEMBELI. Tanpa filter
+      // ini pemilik toko akan melihat 16 ekspedisi di dashboard padahal botnya
+      // hanya menawarkan yang diceklis.
+      couriers: store.active_couriers,
       apiKey: store.mengantar_api_key
     });
 

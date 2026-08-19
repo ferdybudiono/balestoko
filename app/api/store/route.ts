@@ -10,6 +10,8 @@ import {
 } from "@/lib/supabase";
 import { getFonnteDeviceStatus } from "@/lib/fonnte";
 import { daysUntil, maxDevicesForPackage } from "@/lib/packages";
+import { normalizeActiveCouriers, normalizeLocalCourier } from "@/lib/couriers";
+import { normalizeAiTone, normalizePaymentAccounts } from "@/lib/reply-format";
 import { getSessionEmail } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -153,6 +155,40 @@ export async function POST(req: Request) {
     // String kosong = hapus key (pakai endpoint publik Mengantar lagi).
     if (typeof body.mengantar_api_key === "string")
       settings.mengantar_api_key = body.mengantar_api_key.trim().slice(0, 200) || null;
+
+    // ── Ekspedisi, kurir toko, pembayaran, & gaya jawaban AI ────────────────
+    // Semua nilai di bawah ini akhirnya DIKIRIM KE PEMBELI lewat WhatsApp, jadi
+    // panjangnya dibatasi dan kode yang tidak dikenal dibuang senyap — bukan
+    // diteruskan apa adanya ke prompt AI atau ke teks balasan.
+    if (body.active_couriers !== undefined) {
+      // Array kosong sengaja disimpan sebagai `[]` (bukan null): keduanya
+      // bermakna "semua ekspedisi", dan menyimpan apa yang dikirim dashboard
+      // membuat perbandingan dirty di klien tetap jujur.
+      settings.active_couriers = normalizeActiveCouriers(body.active_couriers);
+    }
+    if (body.local_courier !== undefined) {
+      settings.local_courier = normalizeLocalCourier(body.local_courier);
+    }
+    if (body.payment_accounts !== undefined) {
+      settings.payment_accounts = normalizePaymentAccounts(body.payment_accounts);
+    }
+    if (body.cod_enabled !== undefined) {
+      settings.cod_enabled = body.cod_enabled === true;
+    }
+    if (typeof body.payment_note === "string") {
+      settings.payment_note = body.payment_note.trim().slice(0, 600) || null;
+    }
+    if (body.ai_tone !== undefined) {
+      // Nilai tak dikenal jatuh ke default, tidak ditolak: nada bicara bukan
+      // alasan yang layak membuat seluruh penyimpanan pengaturan gagal.
+      settings.ai_tone = normalizeAiTone(body.ai_tone);
+    }
+    if (body.ai_include_total !== undefined) {
+      settings.ai_include_total = body.ai_include_total === true;
+    }
+    if (body.ai_include_payment !== undefined) {
+      settings.ai_include_payment = body.ai_include_payment === true;
+    }
 
     if (Object.keys(settings).length === 0) {
       return NextResponse.json({ error: "Tidak ada perubahan yang valid untuk disimpan." }, { status: 400 });

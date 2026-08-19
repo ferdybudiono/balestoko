@@ -3,6 +3,8 @@
  * Supporting Live Mengantar API endpoint and high-fidelity Mock Fallback.
  */
 
+import { filterRatesByActiveCouriers } from "./couriers";
+
 export interface MengantarLocation {
   id: string;
   subdistrict_name: string;
@@ -234,15 +236,21 @@ export async function searchMengantarLocation(
 
 /**
  * Hitung biaya ongkos kirim (Cek Ongkir) lewat Mengantar API
+ *
+ * `couriers` = daftar kode grup ekspedisi yang dilayani toko
+ * (`stores.active_couriers`). Penyaringan sengaja ditaruh DI SINI, bukan di
+ * pemanggil: ini satu-satunya tempat yang dilewati jalur live maupun jalur
+ * simulasi, jadi bot dan tes ongkir di dashboard mustahil memakai aturan yang
+ * berbeda. Kosong/undefined = semua ekspedisi (lihat `filterRatesByActiveCouriers`).
  */
 export async function calculateMengantarOngkir(params: {
   originSubdistrictId: string;
   destinationSubdistrictId: string;
   weightGram: number; // Dalam gram
-  couriers?: string[];
+  couriers?: string[] | null;
   apiKey?: string;
 }): Promise<OngkirResult> {
-  const { originSubdistrictId, destinationSubdistrictId, weightGram } = params;
+  const { originSubdistrictId, destinationSubdistrictId, weightGram, couriers } = params;
   const weightKg = Math.max(1, Math.ceil((weightGram || 1000) / 1000));
 
   // 1. Panggil Live API Mengantar: allEstimatePublic mengembalikan tarif semua
@@ -265,7 +273,14 @@ export async function calculateMengantarOngkir(params: {
         const data = await res.json();
         if (data?.success && data.data && typeof data.data === "object") {
           const options = mapEstimateData(data.data as Record<string, unknown>, weightKg);
-          if (options.length > 0) return { rates: options, source: "live" };
+          // Penyaringan dilakukan SETELAH memastikan API memang mengembalikan
+          // tarif. Kalau tarifnya ada tapi semuanya milik kurir yang tidak
+          // dilayani toko, hasilnya harus tetap "live tapi kosong" — JANGAN
+          // jatuh ke blok simulasi di bawah, karena itu justru mengembalikan
+          // kurir yang baru saja sengaja dibuang.
+          if (options.length > 0) {
+            return { rates: filterRatesByActiveCouriers(options, couriers), source: "live" };
+          }
         }
       } else {
         console.warn(`[mengantar] allEstimatePublic HTTP ${res.status}`);
@@ -284,37 +299,40 @@ export async function calculateMengantarOngkir(params: {
 
   const totalBase = baseRate + Math.min(25000, Math.floor(distanceMultiplier / 500) * 1500);
 
-  return {
-    source: "mock",
-    rates: [
-      {
-        courier_code: "jne",
-        courier_name: "JNE Express",
-        service_name: "REG (Reguler)",
-        etd: "1-2 hari",
-        cost: totalBase * weightKg
-      },
-      {
-        courier_code: "jnt",
-        courier_name: "J&T Express",
-        service_name: "EZ",
-        etd: "1-3 hari",
-        cost: (totalBase - 1000) * weightKg
-      },
-      {
-        courier_code: "sicepat",
-        courier_name: "SiCepat Ekspres",
-        service_name: "SIUNTUNG",
-        etd: "1-2 hari",
-        cost: (totalBase + 1000) * weightKg
-      },
-      {
-        courier_code: "pos",
-        courier_name: "Pos Indonesia",
-        service_name: "Pos Kilat Khusus",
-        etd: "2-4 hari",
-        cost: Math.max(9000, (totalBase - 3000) * weightKg)
-      }
-    ]
-  };
+  const mockRates: ShippingOption[] = [
+    {
+      courier_code: "jne",
+      courier_name: "JNE Express",
+      service_name: "REG (Reguler)",
+      etd: "1-2 hari",
+      cost: totalBase * weightKg
+    },
+    {
+      // `jnt` adalah kode historis; dikenali sebagai grup `jt` lewat alias di
+      // lib/couriers.ts, jadi J&T tetap ikut tersaring dengan benar.
+      courier_code: "jnt",
+      courier_name: "J&T Express",
+      service_name: "EZ",
+      etd: "1-3 hari",
+      cost: (totalBase - 1000) * weightKg
+    },
+    {
+      courier_code: "sicepat",
+      courier_name: "SiCepat Ekspres",
+      service_name: "SIUNTUNG",
+      etd: "1-2 hari",
+      cost: (totalBase + 1000) * weightKg
+    },
+    {
+      courier_code: "pos",
+      courier_name: "Pos Indonesia",
+      service_name: "Pos Kilat Khusus",
+      etd: "2-4 hari",
+      cost: Math.max(9000, (totalBase - 3000) * weightKg)
+    }
+  ];
+
+  // Jalur simulasi ikut disaring supaya pengaturan ekspedisi toko tetap dihormati
+  // walau tarifnya sedang tidak bisa diambil dari Mengantar.
+  return { source: "mock", rates: filterRatesByActiveCouriers(mockRates, couriers) };
 }

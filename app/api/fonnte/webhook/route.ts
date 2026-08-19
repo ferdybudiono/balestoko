@@ -4,6 +4,7 @@ import {
   getStoreAndDeviceByToken,
   isDeviceWithinPlanLimit,
   isStoreActive,
+  updateStoreDevice,
   type StoreDeviceRecord,
   type StoreRecord
 } from "@/lib/supabase";
@@ -46,6 +47,28 @@ function verifyWebhookSecret(req: Request, body: Record<string, unknown>): boole
     req.headers.get("x-webhook-secret") ||
     String(body.secret || "");
   return provided === expected;
+}
+
+/**
+ * Catat bahwa pesan masuk TIBA untuk nomor ini, beserta apa yang terjadi padanya.
+ *
+ * Ini jejak diagnosa yang ditampilkan di tab WhatsApp. Tanpanya, "belum ada
+ * pembeli yang chat" dan "chat pembeli tidak pernah sampai ke aplikasi" terlihat
+ * sama persis dari dashboard — padahal yang kedua berarti bot mati.
+ *
+ * Kegagalan menulis di sini TIDAK boleh menggagalkan balasan: ini catatan, bukan
+ * bagian dari pemrosesan pesan.
+ */
+async function noteInbound(device: StoreDeviceRecord, note: string): Promise<void> {
+  if (!device.id) return;
+  try {
+    await updateStoreDevice(device.id, {
+      last_inbound_at: new Date().toISOString(),
+      last_inbound_note: note.slice(0, 120)
+    });
+  } catch (err) {
+    console.warn("[fonnte webhook] gagal mencatat pesan masuk:", err);
+  }
 }
 
 export async function POST(req: Request) {
@@ -110,32 +133,41 @@ export async function POST(req: Request) {
     }
 
     const { store, device } = match;
+    const desiredWebhookUrl = buildFonnteWebhookUrl(resolveBaseUrl(req));
 
     if (!secretOk) {
       // Device yang tersambung SEBELUM secret diaktifkan menyimpan URL webhook
-      // tanpa `?secret=`, jadi ia mustahil mengirim secret yang benar. Menolaknya
-      // berarti bot toko itu mati tanpa jalan pulih sendiri — tab QR pun tidak
-      // muncul saat status sudah terhubung. Jadi: terima sekali, perbaiki URL
-      // device-nya, dan setelah tersinkron pintu ini tertutup permanen.
-      if (isWebhookUrlSynced(device)) {
+      // tanpa `?secret=` — dan device yang tersinkron dengan secret LAMA (setelah
+      // rotasi) juga mustahil mengirim secret yang benar. Menolaknya berarti bot
+      // toko itu mati tanpa jalan pulih sendiri — tab QR pun tidak muncul saat
+      // status sudah terhubung. Jadi: terima sekali, perbaiki setelan device-nya,
+      // dan setelah tersinkron pintu ini tertutup permanen.
+      //
+      // Perbandingan URL di `isWebhookUrlSynced` sengaja PERSIS (bukan "memuat
+      // secret="): itu yang membuat rotasi secret ikut lewat jalur perbaikan ini
+      // alih-alih mematikan bot selamanya.
+      if (isWebhookUrlSynced(device, desiredWebhookUrl)) {
         console.warn(
           `[fonnte webhook] secret tidak valid untuk device ${deviceNumber} yang sudah tersinkron, request ditolak.`
         );
+        await noteInbound(device, "Ditolak: secret webhook tidak cocok");
         return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
       }
 
       console.warn(
-        `[fonnte webhook] device ${deviceNumber} belum memakai URL ber-secret — ` +
-          "pesan diproses sekali sambil menyinkronkan URL webhook device."
+        `[fonnte webhook] device ${deviceNumber} belum memakai URL ber-secret yang berlaku — ` +
+          "pesan diproses sekali sambil menyinkronkan setelan device."
       );
       const synced = await syncDeviceWebhookUrl({
         store,
         device,
-        desired: buildFonnteWebhookUrl(resolveBaseUrl(req))
+        desired: desiredWebhookUrl
       });
-      if (!synced) {
+      if (!synced.ok) {
         console.warn(
-          "[fonnte webhook] sinkronisasi URL gagal; buka tab WhatsApp di dashboard toko tersebut untuk memperbaiki."
+          "[fonnte webhook] sinkronisasi setelan gagal:",
+          synced.error,
+          "— buka tab WhatsApp di dashboard toko tersebut untuk memperbaiki."
         );
       }
     }
@@ -143,6 +175,7 @@ export async function POST(req: Request) {
     // Toko nonaktif (trial habis & belum bayar) → jangan proses AI (cegah pemakaian gratis).
     if (!isStoreActive(store)) {
       console.warn("[fonnte webhook] toko nonaktif / trial berakhir, pesan diabaikan.");
+      await noteInbound(device, "Diabaikan: masa aktif toko berakhir");
       return NextResponse.json({ status: "ignored", reason: "Store inactive or trial expired" });
     }
 
@@ -153,6 +186,7 @@ export async function POST(req: Request) {
       console.warn(
         `[fonnte webhook] device ${deviceNumber} di luar kuota paket toko, pesan diabaikan.`
       );
+      await noteInbound(device, "Diabaikan: nomor di luar kuota paket");
       return NextResponse.json({ status: "ignored", reason: "Device over plan limit" });
     }
 
@@ -164,6 +198,7 @@ export async function POST(req: Request) {
         `[fonnte webhook] kuota percakapan bulanan toko habis (${quota.used}/${quota.limit}), ` +
           `pesan dari ${sender} diabaikan.`
       );
+      await noteInbound(device, `Diabaikan: kuota percakapan bulanan habis (${quota.used}/${quota.limit})`);
       return NextResponse.json({ status: "ignored", reason: "Monthly conversation quota exceeded" });
     }
 
@@ -173,6 +208,7 @@ export async function POST(req: Request) {
     const rate = await checkRateLimit(device.id || store.id || deviceNumber, sender);
     if (!rate.ok) {
       console.warn(`[fonnte webhook] batas laju tercapai untuk ${sender}, pesan diabaikan.`);
+      await noteInbound(device, "Diabaikan: terlalu banyak pesan dari satu nomor (batas laju)");
       return NextResponse.json(
         { status: "ignored", reason: "Rate limited" },
         { status: 429, headers: { "Retry-After": String(rate.retryAfterSec) } }
@@ -185,6 +221,13 @@ export async function POST(req: Request) {
       messageText,
       deviceToken: device.fonnte_token
     });
+
+    await noteInbound(
+      device,
+      outcome.delivered
+        ? "Dibalas AI"
+        : `Balasan gagal dikirim: ${outcome.deliveryError || "penyebab tidak diketahui"}`
+    );
 
     return NextResponse.json({
       success: true,

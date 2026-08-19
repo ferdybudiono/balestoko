@@ -16,6 +16,18 @@ export interface FonnteDeviceResponse {
   quota?: string;
   expired?: string;
   reason?: string;
+  /**
+   * Setelan `auto read` device menurut Fonnte. `null` = Fonnte tidak
+   * melaporkannya di response ini (jangan disimpulkan sebagai "mati").
+   *
+   * PENTING: Fonnte MEWAJIBKAN auto read menyala agar webhook pesan masuk
+   * dipanggil ("if you leave it off, your webhook won't work!"). Jadi nilai
+   * `false` di sini berarti bot tidak akan pernah membalas chat pembeli,
+   * seberapa benar pun sisa konfigurasinya.
+   */
+  autoread?: boolean | null;
+  /** URL webhook pesan masuk yang benar-benar tersimpan di sisi Fonnte. */
+  webhook?: string | null;
 }
 
 /**
@@ -27,6 +39,31 @@ export function formatFonntePhone(phone: string): string {
   if (clean.startsWith("0")) clean = "62" + clean.slice(1);
   if (!clean.startsWith("62")) clean = "62" + clean;
   return clean;
+}
+
+/**
+ * Baca flag boolean dari response Fonnte. Fonnte tidak konsisten: ada yang
+ * mengirim boolean asli, ada yang "true"/"false", 1/0, atau "on"/"off".
+ * Nilai yang tidak dikenali → `null` ("tidak tahu"), bukan `false`, supaya
+ * dashboard tidak menuduh setelan mati padahal Fonnte hanya diam.
+ */
+function parseFonnteFlag(value: unknown): boolean | null {
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  const s = String(value ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (["true", "1", "on", "yes", "y", "aktif", "enable", "enabled"].includes(s)) return true;
+  if (["false", "0", "off", "no", "n", "nonaktif", "disable", "disabled"].includes(s)) return false;
+  return null;
+}
+
+/** Ambil nilai pertama yang terisi dari beberapa kemungkinan nama field. */
+function pickField(source: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    const v = source[key];
+    if (v !== undefined && v !== null && v !== "") return v;
+  }
+  return undefined;
 }
 
 /**
@@ -119,22 +156,36 @@ export async function deleteFonnteDevice(phone: string): Promise<{ success: bool
 }
 
 /**
- * Set/Update URL webhook "incoming chat" pada sebuah device Fonnte secara
- * otomatis (tanpa user perlu setting manual di dashboard Fonnte).
+ * Set/Update setelan penerimaan pesan pada sebuah device Fonnte secara otomatis
+ * (tanpa user perlu setting manual di dashboard Fonnte).
  *
  * Endpoint /update-device butuh DEVICE token (bukan account token) + wajib
- * mengirim `name` & `device`. `webhook` = url penerima pesan masuk.
+ * mengirim `name` & `device`.
+ *
+ * DUA setelan yang dikirim, dan KEDUANYA wajib supaya bot bisa membalas chat
+ * pembeli sungguhan:
+ *   • `webhook`  → URL penerima pesan masuk.
+ *   • `autoread` → Fonnte hanya memanggil webhook bila auto read menyala.
+ *                  Device hasil `add-device` tidak menyalakannya sendiri, jadi
+ *                  tanpa baris ini pesan pembeli TIDAK PERNAH sampai ke
+ *                  aplikasi — padahal uji coba dari dashboard tetap sukses
+ *                  (uji coba hanya memakai jalur KIRIM, bukan jalur TERIMA).
+ *
+ * Nama parameter `autoread` mengikuti istilah Fonnte sendiri ("Auto read" di
+ * halaman edit device). Bila suatu saat Fonnte mengganti/mengabaikan namanya,
+ * kegagalan itu TIDAK senyap: `getFonnteDeviceStatus` membaca ulang setelan
+ * sebenarnya dan dashboard menampilkan peringatan agar dinyalakan manual.
  */
-export async function setFonnteWebhook(
+export async function applyFonnteDeviceSettings(
   deviceToken: string,
-  deviceName: string,
-  deviceNumber: string,
-  webhookUrl: string
+  settings: { name: string; deviceNumber: string; webhookUrl: string; autoread?: boolean }
 ): Promise<{ success: boolean; error?: string }> {
+  const { name: rawName, deviceNumber, webhookUrl, autoread = true } = settings;
+
   if (!deviceToken) return { success: false, error: "Device token kosong." };
   if (!webhookUrl) return { success: false, error: "URL webhook kosong." };
 
-  const name = (deviceName || "Device").trim().slice(0, 30) || "Device";
+  const name = (rawName || "Device").trim().slice(0, 30) || "Device";
   const device = formatFonntePhone(deviceNumber);
 
   try {
@@ -142,6 +193,7 @@ export async function setFonnteWebhook(
     formData.append("name", name);
     formData.append("device", device);
     formData.append("webhook", webhookUrl);
+    formData.append("autoread", autoread ? "true" : "false");
 
     const res = await fetch("https://api.fonnte.com/update-device", {
       method: "POST",
@@ -156,9 +208,9 @@ export async function setFonnteWebhook(
     if (res.ok && data.status) {
       return { success: true };
     }
-    return { success: false, error: data.reason || data.message || "Gagal mengatur webhook device." };
+    return { success: false, error: data.reason || data.message || "Gagal mengatur setelan device." };
   } catch (err) {
-    console.error("[fonnte] Exception setting webhook:", err);
+    console.error("[fonnte] Exception updating device settings:", err);
     return { success: false, error: String(err) };
   }
 }
@@ -206,13 +258,18 @@ export async function sendFonnteMessage(options: FonnteSendOptions): Promise<{ s
 }
 
 /**
- * Cek status device Fonnte (Connected / Disconnected).
+ * Cek status device Fonnte (Connected / Disconnected) + setelan penerimaan pesan.
  *
  * PENTING: response /device punya DUA field berbeda:
  *  - `status`  → hanya menandakan TOKEN VALID (request sukses), BUKAN koneksi WA.
  *  - `device_status` → status login WhatsApp sebenarnya ("connect"/"disconnect").
  * Device yang baru dibuat via add-device selalu "disconnect" sampai QR di-scan,
  * jadi kita HARUS memakai `device_status`, bukan `status`.
+ *
+ * Fungsi ini juga membaca `autoread` & `webhook` apa adanya dari Fonnte. Itu
+ * satu-satunya cara memverifikasi bahwa jalur TERIMA (pesan pembeli → webhook)
+ * benar-benar hidup: jalur KIRIM bisa sukses sempurna sementara jalur terima
+ * mati total. Keduanya `null` bila Fonnte tidak melaporkannya.
  */
 export async function getFonnteDeviceStatus(token: string): Promise<FonnteDeviceResponse> {
   const activeToken = token || process.env.FONNTE_TOKEN;
@@ -233,23 +290,38 @@ export async function getFonnteDeviceStatus(token: string): Promise<FonnteDevice
       return { status: false, reason: `HTTP error ${res.status}` };
     }
 
-    const data = await res.json();
+    const data = (await res.json()) as Record<string, unknown>;
 
     // Token tidak valid / error dari Fonnte.
     if (!data.status) {
       return {
         status: false,
-        reason: data.reason || data.message || "Token device tidak valid."
+        reason: (data.reason as string) || (data.message as string) || "Token device tidak valid."
       };
     }
 
-    const connected =
-      String(data.device_status || "").toLowerCase() === "connect";
+    // Sebagian response menaruh detail device di dalam array `data`. Field di
+    // level atas menang bila keduanya ada.
+    const nested = Array.isArray(data.data) ? (data.data[0] as Record<string, unknown>) : null;
+    const info: Record<string, unknown> = { ...(nested || {}), ...data };
+
+    const connected = String(info.device_status || "").toLowerCase() === "connect";
+
+    // Field ada tapi KOSONG bukan hal yang sama dengan tidak dilaporkan: URL
+    // webhook yang dikosongkan di Fonnte justru kondisi yang wajib diperbaiki.
+    // Kalau keduanya disamakan jadi `null`, rekonsiliasi jatuh ke catatan
+    // database kita sendiri — yang masih mengklaim "sudah tersinkron" — dan
+    // device yang webhook-nya hilang tidak akan pernah dipulihkan.
+    const webhookKeys = ["webhook", "webhook_url", "webhookurl", "url_webhook"];
+    const webhookValue = pickField(info, webhookKeys);
+    const webhookReported = webhookKeys.some((k) => info[k] !== undefined && info[k] !== null);
 
     return {
       status: connected,
-      device: data.device || data.whatsapp || "Active Device",
-      quota: data.quota || "Unlimited",
+      device: (info.device as string) || (info.whatsapp as string) || "Active Device",
+      quota: (info.quota as string) || "Unlimited",
+      autoread: parseFonnteFlag(pickField(info, ["autoread", "auto_read", "autoRead"])),
+      webhook: webhookValue !== undefined ? String(webhookValue) : webhookReported ? "" : null,
       reason: connected ? undefined : "WhatsApp belum terhubung (belum scan QR)."
     };
   } catch (err) {

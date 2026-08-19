@@ -159,7 +159,19 @@ export async function runAutoReply(params: {
     // Memori percakapan = fitur berbayar. Riwayatnya tetap dikirim (dipakai
     // mendeteksi sapaan pertama), tapi hanya paket Pro yang riwayatnya ikut
     // masuk ke prompt model.
-    aiContextMessages: aiContextMessagesForPackage(store.package_id)
+    aiContextMessages: aiContextMessagesForPackage(store.package_id),
+    // Pengaturan ekspedisi, pembayaran, & gaya jawaban dari tab Pengaturan Toko.
+    // `?? true` untuk dua toggle terakhir: kolomnya baru, jadi baris lama yang
+    // belum terisi harus tetap mendapat perilaku lengkap (total + cara bayar),
+    // bukan diam-diam kehilangan blok yang tidak pernah dimatikan pemiliknya.
+    activeCouriers: store.active_couriers,
+    localCourier: store.local_courier,
+    paymentAccounts: store.payment_accounts,
+    codEnabled: store.cod_enabled === true,
+    paymentNote: store.payment_note,
+    aiTone: store.ai_tone,
+    includeTotal: store.ai_include_total ?? true,
+    includePayment: store.ai_include_payment ?? true
   });
 
   let delivered = false;

@@ -1,11 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSessionEmail } from "@/lib/auth";
-import {
-  createFonnteDevice,
-  deleteFonnteDevice,
-  formatFonntePhone,
-  getFonnteDeviceStatus
-} from "@/lib/fonnte";
+import { createFonnteDevice, deleteFonnteDevice, formatFonntePhone } from "@/lib/fonnte";
 import { maxDevicesForPackage, getPlan } from "@/lib/packages";
 import {
   deleteStoreDevice,
@@ -17,13 +12,19 @@ import {
   toPublicDevice,
   updateStoreDevice,
   upsertStore,
+  type StoreDeviceRecord,
   type StoreRecord
 } from "@/lib/supabase";
 import {
   buildFonnteWebhookUrl,
   fonnteDeviceName,
+  isReachableBaseUrl,
+  isWebhookUrlSynced,
+  redactWebhookUrl,
+  reconcileDeviceInbound,
   resolveBaseUrl,
-  syncDeviceWebhookUrl
+  syncDeviceWebhookUrl,
+  type DeviceInboundHealth
 } from "@/lib/webhook-url";
 
 export const runtime = "nodejs";
@@ -35,8 +36,9 @@ export const dynamic = "force-dynamic";
  * Jumlah nomor dibatasi paket — Starter 1, Pro 3 — dan batas itu DITEGAKKAN di
  * sini, bukan cuma dijanjikan di halaman harga.
  *
- *   GET    ?status=1  → daftar nomor (opsional: segarkan status dari Fonnte)
+ *   GET    ?status=1  → daftar nomor (opsional: segarkan status + setelan dari Fonnte)
  *   POST   { phone, label? }
+ *   PATCH  ?id=<deviceId>  → paksa perbaiki setelan penerimaan pesan
  *   DELETE ?id=<deviceId>
  */
 
@@ -66,14 +68,25 @@ export async function GET(req: Request) {
   const { devices, legacy } = await listStoreDevicesCompat(store);
   const limit = maxDevicesForPackage(store.package_id);
 
+  const baseUrl = resolveBaseUrl(req);
+  const desired = buildFonnteWebhookUrl(baseUrl);
+  const baseUrlReachable = isReachableBaseUrl(desired);
+
+  // Kondisi jalur TERIMA per nomor. Tanpa `status=1` kita hanya melaporkan apa
+  // yang tercatat di database (murah, dipakai polling); dengan `status=1` setelan
+  // dibaca ulang dari Fonnte dan diperbaiki bila melenceng.
+  const health = new Map<string, DeviceInboundHealth>();
+
   if (refreshStatus) {
     // Satu panggilan Fonnte per device — jalankan paralel supaya latensi tidak
     // menumpuk saat toko punya 3 nomor.
     await Promise.all(
       devices.map(async (d) => {
         if (!d.fonnte_token) return;
-        const status = await getFonnteDeviceStatus(d.fonnte_token);
-        const next = status.status ? "CONNECTED" : "DISCONNECTED";
+        const h = await reconcileDeviceInbound({ store, device: d, desired });
+        health.set(d.id || d.phone, h);
+
+        const next = h.connected ? "CONNECTED" : "DISCONNECTED";
         if (next === d.device_status) return;
         d.device_status = next;
         if (d.id) await updateStoreDevice(d.id, { device_status: next });
@@ -85,14 +98,101 @@ export async function GET(req: Request) {
   }
 
   return NextResponse.json({
-    devices: devices.map(toPublicDevice),
+    devices: devices.map((d) => withInboundDiagnostics(d, desired, health.get(d.id || d.phone))),
     limit,
     planName: getPlan(store.package_id)?.name || "Starter",
     canAddMore: !legacy && devices.length < limit,
     // true = tabel `store_devices` belum ada/belum terisi; nomor di bawah dibaca
     // dari kolom lama `stores` dan penambahan nomor belum bisa dipakai.
-    needsMigration: legacy
+    needsMigration: legacy,
+    // Diagnosa tingkat aplikasi: URL yang didaftarkan ke Fonnte (secret disamarkan)
+    // dan apakah URL itu bisa dijangkau dari internet.
+    expectedWebhookUrl: redactWebhookUrl(desired),
+    baseUrlReachable,
+    baseUrlWarning: baseUrlReachable
+      ? undefined
+      : `NEXT_PUBLIC_BASE_URL menunjuk ke ${baseUrl} yang tidak bisa dijangkau Fonnte. ` +
+        "Chat pembeli tidak akan pernah tiba sebelum variabel itu diisi domain publik aplikasi, " +
+        "lalu aplikasi di-deploy ulang."
   });
+}
+
+/**
+ * Paksa perbaikan setelan penerimaan pesan (URL webhook + auto read) — dipakai
+ * tombol "Perbaiki otomatis" di tab WhatsApp.
+ *
+ *   PATCH /api/fonnte/devices          → semua nomor toko
+ *   PATCH /api/fonnte/devices?id=<uuid> → satu nomor
+ */
+export async function PATCH(req: Request) {
+  const auth = await requireStore();
+  if (!auth.ok) return auth.res;
+  const { store } = auth;
+
+  const id = new URL(req.url).searchParams.get("id") || "";
+  const desired = buildFonnteWebhookUrl(resolveBaseUrl(req));
+
+  if (!isReachableBaseUrl(desired)) {
+    return NextResponse.json(
+      {
+        error:
+          "URL webhook aplikasi masih menunjuk ke localhost/jaringan privat, jadi Fonnte tidak " +
+          "bisa mengirim pesan masuk ke sana. Isi NEXT_PUBLIC_BASE_URL dengan domain publik " +
+          "aplikasi lalu deploy ulang."
+      },
+      { status: 400 }
+    );
+  }
+
+  const { devices } = await listStoreDevicesCompat(store);
+  const targets = id ? devices.filter((d) => d.id === id) : devices;
+
+  if (targets.length === 0) {
+    return NextResponse.json({ error: "Nomor tidak ditemukan." }, { status: 404 });
+  }
+
+  const results = await Promise.all(
+    targets.map(async (d) => {
+      const h = await reconcileDeviceInbound({ store, device: d, desired, force: true });
+      return { device: withInboundDiagnostics(d, desired, h), health: h };
+    })
+  );
+
+  const failed = results.filter((r) => !r.health.webhookSynced || r.health.error);
+
+  return NextResponse.json({
+    success: failed.length === 0,
+    devices: results.map((r) => r.device),
+    error: failed.length > 0 ? failed[0].health.error : undefined
+  });
+}
+
+/**
+ * Gabungkan diagnosa jalur terima ke bentuk device yang dikirim ke browser.
+ *
+ * `health` hanya ada bila setelan baru dibaca langsung dari Fonnte; tanpa itu
+ * jawabannya berbasis catatan database saja — dan itu ditandai lewat
+ * `inbound_checked: false` supaya UI tidak memasang klaim yang tidak dia miliki.
+ */
+function withInboundDiagnostics(
+  device: StoreDeviceRecord,
+  desired: string,
+  health?: DeviceInboundHealth
+) {
+  const base = toPublicDevice(device);
+  const webhookSynced = health ? health.webhookSynced : isWebhookUrlSynced(device, desired);
+  return {
+    ...base,
+    inbound_checked: !!health,
+    autoread: health ? health.autoread : base.autoread,
+    // `health.webhookAtFonnte` sudah disamarkan di `reconcileDeviceInbound`.
+    webhook_url: health ? health.webhookAtFonnte : redactWebhookUrl(device.webhook_url),
+    webhook_synced: webhookSynced,
+    inbound_repaired: health?.repaired ?? false,
+    // Hanya kendala jalur TERIMA. `health.error` juga memuat alasan device tidak
+    // terhubung, dan itu sudah punya tempat sendiri di UI (badge status).
+    inbound_error: webhookSynced ? undefined : health?.error
+  };
 }
 
 export async function POST(req: Request) {
@@ -190,7 +290,11 @@ export async function POST(req: Request) {
   }
 
   const device = inserted.data;
-  await syncDeviceWebhookUrl({
+  // Daftarkan URL webhook + nyalakan `auto read` sejak nomor dibuat. Auto read
+  // adalah syarat Fonnte untuk mengirim pesan masuk ke webhook; tanpa itu nomor
+  // ini bisa mengirim balasan uji coba tapi tidak akan pernah menerima chat
+  // pembeli — kegagalan yang paling membingungkan karena semuanya tampak normal.
+  const synced = await syncDeviceWebhookUrl({
     store,
     device,
     desired: buildFonnteWebhookUrl(resolveBaseUrl(req))
@@ -201,7 +305,15 @@ export async function POST(req: Request) {
     await upsertStore({ email, fonnte_token: created.token, fonnte_device_status: "DISCONNECTED" });
   }
 
-  return NextResponse.json({ success: true, device: toPublicDevice(device) });
+  return NextResponse.json({
+    success: true,
+    device: toPublicDevice(device),
+    // Nomor tetap dibuat: kegagalan sinkronisasi bisa diperbaiki dari tombol
+    // "Perbaiki otomatis" tanpa menambah nomor lagi.
+    warning: synced.ok
+      ? undefined
+      : `Nomor tersimpan, tapi jalur pesan masuk belum siap: ${synced.error || "penyebab tidak diketahui"}`
+  });
 }
 
 export async function DELETE(req: Request) {

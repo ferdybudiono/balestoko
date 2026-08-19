@@ -3,6 +3,7 @@
 import { useState } from "react";
 import {
   CheckCircle,
+  Inbox,
   Info,
   Plus,
   QrCode,
@@ -13,10 +14,11 @@ import {
   Star,
   Trash2,
   TriangleAlert,
+  Wrench,
   Lock
 } from "lucide-react";
 import type { StoreDevice } from "./types";
-import { formatPhoneDisplay, isDeviceConnected } from "./types";
+import { formatPhoneDisplay, isDeviceConnected, isInboundReady, relativeTime } from "./types";
 
 interface WhatsappTabProps {
   devices: StoreDevice[];
@@ -27,6 +29,14 @@ interface WhatsappTabProps {
   devicesNeedMigration: boolean;
   refreshingDevices: boolean;
   onRefreshDevices: () => void;
+
+  /** URL webhook yang berlaku (secret sudah disamarkan server). */
+  expectedWebhookUrl?: string | null;
+  /** Terisi bila NEXT_PUBLIC_BASE_URL tidak bisa dijangkau Fonnte. */
+  baseUrlWarning?: string | null;
+  /** Nomor yang setelan penerimaannya sedang diperbaiki. */
+  repairingDeviceId: string | null;
+  onRepairDevice: (device: StoreDevice) => void;
 
   newPhone: string;
   setNewPhone: (v: string) => void;
@@ -62,6 +72,10 @@ export default function WhatsappTab({
   devicesNeedMigration,
   refreshingDevices,
   onRefreshDevices,
+  expectedWebhookUrl,
+  baseUrlWarning,
+  repairingDeviceId,
+  onRepairDevice,
   newPhone,
   setNewPhone,
   newLabel,
@@ -122,7 +136,7 @@ export default function WhatsappTab({
             type="button"
             onClick={onRefreshDevices}
             disabled={refreshingDevices}
-            title="Segarkan status koneksi tiap nomor"
+            title="Segarkan status koneksi & periksa jalur pesan masuk tiap nomor"
             className="shrink-0 p-2 rounded-xl border border-slate-200 text-slate-500 hover:text-brand-700 hover:border-brand-200 disabled:opacity-60 transition-colors"
           >
             <RefreshCw
@@ -146,6 +160,20 @@ export default function WhatsappTab({
               )}
             </span>
           </div>
+
+          {/* Jalur terima mati total: URL webhook tidak bisa dijangkau Fonnte.
+              Ini kegagalan tingkat aplikasi (salah ENV saat deploy), bukan per
+              nomor — dan gejalanya menipu: uji coba di bawah tetap berhasil
+              karena hanya memakai jalur KIRIM. */}
+          {baseUrlWarning && (
+            <div className="flex items-start gap-2.5 p-3.5 bg-rose-50 border border-rose-200 rounded-xl">
+              <TriangleAlert className="w-4 h-4 text-rose-600 mt-0.5 shrink-0" aria-hidden="true" />
+              <div className="text-xs text-rose-900 leading-relaxed space-y-1">
+                <p className="font-semibold">Bot tidak bisa menerima chat pembeli</p>
+                <p>{baseUrlWarning}</p>
+              </div>
+            </div>
+          )}
 
           {devicesNeedMigration && (
             <div className="flex items-start gap-2.5 p-3.5 bg-amber-50 border border-amber-200 rounded-xl">
@@ -294,6 +322,16 @@ export default function WhatsappTab({
                         )}
                       </div>
                     </div>
+
+                    {/* Diagnosa jalur TERIMA (Fonnte → aplikasi) */}
+                    {connected && !overLimit && (
+                      <InboundPanel
+                        device={device}
+                        expectedWebhookUrl={expectedWebhookUrl}
+                        repairing={!!device.id && repairingDeviceId === device.id}
+                        onRepair={() => onRepairDevice(device)}
+                      />
+                    )}
 
                     {/* Konfirmasi hapus */}
                     {confirmRemoveId === device.id && (
@@ -510,7 +548,14 @@ export default function WhatsappTab({
 
       {/* ── Uji coba ─────────────────────────────────────────────────────
           PENTING: ini bukan simulasi lokal. Pesan balasan benar-benar
-          DIKIRIM lewat WhatsApp ke nomor penguji dan memakai kuota. */}
+          DIKIRIM lewat WhatsApp ke nomor penguji dan memakai kuota.
+
+          Perlu diketahui juga apa yang TIDAK diuji di sini: jalur pesan
+          masuk. Uji coba ini memanggil AI dari server lalu mengirim lewat
+          Fonnte, tanpa pernah melewati webhook — jadi ia bisa sukses
+          sementara chat pembeli sungguhan tidak pernah sampai. Itu sebabnya
+          panel "Jalur terima chat pembeli" di atas ada, dan itu yang
+          disebutkan di catatan bawah. */}
       <section className="bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6 space-y-4">
         <div>
           <h3 className="text-sm font-bold text-ink flex items-center gap-2">
@@ -604,7 +649,150 @@ export default function WhatsappTab({
             Hubungkan minimal satu nomor WhatsApp agar pesan uji coba bisa diproses.
           </p>
         )}
+        <p className="text-[11px] text-slate-400 leading-relaxed">
+          Uji coba ini menguji <strong>jalur kirim</strong> (AI &rarr; WhatsApp). Untuk memastikan chat
+          pembeli sungguhan sampai ke bot, lihat <strong>Jalur terima chat pembeli</strong> pada tiap
+          nomor di atas.
+        </p>
       </section>
     </div>
+  );
+}
+
+/**
+ * Kondisi jalur TERIMA satu nomor: apakah Fonnte akan meneruskan chat pembeli ke
+ * aplikasi ini.
+ *
+ * Kenapa panel ini ada: "Uji coba balasan AI" hanya membuktikan jalur KIRIM
+ * (server → Fonnte → pembeli). Kalau URL webhook belum terdaftar atau `auto read`
+ * di Fonnte mati, uji coba itu tetap sukses sementara chat pembeli sungguhan tidak
+ * pernah tiba — bot tampak sehat tapi bisu, dan satu-satunya gejala yang terlihat
+ * pemilik toko adalah kesunyian. Panel ini yang membedakan "belum ada yang chat"
+ * dari "chat tidak pernah sampai".
+ */
+function InboundPanel({
+  device,
+  expectedWebhookUrl,
+  repairing,
+  onRepair
+}: {
+  device: StoreDevice;
+  expectedWebhookUrl?: string | null;
+  repairing: boolean;
+  onRepair: () => void;
+}) {
+  const ready = isInboundReady(device);
+  const tone =
+    ready === true
+      ? { box: "bg-brand-50/50 border-brand-100", text: "text-brand-800" }
+      : ready === false
+      ? { box: "bg-rose-50 border-rose-200", text: "text-rose-900" }
+      : { box: "bg-slate-50 border-slate-200", text: "text-slate-600" };
+
+  const webhookOk = device.webhook_synced === true;
+  const autoreadOk = device.autoread === true;
+
+  return (
+    <div className="px-4 pb-4 -mt-1">
+      <div className={`p-3.5 border rounded-xl space-y-2.5 ${tone.box}`}>
+        <div className="flex items-start justify-between gap-3">
+          <p className={`text-xs font-semibold flex items-center gap-1.5 ${tone.text}`}>
+            <Inbox className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            Jalur terima chat pembeli
+            {ready === true ? " · siap" : ready === false ? " · belum siap" : " · belum diperiksa"}
+          </p>
+          {ready !== true && !!device.id && (
+            <button
+              type="button"
+              onClick={onRepair}
+              disabled={repairing}
+              className="shrink-0 px-2.5 py-1 rounded-lg border border-slate-300 bg-white text-[11px] font-semibold text-slate-700 hover:border-brand-300 hover:text-brand-700 disabled:opacity-60 transition-colors flex items-center gap-1.5"
+            >
+              {repairing ? (
+                <RefreshCw className="w-3 h-3 animate-spin" aria-hidden="true" />
+              ) : (
+                <Wrench className="w-3 h-3" aria-hidden="true" />
+              )}
+              <span>{repairing ? "Memperbaiki…" : "Perbaiki otomatis"}</span>
+            </button>
+          )}
+        </div>
+
+        <dl className="space-y-1.5 text-[11px]">
+          <div className="flex items-start gap-1.5">
+            <StatusDot ok={device.inbound_checked ? webhookOk : null} />
+            <dt className="text-slate-500 shrink-0">URL webhook:</dt>
+            <dd className={webhookOk ? "text-slate-600" : "font-medium text-rose-800"}>
+              {!device.inbound_checked
+                ? "belum dibaca dari Fonnte"
+                : webhookOk
+                ? "terdaftar di Fonnte"
+                : "belum terdaftar / tidak cocok"}
+            </dd>
+          </div>
+          <div className="flex items-start gap-1.5">
+            <StatusDot ok={autoreadOk ? true : device.autoread === false ? false : null} />
+            <dt className="text-slate-500 shrink-0">Auto read Fonnte:</dt>
+            <dd
+              className={
+                device.autoread === false ? "font-medium text-rose-800" : "text-slate-600"
+              }
+            >
+              {device.autoread === true
+                ? "menyala"
+                : device.autoread === false
+                ? "mati — wajib menyala, tanpa ini Fonnte tidak meneruskan pesan"
+                : "belum diketahui"}
+            </dd>
+          </div>
+          <div className="flex items-start gap-1.5">
+            <StatusDot ok={device.last_inbound_at ? true : null} />
+            <dt className="text-slate-500 shrink-0">Pesan masuk terakhir:</dt>
+            <dd className="text-slate-600">
+              {device.last_inbound_at ? (
+                <>
+                  {relativeTime(device.last_inbound_at)}
+                  {device.last_inbound_note ? ` · ${device.last_inbound_note}` : ""}
+                </>
+              ) : (
+                "belum pernah ada chat pembeli yang sampai ke aplikasi"
+              )}
+            </dd>
+          </div>
+        </dl>
+
+        {device.inbound_repaired && (
+          <p className="text-[11px] text-brand-800">
+            Setelan baru saja diperbaiki otomatis. Coba kirim chat dari nomor lain ke nomor ini untuk
+            memastikan bot menjawab.
+          </p>
+        )}
+
+        {device.inbound_error && (
+          <p className="text-[11px] font-medium text-rose-800">{device.inbound_error}</p>
+        )}
+
+        {expectedWebhookUrl && (
+          <p
+            className="text-[10px] text-slate-400 font-mono truncate"
+            title={expectedWebhookUrl}
+          >
+            {expectedWebhookUrl}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Titik status kecil: hijau = beres, merah = bermasalah, abu = belum diketahui. */
+function StatusDot({ ok }: { ok: boolean | null }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${
+        ok === true ? "bg-brand-500" : ok === false ? "bg-rose-500" : "bg-slate-300"
+      }`}
+    />
   );
 }

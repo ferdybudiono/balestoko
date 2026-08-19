@@ -64,12 +64,27 @@ create table if not exists public.stores (
   origin_subdistrict_id text default '3171010',      -- Contoh default: Jakarta Pusat / Gambir
   origin_city_name      text default 'Jakarta Pusat',
   default_weight        integer default 1000,          -- Gram (1 kg)
-  active_couriers       text[] default array['jne', 'jnt', 'sicepat', 'pos'],
-  
+  -- Ekspedisi yang dilayani toko (kode grup dari lib/couriers.ts).
+  -- NULL / array kosong = SEMUA ekspedisi ditawarkan. Sengaja tanpa default:
+  -- default yang restriktif akan membatasi toko ke ekspedisi yang tidak pernah
+  -- dipilih pemiliknya (lihat blok migrasi di akhir file).
+  active_couriers       text[],
+
+  -- Ongkir kurir toko sendiri: {enabled, label, cost, etd}. cost 0 = "tanya dulu".
+  local_courier         jsonb,
+
+  -- Pembayaran
+  payment_accounts      jsonb   not null default '[]'::jsonb,  -- maks 3: {type,name,number,holder}
+  cod_enabled           boolean not null default false,
+  payment_note          text,
+
   -- AI CS Agent Configuration
   ai_prompt_system      text default 'Kamu adalah Customer Service AI yang ramah dan profesional. Tugasmu adalah menyapa pembeli dengan hangat, menjawab pertanyaan produk, dan membantu mengecek tarif ongkos kirim (ongkir) menggunakan kurir ekspedisi.',
   greeting_message      text default 'Halo! Selamat datang di toko kami 👋 Ada yang bisa kami bantu mengenai produk atau cek tarif ongkir ke kota Kakak?',
-  
+  ai_tone               text    not null default 'ramah',   -- ramah | santai | formal | singkat
+  ai_include_total      boolean not null default true,      -- jumlahkan produk + ongkir di balasan
+  ai_include_payment    boolean not null default true,      -- sertakan instruksi pembayaran
+
   created_at            timestamptz not null default now(),
   updated_at            timestamptz not null default now()
 );
@@ -115,6 +130,15 @@ create table if not exists public.store_devices (
   fonnte_token          text,                            -- DEVICE token hasil add-device
   device_status         text not null default 'DISCONNECTED',
   webhook_url           text,                            -- URL webhook yang sudah tersinkron ke device ini
+  -- Fonnte TIDAK memanggil webhook pesan masuk bila `auto read` device mati,
+  -- dan device hasil add-device tidak menyalakannya sendiri. Kolom ini memisahkan
+  -- "URL webhook sudah terpasang" dari "webhook benar-benar akan dipanggil".
+  -- NULL = belum pernah diurus (baris pra-perbaikan) → akan disinkronkan sekali.
+  autoread              boolean,
+  -- Jejak jalur TERIMA. Tanpa ini "belum ada pembeli yang chat" dan "chat pembeli
+  -- tidak pernah sampai ke aplikasi" terlihat sama persis dari dashboard.
+  last_inbound_at       timestamptz,                     -- pesan masuk terakhir TIBA dari Fonnte
+  last_inbound_note     text,                            -- hasilnya: 'Dibalas AI' / alasan diabaikan
   is_primary            boolean not null default false,  -- device untuk pesan non-percakapan (OTP reset)
   created_at            timestamptz not null default now(),
   updated_at            timestamptz not null default now()
@@ -357,4 +381,46 @@ where s.customer_phone is not null
   and s.fonnte_token <> ''
   and not exists (select 1 from public.store_devices d where d.store_id = s.id)
 on conflict (phone) do nothing;
+
+-- Ekspedisi yang dilayani, kurir toko, pembayaran, & gaya jawaban AI.
+alter table public.stores add column if not exists active_couriers text[];
+alter table public.stores add column if not exists local_courier jsonb;
+alter table public.stores add column if not exists payment_accounts jsonb not null default '[]'::jsonb;
+alter table public.stores add column if not exists cod_enabled boolean not null default false;
+alter table public.stores add column if not exists payment_note text;
+alter table public.stores add column if not exists ai_tone text not null default 'ramah';
+alter table public.stores add column if not exists ai_include_total boolean not null default true;
+alter table public.stores add column if not exists ai_include_payment boolean not null default true;
+
+-- PENTING. `active_couriers` sudah ada sejak lama dengan default
+-- array['jne','jnt','sicepat','pos'], tapi belum pernah DIBACA maupun DITULIS
+-- oleh aplikasi. Begitu penyaringan ekspedisi dinyalakan, default itu berubah
+-- menjadi regresi di setiap toko yang sudah jalan:
+--   1. toko dibatasi ke 4 ekspedisi yang tidak pernah dipilih pemiliknya, dan
+--   2. `jnt` bukan kode yang dikembalikan API (kodenya `jt`), jadi J&T justru
+--      HILANG TOTAL dari kutipan — persis kurir terpopuler di Indonesia.
+-- Karena itu default dilepas dan semantiknya menjadi: NULL/kosong = semua
+-- ekspedisi. Baris yang isinya PERSIS sama dengan default lama pasti belum
+-- pernah disentuh pemiliknya, jadi aman dikosongkan.
+alter table public.stores alter column active_couriers drop default;
+update public.stores set active_couriers = null
+ where active_couriers is not null
+   and active_couriers @> array['jne', 'jnt', 'sicepat', 'pos']
+   and active_couriers <@ array['jne', 'jnt', 'sicepat', 'pos'];
+
+-- Nilai `ai_tone` di luar daftar yang dikenal dikembalikan ke default supaya
+-- prompt AI tidak pernah menerima nada yang tidak punya instruksi.
+update public.stores set ai_tone = 'ramah'
+ where ai_tone is null or ai_tone not in ('ramah', 'santai', 'formal', 'singkat');
+
+-- Diagnosa jalur TERIMA per nomor (webhook pesan masuk Fonnte).
+--
+-- `autoread` SENGAJA dibiarkan NULL untuk baris yang sudah ada: itulah penanda
+-- "belum pernah dinyalakan". Semua device yang tersambung sebelum ini punya URL
+-- webhook yang benar tapi auto read mati, sehingga Fonnte tidak pernah memanggil
+-- webhook-nya — bot tampak sehat di dashboard namun bisu saat pembeli chat.
+-- NULL membuat sinkronisasi berikutnya (buka tab WhatsApp) memperbaikinya sekali.
+alter table public.store_devices add column if not exists autoread boolean;
+alter table public.store_devices add column if not exists last_inbound_at timestamptz;
+alter table public.store_devices add column if not exists last_inbound_note text;
 

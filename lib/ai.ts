@@ -5,6 +5,20 @@
  */
 
 import { calculateMengantarOngkir, searchMengantarLocation, RateSource, ShippingOption } from "./mengantar";
+import { LocalCourierConfig, courierLabel, normalizeActiveCouriers } from "./couriers";
+import {
+  AI_TONE_INSTRUCTIONS,
+  AiTone,
+  OrderDraft,
+  OrderDraftLine,
+  PaymentAccount,
+  PaymentSettings,
+  buildOngkirReply,
+  normalizeAiTone,
+  normalizePaymentAccounts
+} from "./reply-format";
+
+export type { OrderDraft, OrderDraftLine } from "./reply-format";
 
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
@@ -33,6 +47,22 @@ export interface AIProcessParams {
    * sapaan pertama — yang dibatasi hanya apa yang dilihat model.
    */
   aiContextMessages?: number;
+  /** Ekspedisi yang dilayani toko. Kosong/undefined = semua ekspedisi. */
+  activeCouriers?: string[] | null;
+  /** Opsi kurir toko sendiri (bukan dari Mengantar). */
+  localCourier?: LocalCourierConfig | null;
+  /** Rekening/e-wallet tujuan transfer (maks 3). */
+  paymentAccounts?: PaymentAccount[] | null;
+  /** COD tersedia atau tidak. */
+  codEnabled?: boolean;
+  /** Catatan pembayaran bebas dari pemilik toko. */
+  paymentNote?: string | null;
+  /** Nada bicara balasan AI. */
+  aiTone?: string | null;
+  /** Sertakan penjumlahan produk + ongkir pada balasan ongkir. */
+  includeTotal?: boolean;
+  /** Sertakan blok instruksi pembayaran pada balasan ongkir. */
+  includePayment?: boolean;
 }
 
 export interface AIProcessResult {
@@ -82,133 +112,160 @@ function unitsMentioned(haystack: string, needle: string): number {
   return Math.min(n, MAX_UNITS_PER_PRODUCT);
 }
 
-export interface ShippingWeightBasis {
-  weightGram: number;
-  matched: Array<{ name: string; units: number; weight: number }>;
-  /** `matched` = berat produk yang disebut pembeli; `default` = asumsi toko. */
-  source: "matched" | "default";
+/**
+ * Kata yang terlalu umum untuk dipakai sebagai penanda produk. Tanpa daftar ini,
+ * produk bernama "Paket Hemat" akan ikut terpesan setiap kali pembeli menulis
+ * "paket saya kapan sampai".
+ */
+const MATCH_STOPWORDS = new Set([
+  "ongkir", "kirim", "kirimkan", "harga", "berapa", "total", "bayar", "cod",
+  "transfer", "pesan", "order", "beli", "mau", "dong", "kak", "min", "tolong",
+  "gram", "kilo", "kota", "kecamatan", "alamat", "stok", "ready", "warna",
+  "ukuran", "size", "buah", "pcs", "unit", "biji", "dan", "plus", "paket"
+]);
+
+/** Token nama produk yang cukup berarti untuk dicocokkan. */
+function productTokens(name: string): string[] {
+  return normalizeForMatch(name)
+    .split(" ")
+    .filter((t) => t.length >= 3 && !MATCH_STOPWORDS.has(t));
 }
 
 /**
- * Tentukan berat paket untuk kutipan ongkir.
+ * Baca pesan pembeli menjadi draf pesanan: produk apa, berapa unit, berapa
+ * subtotalnya, dan berapa berat paketnya.
  *
- * Dulu fungsi ini efektif `products[0].weight` — berat produk PERTAMA di katalog,
- * siapa pun yang bertanya dan apa pun yang ditanyakan. Untuk toko dengan produk
- * campur (misal gantungan kunci 50 g dan karpet 8 kg) itu salah kutip di setiap
- * percakapan: terlalu murah = toko nombok, terlalu mahal = pembeli kabur.
+ * Dulu fungsi ini (`resolveShippingWeight`) hanya menghitung berat, dan hanya
+ * cocok bila nama produk muncul UTUH di pesan. Pembeli sungguhan menulis
+ * "2 polos lengan panjang" untuk "Kaos Polos Lengan Panjang", jadi pencocokannya
+ * dibuat berlapis — tapi setiap lapis hanya diterima kalau hasilnya TIDAK
+ * ambigu:
  *
- * Sekarang: cocokkan nama produk terhadap pesan pembeli, jumlahkan berat yang
- * cocok (kali jumlah unit bila disebut), dan bila TIDAK ADA yang cocok pakai
- * `default_weight` yang diatur pemilik toko di dashboard — bukan produk acak.
+ * 1. Nama lengkap muncul sebagai substring.
+ * 2. SEMUA token nama produk muncul di pesan, urutan bebas.
+ * 3. Satu token ≥4 karakter yang dimiliki TEPAT SATU produk.
+ * 4. Token yang dimiliki lebih dari satu produk → masuk `ambiguous`, tidak
+ *    dipilih. Toko dengan "Kaos Polos" dan "Kaos Raglan" tidak boleh ditebak
+ *    dari kata "kaos"; salah tebak berarti mengutip harga dan berat produk yang
+ *    bukan dimaksud pembeli.
  */
-export function resolveShippingWeight(
+export function resolveOrderDraft(
   message: string,
   products: ProductLike[] = [],
   defaultWeight?: number
-): ShippingWeightBasis {
+): OrderDraft {
   const fallback = defaultWeight && defaultWeight > 0 ? defaultWeight : 1000;
   const haystack = normalizeForMatch(message);
-  const matched: ShippingWeightBasis["matched"] = [];
-  let total = 0;
-
-  for (const p of products) {
-    const needle = normalizeForMatch(p?.name || "");
-    // Nama sangat pendek ("XL", "A") terlalu mudah cocok dengan kata biasa.
-    if (needle.length < 3 || !haystack.includes(needle)) continue;
-    const weight = Number(p?.weight);
-    if (!Number.isFinite(weight) || weight <= 0) continue;
-
-    const units = unitsMentioned(haystack, needle);
-    matched.push({ name: p.name, units, weight });
-    total += weight * units;
-  }
-
-  if (matched.length === 0 || total <= 0) {
-    return { weightGram: fallback, matched: [], source: "default" };
-  }
-  return {
-    weightGram: Math.min(total, MAX_SHIPPING_WEIGHT_GRAM),
-    matched,
-    source: "matched"
+  const blank: OrderDraft = {
+    lines: [],
+    subtotal: 0,
+    weightGram: fallback,
+    weightSource: "default",
+    ambiguous: []
   };
-}
+  if (!haystack || products.length === 0) return blank;
 
-/** "1.200 gram" → "1,2 kg"; di bawah 1 kg tetap dalam gram. */
-function formatWeight(gram: number): string {
-  if (gram < 1000) return `${gram} gram`;
-  const kg = gram / 1000;
-  return `${kg.toLocaleString("id-ID", { maximumFractionDigits: 2 })} kg`;
-}
+  // index produk → kata di pesan yang dipakai menghitung jumlah unit.
+  const hits = new Map<number, string>();
+  const ambiguous = new Set<string>();
 
-/**
- * Format pilihan ongkir Mengantar menjadi teks WhatsApp yang rapi.
- *
- * Bila `source === "mock"` tarif BUKAN dari kurir sungguhan (lokasi asal toko
- * belum di-set ke `_id` Mengantar). Jangan menyajikannya sebagai harga pasti —
- * beri label "perkiraan" supaya pembeli tidak salah paham & toko tidak rugi.
- */
-/** allEstimatePublic mengembalikan ~16 kurir; menampilkan semuanya = dinding teks. */
-const MAX_WHATSAPP_OPTIONS = 5;
+  // Lapis 1 & 2.
+  products.forEach((p, idx) => {
+    const full = normalizeForMatch(p?.name || "");
+    // Nama sangat pendek ("XL", "A") terlalu mudah cocok dengan kata biasa.
+    if (full.length < 3) return;
 
-function formatOngkirWhatsApp(
-  options: ShippingOption[],
-  destinationCity: string,
-  originCity: string,
-  source: RateSource,
-  weight: ShippingWeightBasis
-): string {
-  const isEstimate = source === "mock";
-
-  let text = isEstimate
-    ? `📦 *Perkiraan Ongkir ke ${destinationCity}*\n`
-    : `📦 *Informasi Tarif Ongkir ke ${destinationCity}*\n`;
-  text += `📍 *Pengiriman dari:* ${originCity}\n`;
-
-  // Selalu sebutkan berat yang dipakai. Ongkir tanpa dasar berat mudah jadi
-  // sengketa: pembeli merasa dikutip mahal, toko merasa sudah benar.
-  if (weight.source === "matched") {
-    const detail = weight.matched
-      .map((m) => (m.units > 1 ? `${m.units}× ${m.name}` : m.name))
-      .join(" + ");
-    text += `⚖️ *Berat paket:* ${formatWeight(weight.weightGram)} (${detail})\n\n`;
-  } else {
-    text += `⚖️ *Berat paket:* ${formatWeight(weight.weightGram)} (perkiraan)\n\n`;
-  }
-
-  text += isEstimate
-    ? `Berikut *perkiraan* ongkos kirim ya Kak:\n\n`
-    : `Berikut adalah daftar pilihan ekspedisi & ongkos kirim:\n\n`;
-
-  // `options` sudah terurut dari termurah, jadi potongannya = pilihan terbaik.
-  const shown = options.slice(0, MAX_WHATSAPP_OPTIONS);
-  const hidden = options.length - shown.length;
-
-  shown.forEach((opt, idx) => {
-    text += `${idx + 1}. *${opt.courier_name}* (${opt.service_name})\n`;
-    text += `   💰 Rp ${opt.cost.toLocaleString("id-ID")}\n`;
-    text += `   ⏱️ Estimasi: ${opt.etd}\n`;
-    if (opt.belowMinimumWeight) {
-      text += `   ℹ️ Kena tarif minimum karena berat paket di bawah batas layanan ini\n`;
+    if (haystack.includes(full)) {
+      hits.set(idx, full);
+      return;
     }
-    text += `\n`;
+
+    const tokens = productTokens(p?.name || "");
+    if (tokens.length === 0) return;
+    if (tokens.every((t) => haystack.includes(t))) {
+      // Jangkar unit = token yang muncul paling awal di pesan, supaya
+      // "2 polos lengan panjang" terbaca 2 unit, bukan 1.
+      const anchor = tokens.reduce(
+        (best, t) => (haystack.indexOf(t) < haystack.indexOf(best) ? t : best),
+        tokens[0]
+      );
+      hits.set(idx, anchor);
+    }
   });
 
-  if (hidden > 0) {
-    text += `_Masih ada ${hidden} pilihan ekspedisi lain. Beri tahu kami kalau Kakak ingin lihat opsi lainnya ya._\n\n`;
+  // Token yang sudah "terpakai" oleh produk yang cocok di lapis 1/2. Tanpa ini,
+  // "2 kaos polos" di toko dengan "Kaos Polos" + "Kaos Raglan" akan ikut
+  // memesan Kaos Raglan lewat token "kaos" yang tersisa.
+  const consumed = new Set<string>();
+  for (const idx of hits.keys()) {
+    for (const t of productTokens(products[idx]?.name || "")) consumed.add(t);
   }
 
-  if (isEstimate) {
-    text += `_Catatan: angka di atas masih perkiraan. Tarif pastinya kami konfirmasi ulang sebelum pesanan diproses ya Kak._\n\n`;
+  // Siapa saja pemilik tiap token — dasar lapis 3 & 4.
+  const owners = new Map<string, number[]>();
+  products.forEach((p, idx) => {
+    for (const t of productTokens(p?.name || "")) {
+      if (t.length < 4) continue;
+      const list = owners.get(t);
+      if (list) {
+        if (!list.includes(idx)) list.push(idx);
+      } else {
+        owners.set(t, [idx]);
+      }
+    }
+  });
+
+  // Lapis 3 & 4 SENGAJA tidak digerbangi "belum ada yang cocok": pembeli bisa
+  // menyebut dua produk sekaligus — satu dengan nama lengkap, satu dengan
+  // sepotong nama saja ("2 kaos polos + 1 topi").
+  for (const [token, idxs] of owners) {
+    if (consumed.has(token) || !haystack.includes(token)) continue;
+    if (idxs.length === 1) {
+      if (!hits.has(idxs[0])) hits.set(idxs[0], token);
+    } else {
+      for (const i of idxs) {
+        if (!hits.has(i)) ambiguous.add(products[i]?.name || "");
+      }
+    }
   }
 
-  if (weight.source === "default") {
-    // Pembeli belum menyebut produknya, jadi beratnya masih asumsi toko. Katakan
-    // terus terang — lebih murah daripada revisi ongkir setelah pembeli setuju.
-    text += `_Ongkir di atas dihitung untuk berat ${formatWeight(weight.weightGram)}. Sebutkan produk & jumlahnya supaya kami hitung ulang lebih tepat ya Kak._\n\n`;
+  const ambiguousList = [...ambiguous].filter(Boolean);
+  if (hits.size === 0) return { ...blank, ambiguous: ambiguousList };
+
+  const lines: OrderDraftLine[] = [];
+  let subtotal = 0;
+  let totalWeight = 0;
+  let weightValid = true;
+
+  // Urut menurut katalog supaya balasan ke pembeli selalu berurutan sama.
+  for (const [idx, anchor] of [...hits.entries()].sort((a, b) => a[0] - b[0])) {
+    const p = products[idx];
+    const units = unitsMentioned(haystack, anchor);
+    const rawWeight = Number(p?.weight);
+    const rawPrice = Number(p?.price);
+    const weight = Number.isFinite(rawWeight) && rawWeight > 0 ? rawWeight : 0;
+    const price = Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice : 0;
+
+    // Berat yang tidak valid TIDAK lagi membuang produknya. Sebelumnya satu data
+    // berat kosong menghapus harga produk itu dari total juga — pembeli dikutip
+    // lebih murah dari yang seharusnya. Sekarang harganya tetap dihitung dan
+    // hanya berat paket yang jatuh ke asumsi toko.
+    if (weight <= 0) weightValid = false;
+
+    const lineTotal = price * units;
+    lines.push({ name: p.name, units, weight, price, lineTotal });
+    subtotal += lineTotal;
+    totalWeight += weight * units;
   }
 
-  text += `Silakan beri tahu kami ekspedisi pilihan Kakak atau jika ingin langsung lanjut ke pemesanan ya! 😊`;
-  return text;
+  const weightOk = weightValid && totalWeight > 0;
+  return {
+    lines,
+    subtotal,
+    weightGram: weightOk ? Math.min(totalWeight, MAX_SHIPPING_WEIGHT_GRAM) : fallback,
+    weightSource: weightOk ? "matched" : "default",
+    ambiguous: ambiguousList
+  };
 }
 
 /**
@@ -264,8 +321,26 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     defaultWeight = 1000,
     products = [],
     chatHistory = [],
-    aiContextMessages = 0
+    aiContextMessages = 0,
+    activeCouriers,
+    localCourier,
+    paymentAccounts,
+    codEnabled = false,
+    paymentNote,
+    aiTone,
+    includeTotal = true,
+    includePayment = true
   } = params;
+
+  const tone: AiTone = normalizeAiTone(aiTone);
+  const payment: PaymentSettings = {
+    accounts: normalizePaymentAccounts(paymentAccounts),
+    codEnabled: codEnabled === true,
+    note: paymentNote || ""
+  };
+  // Kosong = semua ekspedisi. Dinormalkan di sini supaya nilai lama seperti
+  // `jnt` tetap dikenali dan penyaringannya konsisten dengan dashboard.
+  const activeGroups = normalizeActiveCouriers(activeCouriers);
 
   const rawMessage = messageText.trim();
   const lowerMsg = rawMessage.toLowerCase();
@@ -336,34 +411,41 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     const destName = destLoc ? `${destLoc.subdistrict_name}, ${destLoc.city_name}` : targetLocationQuery;
     const destId = destLoc ? destLoc.id : "3273010";
 
-    // Berat paket: dari produk yang DISEBUT pembeli, bukan produk pertama di
-    // katalog. Tidak ada yang cocok → berat default toko dari dashboard.
-    const weightBasis = resolveShippingWeight(rawMessage, products, defaultWeight);
+    // Draf pesanan: produk yang DISEBUT pembeli beserta jumlah & harganya, bukan
+    // produk pertama di katalog. Tidak ada yang cocok → berat default toko.
+    const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
 
     const { rates, source: rateSource } = await calculateMengantarOngkir({
       originSubdistrictId,
       destinationSubdistrictId: destId,
-      weightGram: weightBasis.weightGram,
+      weightGram: draft.weightGram,
+      couriers: activeGroups,
       apiKey: mengantarApiKey
     });
 
     // Kalau pencarian lokasi saja sudah jatuh ke mock, tarifnya pasti bukan live.
     const effectiveSource: RateSource = locSource === "mock" ? "mock" : rateSource;
-    const formattedOngkir = formatOngkirWhatsApp(
+
+    const replyText = buildOngkirReply({
+      draft,
       rates,
-      destName,
+      localCourier,
+      destinationName: destName,
       originCityName,
-      effectiveSource,
-      weightBasis
-    );
+      source: effectiveSource,
+      payment,
+      includeTotal,
+      includePayment,
+      courierFilterActive: activeGroups.length > 0
+    });
 
     return {
-      replyText: formattedOngkir,
+      replyText,
       intent: "ONGKIR_CHECK",
       shippingDetails: rates,
       detectedCity: destName,
       rateSource: effectiveSource,
-      shippingWeightGram: weightBasis.weightGram
+      shippingWeightGram: draft.weightGram
     };
   }
 
@@ -412,13 +494,39 @@ export async function processAICustomerService(params: AIProcessParams): Promise
       .map((m) => `${m.role === "user" ? "Pembeli" : "CS"}: ${m.content.slice(0, 400)}`)
       .join("\n");
 
+    // Rekening disebut LENGKAP ke model supaya ia tidak perlu (dan tidak boleh)
+    // mengarang nomor. Aturan "jangan mengarang" di bawah baru berarti kalau
+    // data yang benar memang tersedia untuk dikutip.
+    const paymentSummary = [
+      ...payment.accounts.map(
+        (a) => `${a.name} ${a.number}${a.holder ? ` (a.n. ${a.holder})` : ""}`
+      ),
+      payment.codEnabled ? "COD (bayar di tempat)" : ""
+    ]
+      .filter(Boolean)
+      .join("; ");
+
     const aiPrompt = `
 System Prompt: ${aiPromptSystem || "Kamu adalah CS AI yang ramah."}
 Toko: ${storeName}
 Pengiriman dari: ${originCityName}
+Nada bicara: ${AI_TONE_INSTRUCTIONS[tone]}
 Katalog Produk:
 ${productCatalogStr || "Belum ada katalog"}
 ${
+  activeGroups.length > 0
+    ? `Ekspedisi yang dilayani toko: ${activeGroups.map((c) => courierLabel(c)).join(", ")}.
+Jangan menawarkan ekspedisi di luar daftar itu.
+`
+    : ""
+}${
+  paymentSummary
+    ? `Metode pembayaran yang tersedia: ${paymentSummary}.
+`
+    : ""
+}${
+  payment.note ? `Catatan pembayaran dari toko: ${payment.note}\n` : ""
+}${
   historyStr
     ? `
 Riwayat percakapan sebelumnya dengan pembeli ini (terlama ke terbaru):
@@ -432,7 +540,21 @@ atau kota yang sudah disebut bila pembeli memakai kata seperti "itu"/"tadi".
 }
 Pesan Pembeli: "${rawMessage}"
 
-Balaslah sebagai Customer Service WhatsApp yang sopan, ramah, dan solutif. Sertakan ajakan untuk mengecek ongkir atau pemesanan produk jika relevan.
+ATURAN ANGKA — WAJIB DIPATUHI:
+- JANGAN mengarang harga produk, ongkir, total, nomor rekening, atau nama bank.
+  Pakai HANYA angka dan data yang tertulis di atas.
+- Ongkir tidak boleh ditebak. Kalau pembeli menanyakan ongkir atau total,
+  mintalah nama kecamatan/kota tujuannya supaya sistem yang menghitung.
+- Kalau harga suatu produk tidak ada di katalog di atas, katakan akan dicek
+  dahulu — jangan menyebut angka apa pun.
+${
+  payment.accounts.length > 0 || payment.codEnabled
+    ? `- Nomor rekening hanya boleh disebut persis seperti yang tertulis di atas.
+`
+    : `- Toko belum mencantumkan rekening. Jangan memberi nomor rekening apa pun.
+`
+}
+Balaslah sebagai Customer Service WhatsApp yang sopan dan solutif. Sertakan ajakan untuk mengecek ongkir atau pemesanan produk jika relevan.
 `;
 
     const geminiReply = await generateGeminiReply(aiPrompt, geminiApiKey);

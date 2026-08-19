@@ -36,6 +36,11 @@ export interface FonnteStatus {
 /**
  * Satu nomor WhatsApp milik toko. Bentuk ini sengaja TANPA token device —
  * server tidak pernah mengirimkannya ke browser.
+ *
+ * Kelompok field kedua adalah diagnosa JALUR TERIMA (Fonnte → aplikasi). Ini
+ * jalur yang tidak tersentuh oleh tombol uji coba balasan — uji coba hanya
+ * memakai jalur KIRIM — jadi tanpa panel ini "bot bisu" tidak bisa dibedakan
+ * dari "belum ada pembeli yang chat".
  */
 export interface StoreDevice {
   id?: string;
@@ -45,6 +50,32 @@ export interface StoreDevice {
   is_primary: boolean;
   has_token: boolean;
   created_at?: string;
+
+  /** `auto read` di Fonnte. WAJIB true, kalau tidak webhook tidak pernah jalan. */
+  autoread?: boolean | null;
+  /** URL webhook terdaftar, secret sudah disamarkan server. */
+  webhook_url?: string | null;
+  /** URL di Fonnte sama dengan URL yang berlaku sekarang. */
+  webhook_synced?: boolean;
+  /** Setelan di atas dibaca langsung dari Fonnte (bukan cuma catatan database). */
+  inbound_checked?: boolean;
+  /** Setelan baru saja diperbaiki otomatis pada pembacaan ini. */
+  inbound_repaired?: boolean;
+  /** Kendala jalur terima yang perlu dibaca pemilik toko. */
+  inbound_error?: string | null;
+  /** Kapan pesan masuk terakhir benar-benar sampai ke aplikasi. */
+  last_inbound_at?: string | null;
+  /** Apa yang terjadi pada pesan masuk terakhir (dibalas / diabaikan + alasan). */
+  last_inbound_note?: string | null;
+}
+
+/** Jalur terima nomor ini siap? `null` = belum bisa disimpulkan. */
+export function isInboundReady(device: StoreDevice): boolean | null {
+  if (!device.inbound_checked) return null;
+  if (!device.webhook_synced) return false;
+  if (device.autoread === false) return false;
+  if (device.autoread === null || device.autoread === undefined) return null;
+  return true;
 }
 
 export function isDeviceConnected(device: StoreDevice): boolean {

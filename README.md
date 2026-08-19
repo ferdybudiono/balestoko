@@ -42,7 +42,7 @@ cp .env.example .env.local
 | `MIDTRANS_IS_PRODUCTION` | `false` untuk sandbox, `true` untuk production. |
 | `NEXT_PUBLIC_SUPABASE_URL` | URL project Supabase. |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service Role key Supabase (**server-only**, jangan diekspos!). |
-| `NEXT_PUBLIC_BASE_URL` | Base URL publik aplikasi (untuk callback Snap). |
+| `NEXT_PUBLIC_BASE_URL` | Base URL publik aplikasi (callback Snap **dan** URL webhook yang didaftarkan ke Fonnte). **Wajib domain publik di produksi** — bila masih `localhost`, bot bisa mengirim tapi tidak akan pernah menerima chat pembeli. |
 | `AUTH_SECRET` | Kunci HMAC penandatangan session login. **Wajib di produksi.** |
 | `FONNTE_TOKEN` | Account Token Fonnte (untuk provisioning device per toko). |
 | `FONNTE_WEBHOOK_SECRET` | Shared secret pelindung `/api/fonnte/webhook`. **Sangat disarankan di produksi** — tanpa ini endpoint terbuka dan bisa dipakai sebagai relay spam. |
@@ -75,6 +75,23 @@ Buka **Supabase → SQL Editor**, tempel isi [`supabase/schema.sql`](./supabase/
 > - Fungsi **`append_conversation_message`** + **`trim_jsonb_tail`** — menyimpan
 >   pesan secara atomik, sehingga dua pesan yang datang bersamaan tidak saling
 >   menimpa.
+> - Kolom **`stores.payment_accounts`**, **`cod_enabled`**, **`payment_note`**,
+>   **`local_courier`**, **`ai_tone`**, **`ai_include_total`**,
+>   **`ai_include_payment`** — pengaturan ekspedisi, total, & instruksi bayar
+>   (lihat [Ekspedisi, Total & Pembayaran](#-ekspedisi-total--pembayaran)).
+>   Tanpa ini tab Pengaturan Toko gagal menyimpan.
+> - **`stores.active_couriers` kehilangan default lamanya**, dan baris yang masih
+>   memegang default itu apa adanya (`{jne,jnt,sicepat,pos}`) dikosongkan.
+>   Kolomnya belum pernah ditulis aplikasi, jadi isinya pasti bukan pilihan
+>   pemilik toko — dan `jnt` bukan kode yang dipakai API (`jt`), sehingga
+>   menyalakan penyaringan tanpa membersihkannya justru **menghapus J&T** dari
+>   semua kutipan ongkir.
+> - Kolom **`store_devices.autoread`**, **`last_inbound_at`**,
+>   **`last_inbound_note`** — dasar panel *Jalur terima chat pembeli* di tab
+>   WhatsApp (lihat [Jalur pesan masuk WhatsApp](#-jalur-pesan-masuk-whatsapp-webhook-fonnte)).
+>   `autoread` sengaja dibiarkan NULL untuk baris lama: nilai itulah penanda
+>   bahwa setelan device belum pernah dipastikan, sehingga sinkronisasi berikutnya
+>   memperbaikinya sekali.
 >
 > Selama fungsi RPC itu belum ada, aplikasi tetap jalan: pembatas laju jatuh ke
 > peta in-memory per instance dan penyimpanan pesan jatuh ke read-modify-write
@@ -87,6 +104,75 @@ npm run dev
 ```
 
 Buka [http://localhost:3000](http://localhost:3000).
+
+---
+
+## 🚚 Ekspedisi, Total & Pembayaran
+
+Diatur pemilik toko di **Dashboard → Pengaturan Toko**, dan semuanya bermuara ke
+satu balasan WhatsApp: rincian pesanan → subtotal → **total bayar per ekspedisi**
+→ cara bayar.
+
+### Ekspedisi yang dilayani (`stores.active_couriers`)
+
+Ceklis merek ekspedisi (bukan 16 kode layanan) dari `COURIER_GROUPS` di
+[`lib/couriers.ts`](./lib/couriers.ts). Satu grup memayungi beberapa
+`courier_code` dari Mengantar — `jne` mencakup `jne` + `jnecargo`, dan `jt` juga
+menerima alias historis `jnt`.
+
+**Kosong = semua ekspedisi ditawarkan**, bukan "tidak ada satu pun". Penyaringan
+punya dua perilaku yang sengaja tidak simetris:
+
+| Keadaan | Hasil | Alasan |
+|---|---|---|
+| Tidak ada yang diceklis | **semua** tarif dikembalikan (fail-open) | Pemilik yang belum mengatur apa pun tidak boleh mendapat bot yang mengutip nol ekspedisi. |
+| Ada ceklis, hasil saring kosong | **kosong**, tanpa fallback (fail-closed) | Mengutip kurir yang tokonya tidak punya akun lebih merugikan daripada berkata jujur bahwa rute itu belum dilayani. |
+
+Penyaringan dilakukan di **satu tempat**, `calculateMengantarOngkir`
+([`lib/mengantar.ts`](./lib/mengantar.ts)) — mencakup jalur live maupun mock —
+jadi balasan bot dan panel "Tes ongkir" di dashboard mustahil berbeda daftar.
+
+Opsional, **kurir toko sendiri** (`stores.local_courier`): satu opsi manual
+dengan label, tarif flat, dan estimasi. Tarif `0`/kosong berarti "tanya dulu" →
+opsinya diletakkan **paling bawah** dan tidak pernah dicetak sebagai `Rp 0`.
+
+### Penjumlahan total
+
+`resolveOrderDraft` di [`lib/ai.ts`](./lib/ai.ts) membaca produk & jumlahnya dari
+pesan pembeli, lalu `buildOngkirReply`
+([`lib/reply-format.ts`](./lib/reply-format.ts)) menjumlahkannya dengan ongkir
+tiap ekspedisi. Pencocokan produk berlapis: nama lengkap → semua kata kunci
+(urutan bebas) → satu kata khas yang hanya dimiliki **tepat satu** produk. Kata
+yang cocok ke lebih dari satu produk **tidak ditebak** — bot menanyakan yang mana,
+sehingga toko dengan "Kaos Polos" dan "Kaos Raglan" tidak salah mengambil.
+
+Dua pagar kejujuran angka:
+
+- Tarif dari jalur **mock** ditulis "Perkiraan total", bukan "Total bayar".
+  Estimasi lunak tidak boleh menjadi angka pasti hanya karena dijumlahkan.
+- Total hanya muncul bila ada produk yang benar-benar cocok. Tidak ada yang
+  cocok → bot minta pembeli menyebut produk & jumlahnya.
+
+### Instruksi pembayaran
+
+`stores.payment_accounts` (maks 3 rekening/e-wallet), `cod_enabled`, dan
+`payment_note`. Rekening tanpa nama bank atau tanpa nomor dijatuhkan — lebih baik
+hilang daripada sampai ke pembeli setengah jadi. Selama belum ada rekening
+tersimpan, prompt Gemini secara eksplisit **melarang** menyebut nomor rekening apa
+pun; yang sudah ada hanya boleh dikutip apa adanya, tidak boleh dikarang.
+
+### Gaya jawaban AI
+
+`ai_tone` (`ramah` / `santai` / `formal` / `singkat`) plus dua toggle
+`ai_include_total` & `ai_include_payment`. Keduanya dibaca dengan `?? true` di
+[`lib/reply-engine.ts`](./lib/reply-engine.ts), supaya baris yang belum pernah
+disimpan sejak migrasi tidak diam-diam kehilangan blok yang tidak pernah
+dimatikan pemiliknya.
+
+Pratinjau balasan di dashboard dirender oleh `buildOngkirReply` — **fungsi yang
+sama** dengan yang dipakai bot. Pratinjau yang disusun ulang secara terpisah pasti
+menyimpang cepat atau lambat, dan pemilik toko akan mengatur sesuatu yang berbeda
+dari yang benar-benar diterima pembelinya.
 
 ---
 
@@ -122,6 +208,59 @@ https://DOMAIN-ANDA/api/midtrans/notification
 
 Saat development lokal, gunakan tunneling (mis. `ngrok http 3000`) supaya
 Midtrans bisa menjangkau endpoint webhook Anda.
+
+---
+
+## 📥 Jalur pesan masuk WhatsApp (webhook Fonnte)
+
+Bot punya **dua jalur yang terpisah total**, dan membedakannya adalah kunci saat
+bot tampak "sehat tapi bisu":
+
+```
+JALUR KIRIM   aplikasi ──► POST api.fonnte.com/send ──► WhatsApp pembeli
+              dipakai: balasan bot, OTP reset password, tombol
+              "Uji coba balasan AI" di dashboard
+
+JALUR TERIMA  pembeli ──► WhatsApp ──► Fonnte ──► POST /api/fonnte/webhook
+              dipakai: HANYA chat pembeli sungguhan
+              syarat: URL webhook device terdaftar + `auto read` device MENYALA
+```
+
+**Uji coba balasan AI tidak menguji jalur terima.** Ia memanggil Gemini dari
+server lalu mengirim lewat `/send`, tanpa sekali pun melewati webhook — jadi ia
+tetap berhasil walau jalur terima mati. Kalau uji coba berbalas tapi chat pembeli
+tidak, penyebabnya hampir pasti ada di jalur terima, bukan di AI atau di device.
+
+Semuanya dipasang otomatis oleh aplikasi — tidak ada yang perlu disetel manual di
+dashboard Fonnte:
+
+| Kapan | Yang dilakukan |
+|---|---|
+| Nomor baru dibuat (`POST /api/fonnte/devices`) | Daftarkan URL webhook + nyalakan `auto read` |
+| QR dibuka (`GET /api/fonnte/qr`) | Baca setelan **nyata** di Fonnte, perbaiki bila melenceng |
+| Tab WhatsApp dibuka / tombol segarkan | Sama, untuk semua nomor toko sekaligus |
+| Pesan masuk dengan secret lama/kosong | Dilayani sekali, sambil setelan device diperbaiki |
+
+Tab WhatsApp menampilkan panel **Jalur terima chat pembeli** per nomor: status URL
+webhook, status `auto read`, dan **kapan pesan masuk terakhir benar-benar tiba**
+beserta apa yang terjadi padanya (dibalas AI / diabaikan karena kuota / ditolak
+karena secret / dst). Tanpa catatan itu, "belum ada pembeli yang chat" dan "chat
+pembeli tidak pernah sampai" terlihat sama persis dari dashboard. Bila ada yang
+melenceng, tombol **Perbaiki otomatis** mendorong ulang setelannya ke Fonnte.
+
+### Kalau chat pembeli masih tidak dibalas
+
+1. **Panel jalur terima bilang "belum siap"** → tekan *Perbaiki otomatis*. Kalau
+   gagal, pesan galatnya berasal langsung dari Fonnte.
+2. **Peringatan `NEXT_PUBLIC_BASE_URL` muncul** → variabelnya masih `localhost`
+   atau IP privat. Isi domain publik aplikasi, deploy ulang, buka tab WhatsApp.
+3. **Panel bilang siap, tapi "pesan masuk terakhir" tetap kosong** → Fonnte tidak
+   memanggil webhook sama sekali. Cek log deployment; bila kosong juga, cek di
+   dashboard Fonnte apakah device masih tertaut dan domainnya tidak terhalang
+   proteksi (mis. Vercel Preview Protection pada domain preview).
+4. **Ada catatan "Diabaikan: …"** → jalur terima sehat, pesan sengaja tidak
+   dibalas. Alasannya tertulis: masa aktif toko berakhir, nomor di luar kuota
+   paket, kuota percakapan bulanan habis, atau batas laju per nomor.
 
 ---
 

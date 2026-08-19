@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getFonnteQRCode, getFonnteDeviceStatus, formatFonntePhone } from "@/lib/fonnte";
+import { getFonnteQRCode, formatFonntePhone } from "@/lib/fonnte";
 import {
   getStoreByEmail,
   listStoreDevicesCompat,
@@ -7,7 +7,7 @@ import {
   upsertStore
 } from "@/lib/supabase";
 import { getSessionEmail } from "@/lib/auth";
-import { buildFonnteWebhookUrl, resolveBaseUrl, syncDeviceWebhookUrl } from "@/lib/webhook-url";
+import { buildFonnteWebhookUrl, reconcileDeviceInbound, resolveBaseUrl } from "@/lib/webhook-url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -71,26 +71,38 @@ export async function GET(req: Request) {
 
   const token = device.fonnte_token;
 
-  // Sinkronkan URL webhook device secara OTOMATIS & idempoten: update-device hanya
-  // dipanggil bila URL tujuan berbeda dari yang tersimpan.
-  await syncDeviceWebhookUrl({
+  // Rekonsiliasi setelan penerimaan pesan (URL webhook + auto read) dengan
+  // kondisi NYATA di Fonnte — sekaligus mengambil status koneksi, jadi tidak ada
+  // tambahan panggilan API dibanding sebelumnya.
+  //
+  // Auto read wajib menyala: Fonnte tidak memanggil webhook pesan masuk tanpa
+  // itu, dan device hasil add-device tidak menyalakannya sendiri. Inilah yang
+  // membuat bot "sehat tapi bisu" — uji coba dari dashboard tetap berhasil
+  // karena hanya memakai jalur KIRIM.
+  const health = await reconcileDeviceInbound({
     store,
     device,
     desired: buildFonnteWebhookUrl(resolveBaseUrl(req))
   });
 
-  const status = await getFonnteDeviceStatus(token);
-  const nextStatus = status.status ? "CONNECTED" : "DISCONNECTED";
+  const nextStatus = health.connected ? "CONNECTED" : "DISCONNECTED";
   if (nextStatus !== device.device_status) {
     if (device.id) await updateStoreDevice(device.id, { device_status: nextStatus });
     if (device.is_primary) await upsertStore({ email, fonnte_device_status: nextStatus });
   }
 
-  if (status.status) {
+  // Kendala jalur terima tidak boleh menghalangi scan QR, tapi harus terlihat.
+  const inboundWarning =
+    health.error && !health.webhookSynced
+      ? `Bot bisa terhubung, tapi jalur pesan masuk belum siap: ${health.error}`
+      : undefined;
+
+  if (health.connected) {
     return NextResponse.json({
       connected: true,
       deviceId: device.id,
       phone: device.phone,
+      warning: inboundWarning,
       message: "WhatsApp Device sudah TERHUBUNG! Tidak perlu scan QR lagi. 🎉"
     });
   }
@@ -109,6 +121,7 @@ export async function GET(req: Request) {
     connected: false,
     deviceId: device.id,
     phone: device.phone,
+    warning: inboundWarning,
     qrUrl: qrResult.qrUrl
   });
 }

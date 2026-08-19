@@ -6,6 +6,8 @@
  */
 
 import { maxDevicesForPackage, monthStartMs, subscriptionEndAfterPayment } from "@/lib/packages";
+import type { LocalCourierConfig } from "@/lib/couriers";
+import type { PaymentAccount } from "@/lib/reply-format";
 
 function getConfig(): { url: string; key: string } | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -48,8 +50,25 @@ export interface StoreRecord {
   origin_subdistrict_id?: string;
   origin_city_name?: string;
   default_weight?: number;
+  /**
+   * Kode grup ekspedisi yang dilayani toko (lihat `lib/couriers.ts`).
+   * NULL / array kosong = semua ekspedisi ditawarkan.
+   */
+  active_couriers?: string[] | null;
+  /** Kurir toko sendiri: `{enabled, label, cost, etd}`; cost 0 = "tanya dulu". */
+  local_courier?: LocalCourierConfig | null;
+  /** Rekening/e-wallet tujuan transfer (maks 3). */
+  payment_accounts?: PaymentAccount[] | null;
+  cod_enabled?: boolean | null;
+  payment_note?: string | null;
   ai_prompt_system?: string;
   greeting_message?: string;
+  /** `ramah` | `santai` | `formal` | `singkat`. */
+  ai_tone?: string | null;
+  /** Jumlahkan subtotal produk + ongkir pada balasan ongkir. */
+  ai_include_total?: boolean | null;
+  /** Sertakan blok instruksi pembayaran pada balasan ongkir. */
+  ai_include_payment?: boolean | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -69,6 +88,18 @@ export interface StoreDeviceRecord {
   fonnte_token?: string | null;
   device_status?: string | null;
   webhook_url?: string | null;
+  /**
+   * `autoread` device di Fonnte terakhir kali kita nyalakan/lihat.
+   *
+   * Fonnte tidak memanggil webhook pesan masuk kalau auto read mati, jadi kolom
+   * ini yang membedakan "webhook sudah terpasang" dari "webhook benar-benar
+   * akan dipanggil". `null` = belum pernah diurus (device pra-perbaikan).
+   */
+  autoread?: boolean | null;
+  /** Kapan pesan masuk dari Fonnte terakhir kali TIBA untuk nomor ini. */
+  last_inbound_at?: string | null;
+  /** Apa yang terjadi pada pesan masuk terakhir ("Dibalas AI", alasan diabaikan, …). */
+  last_inbound_note?: string | null;
   is_primary?: boolean;
   created_at?: string;
   updated_at?: string;
@@ -482,6 +513,20 @@ export interface PublicStoreDevice {
   is_primary: boolean;
   has_token: boolean;
   created_at?: string;
+  /**
+   * Diagnosa jalur TERIMA (pesan pembeli → webhook). Tanpa ini pemilik toko
+   * tidak punya cara membedakan "belum ada yang chat" dari "bot tidak pernah
+   * menerima chat", dua kondisi yang tampak identik dari dashboard.
+   *
+   * CATATAN: `webhook_url` sengaja TIDAK ada di sini. URL aslinya memuat
+   * `FONNTE_WEBHOOK_SECRET` yang berlaku untuk SEMUA tenant — bila ikut terkirim,
+   * pemilik toko mana pun bisa memalsukan pesan masuk untuk nomor toko lain.
+   * `/api/fonnte/devices` menambahkannya khusus untuk panel diagnosa, dan wajib
+   * melewatkannya lewat `redactWebhookUrl` lebih dulu.
+   */
+  autoread: boolean | null;
+  last_inbound_at: string | null;
+  last_inbound_note: string | null;
 }
 
 export function toPublicDevice(device: StoreDeviceRecord): PublicStoreDevice {
@@ -492,7 +537,10 @@ export function toPublicDevice(device: StoreDeviceRecord): PublicStoreDevice {
     device_status: device.device_status || "DISCONNECTED",
     is_primary: !!device.is_primary,
     has_token: !!device.fonnte_token,
-    created_at: device.created_at
+    created_at: device.created_at,
+    autoread: device.autoread ?? null,
+    last_inbound_at: device.last_inbound_at || null,
+    last_inbound_note: device.last_inbound_note || null
   };
 }
 

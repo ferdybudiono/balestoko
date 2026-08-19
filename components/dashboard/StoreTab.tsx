@@ -2,19 +2,39 @@
 
 import { useState } from "react";
 import {
+  Banknote,
   Calculator,
   CheckCircle,
   ChevronRight,
   KeyRound,
   MapPin,
+  MessageSquare,
+  Plus,
   RefreshCw,
   Save,
   Search,
   ShoppingBag,
   Sparkles,
+  Trash2,
   Truck,
   TriangleAlert
 } from "lucide-react";
+import {
+  COURIER_GROUPS,
+  MAX_LOCAL_COURIER_COST,
+  normalizeActiveCouriers,
+  type LocalCourierConfig
+} from "@/lib/couriers";
+import {
+  AI_TONES,
+  AI_TONE_HINTS,
+  AI_TONE_LABELS,
+  MAX_PAYMENT_ACCOUNTS,
+  buildOngkirReply,
+  normalizePaymentAccounts,
+  type AiTone,
+  type PaymentAccount
+} from "@/lib/reply-format";
 import { formatRupiah, type ShowToast } from "./types";
 
 export interface LocationOption {
@@ -44,6 +64,29 @@ export interface StoreForm {
   mengantarApiKey: string;
   /** Minta server menghapus key tersimpan (kolom kosong saja tidak menghapus). */
   clearMengantarKey: boolean;
+
+  /**
+   * Kode grup ekspedisi yang dilayani toko. Array KOSONG = semua ekspedisi
+   * ditawarkan (bukan "tidak ada"). Selalu diurutkan `normalizeActiveCouriers`
+   * supaya `sameForm` — yang membandingkan dengan `JSON.stringify` — tidak
+   * salah menandai ada perubahan hanya karena urutan ceklis berbeda.
+   */
+  activeCouriers: string[];
+  /** Kurir toko sendiri. Disimpan pipih (bukan objek) demi alasan yang sama. */
+  localCourierEnabled: boolean;
+  localCourierLabel: string;
+  /** Kosong / "0" = tarif belum pasti ("tanya dulu"). */
+  localCourierCost: string;
+  localCourierEtd: string;
+
+  /** Maks 3. Kunci objek selalu dibangun dengan urutan tetap: type→name→number→holder. */
+  paymentAccounts: PaymentAccount[];
+  codEnabled: boolean;
+  paymentNote: string;
+
+  aiTone: AiTone;
+  includeTotal: boolean;
+  includePayment: boolean;
 }
 
 interface StoreTabProps {
@@ -143,6 +186,103 @@ export default function StoreTab({
       setCalculating(false);
     }
   };
+
+  // ── Ekspedisi yang dilayani ───────────────────────────────────────────
+  const activeSet = new Set(form.activeCouriers);
+  const toggleCourier = (code: string) => {
+    const next = activeSet.has(code)
+      ? form.activeCouriers.filter((c) => c !== code)
+      : [...form.activeCouriers, code];
+    // SELALU lewat normalisasi: urutan kanonik membuat perbandingan "ada
+    // perubahan belum disimpan" (yang memakai JSON.stringify) tetap jujur.
+    setForm({ activeCouriers: normalizeActiveCouriers(next) });
+  };
+
+  // ── Rekening pembayaran ───────────────────────────────────────────────
+  /** Kunci selalu urut type→name→number→holder, alasan sama seperti di atas. */
+  const orderedAccount = (a: PaymentAccount): PaymentAccount => ({
+    type: a.type,
+    name: a.name,
+    number: a.number,
+    holder: a.holder
+  });
+
+  const setAccount = (idx: number, patch: Partial<PaymentAccount>) =>
+    setForm({
+      paymentAccounts: form.paymentAccounts.map((a, i) =>
+        i === idx ? orderedAccount({ ...a, ...patch }) : a
+      )
+    });
+
+  const addAccount = () => {
+    if (form.paymentAccounts.length >= MAX_PAYMENT_ACCOUNTS) return;
+    setForm({
+      paymentAccounts: [
+        ...form.paymentAccounts,
+        { type: "bank", name: "", number: "", holder: "" }
+      ]
+    });
+  };
+
+  const removeAccount = (idx: number) =>
+    setForm({ paymentAccounts: form.paymentAccounts.filter((_, i) => i !== idx) });
+
+  // ── Pratinjau balasan ─────────────────────────────────────────────────
+  // Dirender oleh `buildOngkirReply`, yaitu fungsi yang SAMA PERSIS dengan yang
+  // dipakai bot saat membalas pembeli. Pratinjau yang disusun ulang secara
+  // terpisah pasti menyimpang cepat atau lambat, dan pemilik toko akan mengatur
+  // sesuatu yang berbeda dari yang benar-benar diterima pembelinya.
+  const previewLocal: LocalCourierConfig = {
+    enabled: form.localCourierEnabled,
+    label: form.localCourierLabel.trim() || "Kurir toko (dalam kota)",
+    cost: Math.max(0, Number(form.localCourierCost) || 0),
+    etd: form.localCourierEtd.trim()
+  };
+
+  // Angka contoh; yang penting di sini bentuk pesannya, bukan tarifnya. Daftar
+  // ekspedisinya mengikuti ceklis supaya pratinjau tidak menampilkan kurir yang
+  // justru tidak dilayani.
+  const sampleCosts = [12000, 14000, 15000];
+  const previewRates = (form.activeCouriers.length > 0
+    ? COURIER_GROUPS.filter((g) => activeSet.has(g.code))
+    : COURIER_GROUPS
+  )
+    .slice(0, sampleCosts.length)
+    .map((g, i) => ({
+      courier_name: g.label,
+      service_name: "Reguler",
+      etd: "1-2 hari",
+      cost: sampleCosts[i]
+    }));
+
+  const previewReply = buildOngkirReply({
+    draft: {
+      lines: [
+        { name: "Kaos Polos", units: 2, weight: 250, price: 60000, lineTotal: 120000 },
+        { name: "Topi Rajut", units: 1, weight: 250, price: 45000, lineTotal: 45000 }
+      ],
+      subtotal: 165000,
+      weightGram: 750,
+      weightSource: "matched",
+      ambiguous: []
+    },
+    rates: previewRates,
+    localCourier: previewLocal,
+    destinationName: "Coblong, Bandung",
+    originCityName: form.originCityName || "Jakarta Pusat",
+    source: "live",
+    payment: {
+      // Dinormalisasi sama seperti di server: baris rekening yang masih kosong
+      // memang dijatuhkan sebelum dikirim, jadi pratinjau tidak boleh
+      // memperlihatkannya seolah-olah akan sampai ke pembeli.
+      accounts: normalizePaymentAccounts(form.paymentAccounts),
+      codEnabled: form.codEnabled,
+      note: form.paymentNote
+    },
+    includeTotal: form.includeTotal,
+    includePayment: form.includePayment,
+    courierFilterActive: form.activeCouriers.length > 0
+  });
 
   return (
     <form
@@ -389,8 +529,332 @@ export default function StoreTab({
           </p>
         </div>
 
+        {/* ── Ekspedisi yang dilayani ─────────────────────────────────── */}
+        <div className="space-y-4 pt-5 border-t border-slate-100">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-bold text-ink flex items-center gap-2">
+                <Truck className="w-4 h-4 text-brand-600" aria-hidden="true" />
+                Ekspedisi yang dilayani
+              </h3>
+              <p className="text-xs text-slate-500 mt-1">
+                Ceklis ekspedisi yang toko Anda benar-benar pakai. AI hanya menawarkan yang diceklis.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() =>
+                  setForm({
+                    activeCouriers: normalizeActiveCouriers(COURIER_GROUPS.map((g) => g.code))
+                  })
+                }
+                className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
+              >
+                Pilih semua
+              </button>
+              <button
+                type="button"
+                onClick={() => setForm({ activeCouriers: [] })}
+                className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
+              >
+                Kosongkan
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {COURIER_GROUPS.map((g) => {
+              const on = activeSet.has(g.code);
+              return (
+                <label
+                  key={g.code}
+                  className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl border cursor-pointer transition-colors ${
+                    on
+                      ? "bg-brand-50 border-brand-300"
+                      : "bg-slate-50 border-slate-200 hover:border-slate-300"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={on}
+                    onChange={() => toggleCourier(g.code)}
+                    className="w-4 h-4 rounded border-slate-300 text-brand-600 focus:ring-2 focus:ring-brand-200"
+                  />
+                  <span className="min-w-0">
+                    <span
+                      className={`block text-sm font-medium truncate ${
+                        on ? "text-brand-800" : "text-slate-600"
+                      }`}
+                    >
+                      {g.label}
+                    </span>
+                    {g.hint && (
+                      <span className="block text-[11px] text-slate-400 truncate">{g.hint}</span>
+                    )}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+
+          {/* Perilaku "kosong = semua" harus dikatakan terus terang: tanpa
+              keterangan ini, kolom kosong mudah dibaca sebagai "tidak ada
+              ekspedisi" dan pemilik toko akan bingung kenapa bot tetap
+              menawarkan 16 kurir. */}
+          {form.activeCouriers.length === 0 ? (
+            <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5">
+              Belum ada yang diceklis — <strong>semua ekspedisi</strong> ditawarkan ke pembeli.
+              Ceklis beberapa untuk membatasinya.
+            </p>
+          ) : (
+            <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5">
+              {form.activeCouriers.length} ekspedisi dilayani. Kalau tujuan pembeli tidak
+              dijangkau salah satunya, AI akan berkata terus terang — bukan menawarkan kurir
+              lain di luar daftar ini.
+            </p>
+          )}
+
+          {/* Sub-panel: kurir toko sendiri */}
+          <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-3">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.localCourierEnabled}
+                onChange={(e) => setForm({ localCourierEnabled: e.target.checked })}
+                className="mt-0.5 w-4 h-4 rounded border-slate-300 text-brand-600 focus:ring-2 focus:ring-brand-200"
+              />
+              <span>
+                <span className="text-sm font-semibold text-ink">
+                  Tambah opsi kurir toko / COD dalam kota
+                </span>
+                <span className="block text-xs text-slate-500 mt-0.5">
+                  Untuk pengiriman yang Anda antar sendiri atau lewat ojek online.
+                </span>
+              </span>
+            </label>
+
+            {form.localCourierEnabled && (
+              <div className="grid sm:grid-cols-3 gap-3 pt-1">
+                <div className="sm:col-span-3">
+                  <label htmlFor="local-label" className={labelCls}>
+                    Nama opsi
+                  </label>
+                  <input
+                    id="local-label"
+                    type="text"
+                    maxLength={60}
+                    placeholder="Kurir toko / Gojek (dalam kota)"
+                    value={form.localCourierLabel}
+                    onChange={(e) => setForm({ localCourierLabel: e.target.value })}
+                    className={`${inputCls} bg-white`}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="local-cost" className={labelCls}>
+                    Tarif (Rp)
+                  </label>
+                  <input
+                    id="local-cost"
+                    type="number"
+                    inputMode="numeric"
+                    min={0}
+                    max={MAX_LOCAL_COURIER_COST}
+                    step={1000}
+                    placeholder="0"
+                    value={form.localCourierCost}
+                    onChange={(e) => setForm({ localCourierCost: e.target.value })}
+                    className={`${inputCls} bg-white`}
+                  />
+                  <p className="text-xs text-slate-400 mt-1.5">
+                    Kosong atau 0 = tarif ditanyakan dulu (tidak pernah ditulis “Rp 0”).
+                  </p>
+                </div>
+                <div className="sm:col-span-2">
+                  <label htmlFor="local-etd" className={labelCls}>
+                    Estimasi
+                  </label>
+                  <input
+                    id="local-etd"
+                    type="text"
+                    maxLength={40}
+                    placeholder="Hari yang sama"
+                    value={form.localCourierEtd}
+                    onChange={(e) => setForm({ localCourierEtd: e.target.value })}
+                    className={`${inputCls} bg-white`}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── Pembayaran ─────────────────────────────────────────────── */}
+        <div className="space-y-4 pt-5 border-t border-slate-100">
+          <div>
+            <h3 className="text-sm font-bold text-ink flex items-center gap-2">
+              <Banknote className="w-4 h-4 text-brand-600" aria-hidden="true" />
+              Pembayaran
+            </h3>
+            <p className="text-xs text-slate-500 mt-1">
+              Dikirim otomatis bersama total pesanan, jadi pembeli tidak perlu bertanya lagi ke
+              mana harus transfer. Maksimal {MAX_PAYMENT_ACCOUNTS} rekening / e-wallet.
+            </p>
+          </div>
+
+          {form.paymentAccounts.length === 0 && (
+            <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5">
+              Belum ada rekening. Selama kosong, AI tidak akan menyebut nomor rekening apa pun.
+            </p>
+          )}
+
+          {form.paymentAccounts.length > 0 && (
+            <div className="space-y-3">
+              {form.paymentAccounts.map((a, idx) => (
+                <div
+                  key={idx}
+                  className="grid gap-2 sm:grid-cols-[7.5rem_1fr_1fr_1fr_2.5rem] items-start"
+                >
+                  <select
+                    aria-label={`Jenis pembayaran ${idx + 1}`}
+                    value={a.type}
+                    onChange={(e) =>
+                      setAccount(idx, { type: e.target.value === "ewallet" ? "ewallet" : "bank" })
+                    }
+                    className={inputCls}
+                  >
+                    <option value="bank">Bank</option>
+                    <option value="ewallet">E-wallet</option>
+                  </select>
+                  <input
+                    type="text"
+                    maxLength={40}
+                    placeholder={a.type === "ewallet" ? "GoPay" : "BCA"}
+                    aria-label={`Nama bank / e-wallet ${idx + 1}`}
+                    value={a.name}
+                    onChange={(e) => setAccount(idx, { name: e.target.value })}
+                    className={inputCls}
+                  />
+                  <input
+                    type="text"
+                    maxLength={40}
+                    placeholder={a.type === "ewallet" ? "0812xxxxxxx" : "1234567890"}
+                    aria-label={`Nomor ${idx + 1}`}
+                    value={a.number}
+                    onChange={(e) => setAccount(idx, { number: e.target.value })}
+                    className={inputCls}
+                  />
+                  <input
+                    type="text"
+                    maxLength={60}
+                    placeholder="a.n. nama pemilik"
+                    aria-label={`Nama pemilik ${idx + 1}`}
+                    value={a.holder}
+                    onChange={(e) => setAccount(idx, { holder: e.target.value })}
+                    className={inputCls}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeAccount(idx)}
+                    aria-label={`Hapus rekening ${idx + 1}`}
+                    className="h-[42px] w-full sm:w-10 flex items-center justify-center text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition-colors"
+                  >
+                    <Trash2 className="w-4 h-4" aria-hidden="true" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {form.paymentAccounts.length < MAX_PAYMENT_ACCOUNTS && (
+            <button
+              type="button"
+              onClick={addAccount}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-brand-700 bg-brand-50 hover:bg-brand-100 rounded-xl transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+              Tambah rekening
+            </button>
+          )}
+
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={form.codEnabled}
+              onChange={(e) => setForm({ codEnabled: e.target.checked })}
+              className="mt-0.5 w-4 h-4 rounded border-slate-300 text-brand-600 focus:ring-2 focus:ring-brand-200"
+            />
+            <span>
+              <span className="text-sm font-semibold text-ink">Terima COD (bayar di tempat)</span>
+              <span className="block text-xs text-slate-500 mt-0.5">
+                Ditawarkan sebagai pilihan pembayaran di balasan AI.
+              </span>
+            </span>
+          </label>
+
+          <div>
+            <label htmlFor="payment-note" className={labelCls}>
+              Catatan pembayaran (opsional)
+            </label>
+            <textarea
+              id="payment-note"
+              rows={2}
+              maxLength={600}
+              placeholder="Contoh: COD hanya untuk area Bandung. Pesanan diproses setelah bukti transfer diterima."
+              value={form.paymentNote}
+              onChange={(e) => setForm({ paymentNote: e.target.value })}
+              className={`${inputCls} py-3`}
+            />
+            <p className="text-xs text-slate-400 mt-1.5">{form.paymentNote.length}/600</p>
+          </div>
+        </div>
+
         {/* ── Pengaturan AI ──────────────────────────────────────────── */}
         <div className="space-y-4 pt-5 border-t border-slate-100">
+          <div>
+            <h3 className="text-sm font-bold text-ink flex items-center gap-2">
+              <MessageSquare className="w-4 h-4 text-brand-600" aria-hidden="true" />
+              Gaya jawaban AI
+            </h3>
+            <p className="text-xs text-slate-500 mt-1">
+              Nada bicara bot dan apa saja yang ikut dikirim setiap kali pembeli menanyakan
+              ongkir.
+            </p>
+          </div>
+
+          <div>
+            <span className={labelCls}>Nada bicara</span>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              {AI_TONES.map((t) => {
+                const on = form.aiTone === t;
+                return (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => setForm({ aiTone: t })}
+                    aria-pressed={on}
+                    className={`px-3 py-2.5 rounded-xl border text-left transition-colors ${
+                      on
+                        ? "bg-brand-50 border-brand-300"
+                        : "bg-slate-50 border-slate-200 hover:border-slate-300"
+                    }`}
+                  >
+                    <span
+                      className={`block text-sm font-semibold ${
+                        on ? "text-brand-800" : "text-slate-700"
+                      }`}
+                    >
+                      {AI_TONE_LABELS[t]}
+                    </span>
+                    <span className="block text-[11px] text-slate-500 mt-0.5 leading-snug">
+                      {AI_TONE_HINTS[t]}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           <div>
             <label htmlFor="greeting" className={labelCls}>
               Pesan sambutan otomatis
@@ -423,6 +887,54 @@ export default function StoreTab({
             <p className="text-xs text-slate-400 mt-1.5">
               Tentukan gaya bahasa, aturan khusus toko, hal yang tidak boleh dijanjikan, dll.{" "}
               {form.aiPromptSystem.length}/4000
+            </p>
+          </div>
+
+          <div className="grid sm:grid-cols-2 gap-3">
+            <label className="flex items-start gap-3 p-3.5 bg-slate-50 border border-slate-200 rounded-xl cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.includeTotal}
+                onChange={(e) => setForm({ includeTotal: e.target.checked })}
+                className="mt-0.5 w-4 h-4 rounded border-slate-300 text-brand-600 focus:ring-2 focus:ring-brand-200"
+              />
+              <span>
+                <span className="text-sm font-semibold text-ink">Sertakan rincian &amp; total</span>
+                <span className="block text-xs text-slate-500 mt-0.5">
+                  Harga produk dijumlahkan dengan ongkir tiap ekspedisi.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-3 p-3.5 bg-slate-50 border border-slate-200 rounded-xl cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.includePayment}
+                onChange={(e) => setForm({ includePayment: e.target.checked })}
+                className="mt-0.5 w-4 h-4 rounded border-slate-300 text-brand-600 focus:ring-2 focus:ring-brand-200"
+              />
+              <span>
+                <span className="text-sm font-semibold text-ink">Sertakan cara pembayaran</span>
+                <span className="block text-xs text-slate-500 mt-0.5">
+                  Rekening, COD, dan catatan dari section Pembayaran di atas.
+                </span>
+              </span>
+            </label>
+          </div>
+
+          {/* Pratinjau dirender oleh buildOngkirReply — fungsi yang SAMA dengan
+              yang dipakai bot menyusun balasan asli. Jadi pratinjau ini tidak
+              bisa menyimpang dari yang diterima pembeli: kalau formatnya
+              berubah, keduanya berubah bersamaan. */}
+          <div>
+            <span className={labelCls}>Pratinjau balasan WhatsApp</span>
+            <div className="p-4 bg-emerald-50/70 border border-emerald-100 rounded-2xl overflow-x-auto">
+              <p className="text-[13px] leading-relaxed text-ink whitespace-pre-wrap">
+                {previewReply}
+              </p>
+            </div>
+            <p className="text-xs text-slate-400 mt-1.5">
+              Contoh dengan data karangan (2 produk, tujuan Coblong &mdash; Bandung) dan tarif
+              contoh. Ongkir asli selalu diambil dari Mengantar saat pembeli bertanya.
             </p>
           </div>
         </div>

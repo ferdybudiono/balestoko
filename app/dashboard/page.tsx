@@ -36,6 +36,11 @@ import type {
   TabId
 } from "@/components/dashboard/types";
 import { getPlan, hasAdvancedAnalytics, monthlyConversationLimit } from "@/lib/packages";
+// Modul murni (tanpa env/fetch), jadi aman diimpor komponen client. Normalisasi
+// dijalankan DI SINI supaya bentuk form selalu kanonik dan `sameForm` — yang
+// membandingkan dengan JSON.stringify — tidak salah menandai "belum disimpan".
+import { DEFAULT_LOCAL_COURIER, normalizeActiveCouriers, normalizeLocalCourier } from "@/lib/couriers";
+import { normalizeAiTone, normalizePaymentAccounts } from "@/lib/reply-format";
 
 const TABS: Array<{ id: TabId; icon: typeof LayoutDashboard; label: string; short: string }> = [
   { id: "overview", icon: LayoutDashboard, label: "Ringkasan", short: "Ringkasan" },
@@ -70,7 +75,22 @@ const EMPTY_FORM: StoreForm = {
   aiPromptSystem: DEFAULT_AI_PROMPT,
   greetingMessage: DEFAULT_GREETING,
   mengantarApiKey: "",
-  clearMengantarKey: false
+  clearMengantarKey: false,
+
+  // Kosong = SEMUA ekspedisi ditawarkan ke pembeli (bukan "tidak ada satu pun").
+  activeCouriers: [],
+  localCourierEnabled: false,
+  localCourierLabel: DEFAULT_LOCAL_COURIER.label,
+  localCourierCost: "",
+  localCourierEtd: DEFAULT_LOCAL_COURIER.etd,
+
+  paymentAccounts: [],
+  codEnabled: false,
+  paymentNote: "",
+
+  aiTone: "ramah",
+  includeTotal: true,
+  includePayment: true
 };
 
 /** Bandingkan isi form (flat, semua kunci sama) untuk deteksi perubahan. */
@@ -101,6 +121,36 @@ function qrEndpoint(device: StoreDevice): string {
     ? `deviceId=${encodeURIComponent(device.id)}`
     : `phone=${encodeURIComponent(device.phone)}`;
   return `/api/fonnte/qr?${param}`;
+}
+
+/**
+ * Pertahankan hasil pembacaan setelan Fonnte saat daftar nomor dimuat ulang
+ * tanpa `status=1`.
+ *
+ * Hanya pembacaan `live` yang tahu kondisi webhook & auto read di Fonnte. Polling
+ * biasa (dan `GET /api/store`) mengembalikan baris database apa adanya, jadi
+ * menimpanya mentah-mentah membuat panel *Jalur terima chat pembeli* kembali ke
+ * "belum diperiksa" setiap 30 detik — persis diagnosa yang paling dibutuhkan
+ * hilang tepat ketika pemilik toko sedang membacanya.
+ */
+function mergeDeviceDiagnostics(prev: StoreDevice[], next: StoreDevice[]): StoreDevice[] {
+  if (prev.length === 0) return next;
+  const before = new Map(prev.map((d) => [d.id || d.phone, d]));
+  return next.map((d) => {
+    const old = before.get(d.id || d.phone);
+    // Data baru yang sudah diperiksa selalu menang; tanpa pembacaan lama, biarkan.
+    if (d.inbound_checked || !old?.inbound_checked) return d;
+    return {
+      ...d,
+      inbound_checked: true,
+      autoread: old.autoread,
+      webhook_url: old.webhook_url,
+      webhook_synced: old.webhook_synced,
+      inbound_error: old.inbound_error
+      // `inbound_repaired` sengaja TIDAK dibawa: itu peristiwa sekali-jalan,
+      // bukan kondisi yang berlaku terus.
+    };
+  });
 }
 
 export default function DashboardPage() {
@@ -156,6 +206,11 @@ export default function DashboardPage() {
   const [newLabel, setNewLabel] = useState("");
   const [addingDevice, setAddingDevice] = useState(false);
   const [removingDeviceId, setRemovingDeviceId] = useState<string | null>(null);
+  // Diagnosa jalur TERIMA (Fonnte → aplikasi): URL webhook yang berlaku dan
+  // peringatan bila NEXT_PUBLIC_BASE_URL tidak bisa dijangkau dari internet.
+  const [expectedWebhookUrl, setExpectedWebhookUrl] = useState<string | null>(null);
+  const [baseUrlWarning, setBaseUrlWarning] = useState<string | null>(null);
+  const [repairingDeviceId, setRepairingDeviceId] = useState<string | null>(null);
   // Simpan device-nya (bukan hanya id) supaya polling QR tahu endpoint mana yang
   // harus dipanggil, termasuk untuk data lama yang belum punya id.
   const [qrDevice, setQrDevice] = useState<StoreDevice | null>(null);
@@ -253,6 +308,7 @@ export default function DashboardPage() {
         setHasMengantarKey(!!s.has_mengantar_api_key);
         setPackageId(s.package_id || "");
 
+        const local = normalizeLocalCourier(s.local_courier);
         const next: StoreForm = {
           storeName: s.store_name || "",
           originCityName: s.origin_city_name || "",
@@ -261,7 +317,25 @@ export default function DashboardPage() {
           aiPromptSystem: s.ai_prompt_system || DEFAULT_AI_PROMPT,
           greetingMessage: s.greeting_message || DEFAULT_GREETING,
           mengantarApiKey: "",
-          clearMengantarKey: false
+          clearMengantarKey: false,
+
+          activeCouriers: normalizeActiveCouriers(s.active_couriers),
+          localCourierEnabled: local.enabled,
+          localCourierLabel: local.label,
+          // `0` dari server = "tanya dulu" → tampil sebagai kolom kosong, bukan
+          // angka 0 yang mengesankan gratis.
+          localCourierCost: local.cost > 0 ? String(local.cost) : "",
+          localCourierEtd: local.etd,
+
+          paymentAccounts: normalizePaymentAccounts(s.payment_accounts),
+          codEnabled: s.cod_enabled === true,
+          paymentNote: s.payment_note || "",
+
+          aiTone: normalizeAiTone(s.ai_tone),
+          // `?? true`: kolomnya baru, jadi baris yang belum pernah disimpan sejak
+          // migrasi harus tetap dianggap menyertakan total & cara bayar.
+          includeTotal: s.ai_include_total ?? true,
+          includePayment: s.ai_include_payment ?? true
         };
         // Jangan timpa apa yang sedang diedit user saat polling berjalan.
         const wasDirty = !sameForm(formRef.current, savedFormRef.current);
@@ -271,7 +345,13 @@ export default function DashboardPage() {
         // `light=1` mengembalikan null — pertahankan status yang sudah ada.
         if (data.fonnteStatus) setFonnteStatus(data.fonnteStatus);
 
-        if (Array.isArray(data.devices)) setDevices(data.devices as StoreDevice[]);
+        if (Array.isArray(data.devices)) {
+          // Gabungkan, jangan timpa: endpoint ini tidak membawa hasil pembacaan
+          // setelan dari Fonnte (`webhook_synced`, `inbound_checked`), jadi
+          // penimpaan mentah akan mengembalikan panel diagnosa ke "belum
+          // diperiksa" setiap kali polling berjalan.
+          setDevices((prev) => mergeDeviceDiagnostics(prev, data.devices as StoreDevice[]));
+        }
         if (typeof data.deviceLimit === "number") setDeviceLimit(data.deviceLimit);
         setDevicesNeedMigration(!!data.devicesNeedMigration);
 
@@ -328,9 +408,13 @@ export default function DashboardPage() {
         const res = await fetch(`/api/fonnte/devices${live ? "?status=1" : ""}`);
         if (!res.ok) return;
         const data = await res.json();
-        if (Array.isArray(data.devices)) setDevices(data.devices as StoreDevice[]);
+        if (Array.isArray(data.devices)) {
+          setDevices((prev) => mergeDeviceDiagnostics(prev, data.devices as StoreDevice[]));
+        }
         if (typeof data.limit === "number") setDeviceLimit(data.limit);
         setDevicesNeedMigration(!!data.needsMigration);
+        setExpectedWebhookUrl(data.expectedWebhookUrl || null);
+        setBaseUrlWarning(data.baseUrlWarning || null);
       } catch {
         /* diamkan — polling berikutnya mencoba lagi */
       } finally {
@@ -356,11 +440,15 @@ export default function DashboardPage() {
         if (data.connected) {
           setQrUrl(null);
           setQrDevice(null);
-          showToast("Nomor ini sudah terhubung! 🎉");
-          refreshDevices();
+          // `warning` = tersambung, tapi jalur pesan masuk belum siap. Jangan
+          // ucapkan "berhasil" kalau bot-nya akan bisu.
+          if (data.warning) showToast(data.warning, "error");
+          else showToast("Nomor ini sudah terhubung! 🎉");
+          refreshDevices({ live: true });
           fetchStoreData({ light: true, silent: true });
         } else if (data.qrUrl) {
           setQrUrl(data.qrUrl);
+          if (data.warning) showToast(data.warning, "error");
         } else {
           setQrDevice(null);
           showToast(data.error || "QR Code belum tersedia. Coba lagi sebentar.", "error");
@@ -394,7 +482,13 @@ export default function DashboardPage() {
       }
       setNewPhone("");
       setNewLabel("");
-      showToast("Nomor terdaftar. Scan QR untuk menghubungkan WhatsApp-nya.");
+      // `warning` = nomor tersimpan tapi jalur pesan masuk belum siap (mis. URL
+      // webhook belum bisa dijangkau). Itu harus terlihat sekarang, bukan nanti
+      // saat pembeli pertama tidak dibalas.
+      showToast(
+        data.warning || "Nomor terdaftar. Scan QR untuk menghubungkan WhatsApp-nya.",
+        data.warning ? "error" : "success"
+      );
       await refreshDevices();
       // Langsung tampilkan QR-nya: nomor baru belum berguna sebelum di-scan.
       if (data.device) handleFetchQr(data.device as StoreDevice);
@@ -435,6 +529,38 @@ export default function DashboardPage() {
     [qrDevice, fetchStoreData, refreshDevices, showToast]
   );
 
+  /**
+   * Dorong ulang setelan penerimaan pesan satu nomor ke Fonnte (URL webhook +
+   * auto read), lalu tampilkan hasil pembacaan terbarunya.
+   *
+   * Ini jalan keluar mandiri untuk kondisi "bot bisa mengirim tapi tidak pernah
+   * menerima" — pemilik toko tidak perlu masuk ke dashboard Fonnte.
+   */
+  const handleRepairDevice = useCallback(
+    async (device: StoreDevice) => {
+      if (!device.id) return;
+      setRepairingDeviceId(device.id);
+      try {
+        const res = await fetch(`/api/fonnte/devices?id=${encodeURIComponent(device.id)}`, {
+          method: "PATCH"
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) {
+          showToast(data.error || "Gagal memperbaiki setelan nomor ini.", "error");
+        } else {
+          showToast("Setelan penerimaan pesan diperbaiki. Coba chat ke nomor ini untuk mengetes.");
+        }
+        // Baca ulang kondisi sebenarnya dari Fonnte, jangan percaya klaim tombol.
+        await refreshDevices({ live: true });
+      } catch {
+        showToast("Gagal memperbaiki setelan nomor ini.", "error");
+      } finally {
+        setRepairingDeviceId(null);
+      }
+    },
+    [refreshDevices, showToast]
+  );
+
   // Pantau status selama QR tampil; berhenti begitu terhubung atau kedaluwarsa.
   useEffect(() => {
     if (!qrUrl || !qrDevice) return;
@@ -454,7 +580,10 @@ export default function DashboardPage() {
           setQrUrl(null);
           setQrDevice(null);
           showToast("WhatsApp berhasil terhubung! 🎉");
-          refreshDevices();
+          // `live` — device yang baru ditautkan adalah saat paling rawan setelan
+          // webhook/auto read-nya belum terpasang. Rekonsiliasi sekarang, jangan
+          // tunggu pembeli pertama yang tidak dibalas.
+          refreshDevices({ live: true });
           fetchStoreData({ light: true, silent: true });
         } else if (data.qrUrl) {
           setQrUrl(data.qrUrl);
@@ -465,6 +594,17 @@ export default function DashboardPage() {
     }, QR_POLL_MS);
     return () => clearTimeout(id);
   }, [qrUrl, qrTicks, qrDevice, fetchStoreData, refreshDevices, showToast]);
+
+  // Buka tab WhatsApp = periksa jalur terima. Pembacaan `live` inilah yang
+  // membaca setelan nyata di Fonnte dan memperbaikinya bila melenceng, jadi
+  // sekadar membuka tab ini sudah menyembuhkan device yang webhook/auto read-nya
+  // hilang — tanpa itu, panel diagnosa hanya bisa bilang "belum diperiksa".
+  const inboundChecked = useRef(false);
+  useEffect(() => {
+    if (activeTab !== "whatsapp" || inboundChecked.current) return;
+    inboundChecked.current = true;
+    refreshDevices({ live: true });
+  }, [activeTab, refreshDevices]);
 
   // Nomor pengirim untuk uji coba: jaga agar selalu menunjuk nomor yang valid.
   useEffect(() => {
@@ -499,7 +639,22 @@ export default function DashboardPage() {
         origin_subdistrict_id: form.originSubdistrictId,
         default_weight: weight,
         ai_prompt_system: form.aiPromptSystem,
-        greeting_message: form.greetingMessage
+        greeting_message: form.greetingMessage,
+        active_couriers: form.activeCouriers,
+        local_courier: {
+          enabled: form.localCourierEnabled,
+          label: form.localCourierLabel,
+          // Kolom kosong / bukan angka → 0, yang di sisi pembeli berarti
+          // "tarif ditanyakan dulu" dan tidak pernah dicetak sebagai Rp 0.
+          cost: Number(form.localCourierCost) || 0,
+          etd: form.localCourierEtd
+        },
+        payment_accounts: form.paymentAccounts,
+        cod_enabled: form.codEnabled,
+        payment_note: form.paymentNote,
+        ai_tone: form.aiTone,
+        ai_include_total: form.includeTotal,
+        ai_include_payment: form.includePayment
       };
       // Kolom kosong = biarkan key lama. String kosong dikirim HANYA bila user
       // memang meminta penghapusan.
@@ -959,6 +1114,10 @@ export default function DashboardPage() {
                   devicesNeedMigration={devicesNeedMigration}
                   refreshingDevices={refreshingDevices}
                   onRefreshDevices={() => refreshDevices({ live: true })}
+                  expectedWebhookUrl={expectedWebhookUrl}
+                  baseUrlWarning={baseUrlWarning}
+                  repairingDeviceId={repairingDeviceId}
+                  onRepairDevice={handleRepairDevice}
                   newPhone={newPhone}
                   setNewPhone={setNewPhone}
                   newLabel={newLabel}
