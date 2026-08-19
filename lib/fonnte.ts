@@ -116,25 +116,28 @@ export async function createFonnteDevice(
 }
 
 /**
- * Hapus Device di Fonnte memakai Account Token.
- *
- * Dipanggil saat pemilik toko melepas salah satu nomornya. Penting karena Fonnte
- * menolak `add-device` untuk nomor yang masih terdaftar — tanpa penghapusan ini,
- * nomor yang pernah dilepas tidak bisa disambungkan lagi.
- *
- * Kegagalan di sini TIDAK fatal: baris device tetap dihapus dari database supaya
- * kuota paket user langsung bebas. Konsekuensinya nomor itu mungkin masih
- * tersangkut di akun Fonnte dan perlu dihapus manual dari dashboard Fonnte.
+ * Alasan dari Fonnte yang artinya "device itu memang sudah tidak ada di sini".
+ * Untuk tujuan kita (nomor bebas dipakai lagi) itu sama saja dengan sukses.
  */
-export async function deleteFonnteDevice(phone: string): Promise<{ success: boolean; error?: string }> {
-  const accountToken = process.env.FONNTE_TOKEN;
-  if (!accountToken) return { success: false, error: "FONNTE_TOKEN (account token) belum diatur." };
+const FONNTE_DEVICE_GONE =
+  /not found|tidak ada|no device|belum terdaftar|not registered|tidak terdaftar/;
 
-  const devicePhone = formatFonntePhone(phone);
-  if (!devicePhone || devicePhone.replace(/\D/g, "").length < 8) {
-    return { success: false, error: "Nomor device tidak valid." };
-  }
+/**
+ * HTTP status yang berarti "coba lagi nanti", bukan "permintaanmu ditolak".
+ */
+const FONNTE_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type DeleteAttempt = { success: true } | { success: false; error: string; retryable: boolean };
+
+/** Satu kali panggil `delete-device`, sekaligus menilai apakah layak diulang. */
+async function attemptDeleteFonnteDevice(
+  devicePhone: string,
+  accountToken: string
+): Promise<DeleteAttempt> {
   try {
     const formData = new URLSearchParams();
     formData.append("device", devicePhone);
@@ -146,13 +149,84 @@ export async function deleteFonnteDevice(phone: string): Promise<{ success: bool
       cache: "no-store"
     });
 
-    const data = await res.json().catch(() => ({}));
+    // Dibaca sebagai teks dulu: body kosong harus bisa dibedakan dari penolakan
+    // yang punya alasan, karena yang pertama layak diulang dan yang kedua tidak.
+    const raw = (await res.text().catch(() => "")).trim();
+    let data: Record<string, unknown> = {};
+    if (raw) {
+      try {
+        data = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        data = {};
+      }
+    }
+
     if (res.ok && data.status) return { success: true };
-    return { success: false, error: data.reason || data.message || "Gagal menghapus device Fonnte." };
+
+    const reason = String(data.reason || data.message || "").trim();
+    if (FONNTE_DEVICE_GONE.test(reason.toLowerCase())) return { success: true };
+
+    // Fonnte sedang goyah (5xx/429) atau tidak menjawab apa pun yang bisa
+    // ditafsirkan. Itu gangguan sementara, bukan keputusan — ulangi.
+    if (FONNTE_RETRYABLE_STATUS.has(res.status) || !raw) {
+      return {
+        success: false,
+        error: reason || `Fonnte membalas HTTP ${res.status} tanpa keterangan.`,
+        retryable: true
+      };
+    }
+
+    // Fonnte menjawab dengan alasan yang jelas. Mengulang hanya menunda kabar buruk.
+    return {
+      success: false,
+      error: reason || "Gagal menghapus device Fonnte.",
+      retryable: false
+    };
   } catch (err) {
     console.error("[fonnte] Exception deleting device:", err);
-    return { success: false, error: String(err) };
+    return { success: false, error: String(err), retryable: true };
   }
+}
+
+/**
+ * Hapus Device di Fonnte memakai Account Token.
+ *
+ * Dipanggil saat pemilik toko melepas salah satu nomornya. Penting karena Fonnte
+ * menolak `add-device` untuk nomor yang masih terdaftar — tanpa penghapusan ini,
+ * nomor yang pernah dilepas tidak bisa disambungkan lagi.
+ *
+ * Hasil fungsi ini adalah SYARAT penghapusan di dashboard (lihat DELETE
+ * /api/fonnte/devices), jadi kegagalan sesaat tidak boleh langsung menggagalkan
+ * permintaan user: gangguan jaringan dan 5xx dari Fonnte diulang beberapa kali
+ * lebih dulu. Penolakan yang jelas beralasan tidak diulang — mengulang hanya
+ * memperlambat pesan error yang sama.
+ */
+export async function deleteFonnteDevice(
+  phone: string,
+  opts: { attempts?: number } = {}
+): Promise<{ success: boolean; error?: string }> {
+  const accountToken = process.env.FONNTE_TOKEN;
+  if (!accountToken) return { success: false, error: "FONNTE_TOKEN (account token) belum diatur." };
+
+  const devicePhone = formatFonntePhone(phone);
+  if (!devicePhone || devicePhone.replace(/\D/g, "").length < 8) {
+    return { success: false, error: "Nomor device tidak valid." };
+  }
+
+  const attempts = Math.max(1, opts.attempts ?? 3);
+  let lastError = "Gagal menghapus device Fonnte.";
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (attempt > 1) await delay(400 * (attempt - 1));
+
+    const outcome = await attemptDeleteFonnteDevice(devicePhone, accountToken);
+    if (outcome.success) return { success: true };
+
+    lastError = outcome.error;
+    if (!outcome.retryable) return { success: false, error: outcome.error };
+  }
+
+  return { success: false, error: lastError };
 }
 
 /**

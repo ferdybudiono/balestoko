@@ -335,9 +335,25 @@ export async function DELETE(req: Request) {
   const target = devices.find((d) => d.id === id);
   if (!target) return NextResponse.json({ error: "Nomor tidak ditemukan." }, { status: 404 });
 
-  // Lepas dulu di Fonnte, kalau tidak nomornya tetap tersangkut di akun dan
-  // tidak bisa disambungkan lagi. Gagal di sini tidak menghalangi penghapusan.
+  // Hapus dulu di Fonnte, dan jadikan ini SYARAT. Kalau gagal, JANGAN hapus
+  // baris DB — supaya dashboard dan Fonnte tidak pernah beda status, dan supaya
+  // nomor tidak tersangkut di akun Fonnte (add-device menolak nomor kembar,
+  // jadi nomor yang tersangkut tidak bisa disambungkan lagi selamanya).
+  //
+  // `deleteFonnteDevice` sudah mengulang gangguan sesaat sendiri, dan menganggap
+  // nomor yang memang sudah tidak ada di Fonnte sebagai sukses. Jadi kegagalan
+  // di sini berarti penolakan nyata, bukan jaringan yang kedip.
   const unlinked = await deleteFonnteDevice(target.phone);
+  if (!unlinked.success) {
+    return NextResponse.json(
+      {
+        error:
+          "Nomor gagal dihapus dari Fonnte, jadi belum dihapus dari dashboard. " +
+          `Coba lagi sebentar. Penyebab: ${unlinked.error || "tidak diketahui"}`
+      },
+      { status: 502 }
+    );
+  }
 
   const removed = await deleteStoreDevice(id, store.id!);
   if (!removed.ok) {
@@ -367,11 +383,7 @@ export async function DELETE(req: Request) {
     }
   }
 
-  return NextResponse.json({
-    success: true,
-    fonnteUnlinked: unlinked.success,
-    warning: unlinked.success
-      ? undefined
-      : "Nomor sudah dilepas dari dashboard, tapi belum terhapus di Fonnte. Hapus manual dari dashboard Fonnte bila ingin memakainya lagi."
-  });
+  // Sampai di sini device SUDAH terhapus di Fonnte (itu syarat di atas), jadi
+  // tidak ada lagi kondisi "terhapus separuh" yang perlu diperingatkan ke user.
+  return NextResponse.json({ success: true });
 }

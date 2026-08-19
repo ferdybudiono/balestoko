@@ -339,8 +339,8 @@ export default function WhatsappTab({
                         <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl space-y-2.5">
                           <p className="text-xs text-rose-900 leading-relaxed">
                             Hapus <strong>{formatPhoneDisplay(device.phone)}</strong>? Bot berhenti
-                            membalas di nomor ini dan tautan perangkat WhatsApp-nya dilepas. Riwayat
-                            chat tetap tersimpan.
+                            membalas di nomor ini dan perangkatnya ikut dihapus di Fonnte, jadi kalau
+                            nanti ditambahkan lagi perlu scan QR baru. Riwayat chat tetap tersimpan.
                           </p>
                           <div className="flex items-center gap-2">
                             <button

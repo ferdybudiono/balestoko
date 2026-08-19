@@ -516,8 +516,9 @@ export default function DashboardPage() {
           setQrUrl(null);
           setQrDevice(null);
         }
-        // `warning` = baris DB terhapus tapi device di Fonnte belum; user perlu tahu.
-        showToast(data.warning || "Nomor berhasil dihapus.", data.warning ? "error" : "success");
+        // Server hanya menjawab sukses setelah device benar-benar terhapus di
+        // Fonnte, jadi tidak ada lagi kondisi "terhapus separuh" untuk dilaporkan.
+        showToast("Nomor berhasil dihapus dari dashboard dan dari Fonnte.", "success");
         await refreshDevices();
         fetchStoreData({ light: true, silent: true });
       } catch {
