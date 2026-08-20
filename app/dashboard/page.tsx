@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import {
   Bot,
   CheckCircle,
+  ClipboardList,
   Clock,
   Crown,
   LayoutDashboard,
@@ -22,6 +23,7 @@ import {
 } from "lucide-react";
 
 import ChatsTab from "@/components/dashboard/ChatsTab";
+import OrdersTab from "@/components/dashboard/OrdersTab";
 import OverviewTab from "@/components/dashboard/OverviewTab";
 import ProductsTab from "@/components/dashboard/ProductsTab";
 import StoreTab, { type StoreForm } from "@/components/dashboard/StoreTab";
@@ -29,6 +31,7 @@ import WhatsappTab from "@/components/dashboard/WhatsappTab";
 import { computeStats } from "@/components/dashboard/stats";
 import { isDeviceConnected } from "@/components/dashboard/types";
 import type {
+  BuyerOrder,
   Conversation,
   FonnteStatus,
   Product,
@@ -47,6 +50,7 @@ const TABS: Array<{ id: TabId; icon: typeof LayoutDashboard; label: string; shor
   { id: "whatsapp", icon: Smartphone, label: "Hubungkan WhatsApp", short: "WhatsApp" },
   { id: "store", icon: ShoppingBag, label: "Pengaturan Toko", short: "Toko" },
   { id: "products", icon: Package, label: "Produk", short: "Produk" },
+  { id: "orders", icon: ClipboardList, label: "Pesanan", short: "Pesanan" },
   { id: "chats", icon: MessageSquare, label: "Chat AI", short: "Chat" }
 ];
 
@@ -194,6 +198,11 @@ export default function DashboardPage() {
   // kembali ke percakapan pertama.
   const [selectedPhone, setSelectedPhone] = useState<string | null>(null);
 
+  // Pesanan pembeli hasil rekaman AI (tab "Pesanan").
+  const [buyerOrders, setBuyerOrders] = useState<BuyerOrder[]>([]);
+  const [ordersNeedMigration, setOrdersNeedMigration] = useState(false);
+  const [orderBusyId, setOrderBusyId] = useState<string | null>(null);
+
   // WhatsApp: nomor-nomor toko (Starter 1, Pro 3) + QR per nomor
   const [devices, setDevices] = useState<StoreDevice[]>([]);
   const [deviceLimit, setDeviceLimit] = useState(1);
@@ -208,6 +217,8 @@ export default function DashboardPage() {
   const [expectedWebhookUrl, setExpectedWebhookUrl] = useState<string | null>(null);
   const [baseUrlWarning, setBaseUrlWarning] = useState<string | null>(null);
   const [repairingDeviceId, setRepairingDeviceId] = useState<string | null>(null);
+  // Nomor yang sedang menyimpan cakupan produknya (paket Pro: 3 nomor).
+  const [savingScopeId, setSavingScopeId] = useState<string | null>(null);
   // Simpan device-nya (bukan hanya id) supaya polling QR tahu endpoint mana yang
   // harus dipanggil, termasuk untuk data lama yang belum punya id.
   const [qrDevice, setQrDevice] = useState<StoreDevice | null>(null);
@@ -350,6 +361,8 @@ export default function DashboardPage() {
         setDevicesNeedMigration(!!data.devicesNeedMigration);
 
         if (Array.isArray(data.products)) setProducts(data.products);
+        if (Array.isArray(data.buyerOrders)) setBuyerOrders(data.buyerOrders as BuyerOrder[]);
+        setOrdersNeedMigration(!!data.ordersNeedMigration);
         if (Array.isArray(data.conversations)) {
           const list = data.conversations as Conversation[];
           setConversations(list);
@@ -717,6 +730,104 @@ export default function DashboardPage() {
     }
   }, [testPhone, testMessageText, testDeviceId, fetchStoreData, goToTab, showToast]);
 
+  // ── Pesanan pembeli ───────────────────────────────────────────────────
+  //
+  // Perubahan status ditulis OPTIMIS ke state supaya centang "selesai" terasa
+  // langsung, lalu dikembalikan bila server menolak. Tanpa itu tombol terasa
+  // menggantung selama satu round-trip PostgREST.
+  const handleToggleOrderDone = useCallback(
+    async (order: BuyerOrder, done: boolean) => {
+      if (!order.id) return;
+      const id = order.id;
+      const before = order.status;
+      setOrderBusyId(id);
+      setBuyerOrders((prev) =>
+        prev.map((o) =>
+          o.id === id
+            ? { ...o, status: done ? "done" : "new", done_at: done ? new Date().toISOString() : null }
+            : o
+        )
+      );
+      try {
+        const res = await fetch("/api/buyer-orders", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, done })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setBuyerOrders((prev) => prev.map((o) => (o.id === id ? { ...o, status: before } : o)));
+          showToast(data.error || "Gagal memperbarui pesanan.", "error");
+          return;
+        }
+        showToast(done ? "Pesanan ditandai selesai." : "Pesanan dibuka kembali.");
+      } catch {
+        setBuyerOrders((prev) => prev.map((o) => (o.id === id ? { ...o, status: before } : o)));
+        showToast("Terjadi kesalahan saat memperbarui pesanan.", "error");
+      } finally {
+        setOrderBusyId(null);
+      }
+    },
+    [showToast]
+  );
+
+  const handleDeleteOrder = useCallback(
+    async (order: BuyerOrder) => {
+      if (!order.id) return;
+      const id = order.id;
+      setOrderBusyId(id);
+      try {
+        const res = await fetch(`/api/buyer-orders?id=${encodeURIComponent(id)}`, {
+          method: "DELETE"
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(data.error || "Gagal menghapus pesanan.", "error");
+          return;
+        }
+        setBuyerOrders((prev) => prev.filter((o) => o.id !== id));
+        showToast("Pesanan dihapus.");
+      } catch {
+        showToast("Terjadi kesalahan saat menghapus pesanan.", "error");
+      } finally {
+        setOrderBusyId(null);
+      }
+    },
+    [showToast]
+  );
+
+  // ── Cakupan produk per nomor WhatsApp ─────────────────────────────────
+  const handleSaveDeviceScope = useCallback(
+    async (deviceId: string, productIds: string[]) => {
+      setSavingScopeId(deviceId);
+      try {
+        const res = await fetch("/api/fonnte/devices/scope", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ deviceId, productIds })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(data.error || "Gagal menyimpan cakupan produk.", "error");
+          return;
+        }
+        setDevices((prev) =>
+          prev.map((d) => (d.id === deviceId ? { ...d, product_ids: productIds } : d))
+        );
+        showToast(
+          productIds.length === 0
+            ? "Nomor ini sekarang menjawab semua produk."
+            : `Nomor ini menjawab ${productIds.length} produk pilihan.`
+        );
+      } catch {
+        showToast("Terjadi kesalahan saat menyimpan cakupan produk.", "error");
+      } finally {
+        setSavingScopeId(null);
+      }
+    },
+    [showToast]
+  );
+
   const handleLogout = useCallback(async () => {
     try {
       await fetch("/api/auth/logout", { method: "POST" });
@@ -772,6 +883,9 @@ export default function DashboardPage() {
 
   const tabCounts: Partial<Record<TabId, number>> = {
     products: products.length,
+    // Yang ditampilkan adalah pesanan yang PERLU DIPROSES — angka itulah yang
+    // menjadi alasan pemilik toko membuka tab ini, bukan total sepanjang masa.
+    orders: buyerOrders.filter((o) => o.status !== "done").length,
     chats: conversations.length
   };
 
@@ -1134,6 +1248,9 @@ export default function DashboardPage() {
                   setTestDeviceId={setTestDeviceId}
                   sendingTest={sendingTest}
                   onSendTest={handleSendTest}
+                  products={products}
+                  savingScopeId={savingScopeId}
+                  onSaveScope={handleSaveDeviceScope}
                 />
               )}
             </div>
@@ -1159,6 +1276,19 @@ export default function DashboardPage() {
                   products={products}
                   showToast={showToast}
                   onChanged={() => fetchStoreData({ light: true, silent: true })}
+                />
+              )}
+            </div>
+
+            <div role="tabpanel" id="panel-orders" aria-labelledby="tab-orders" hidden={activeTab !== "orders"}>
+              {activeTab === "orders" && (
+                <OrdersTab
+                  orders={buyerOrders}
+                  needsMigration={ordersNeedMigration}
+                  busyId={orderBusyId}
+                  onToggleDone={handleToggleOrderDone}
+                  onDelete={handleDeleteOrder}
+                  showToast={showToast}
                 />
               )}
             </div>

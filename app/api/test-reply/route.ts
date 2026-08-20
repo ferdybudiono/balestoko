@@ -99,7 +99,10 @@ export async function POST(req: Request) {
       store,
       sender,
       messageText,
-      deviceToken: device.fonnte_token
+      deviceToken: device.fonnte_token,
+      // Uji coba harus memakai batasan produk nomor itu juga, kalau tidak
+      // pratinjaunya menjanjikan jawaban yang tidak akan keluar di WhatsApp.
+      device
     });
     return NextResponse.json({
       success: true,

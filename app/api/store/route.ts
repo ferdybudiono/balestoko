@@ -4,6 +4,7 @@ import {
   upsertStore,
   getAllConversations,
   getProductsByStoreId,
+  listBuyerOrders,
   listStoreDevicesCompat,
   storeActivityState,
   toPublicDevice
@@ -45,15 +46,18 @@ export async function GET(req: Request) {
         devices: [],
         deviceLimit: maxDevicesForPackage(null),
         devicesNeedMigration: false,
+        buyerOrders: [],
+        ordersNeedMigration: false,
         activity: { state: "inactive", active: false, endsAt: null, daysLeft: null }
       });
     }
 
-    // Tiga query independen — jalankan paralel supaya latensi tidak menumpuk.
-    const [conversations, products, deviceList] = await Promise.all([
+    // Empat query independen — jalankan paralel supaya latensi tidak menumpuk.
+    const [conversations, products, deviceList, buyerOrders] = await Promise.all([
       store?.id ? getAllConversations(store.id) : Promise.resolve([]),
       store?.id ? getProductsByStoreId(store.id) : Promise.resolve([]),
-      listStoreDevicesCompat(store)
+      listStoreDevicesCompat(store),
+      store?.id ? listBuyerOrders(store.id) : Promise.resolve([])
     ]);
     const { devices, legacy } = deviceList;
 
@@ -110,6 +114,11 @@ export async function GET(req: Request) {
       devices: devices.map(toPublicDevice),
       deviceLimit: maxDevicesForPackage(store.package_id),
       devicesNeedMigration: legacy,
+      // `null` dari listBuyerOrders = tabel pesanan belum ada (SQL terbaru belum
+      // dijalankan). Dibedakan dari daftar kosong supaya dashboard menampilkan
+      // ajakan menjalankan migrasi, bukan "belum ada pesanan".
+      buyerOrders: buyerOrders || [],
+      ordersNeedMigration: buyerOrders === null,
       activity: {
         state,
         active: state === "active" || state === "trial",

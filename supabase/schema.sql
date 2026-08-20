@@ -106,7 +106,10 @@ create table if not exists public.conversations (
   id                    uuid primary key default gen_random_uuid(),
   store_id              uuid references public.stores(id) on delete cascade,
   customer_phone        text not null,
+  -- Nama & alamat DIPANCING oleh AI lalu direkam di sini. Dipakai label
+  -- "nama + kota" di riwayat chat dashboard dan sebagai identitas pesanan.
   customer_name         text default 'Pembeli WA',
+  customer_address      text,
   messages              jsonb not null default '[]'::jsonb, -- Array of {role: 'user'|'assistant', content: text, timestamp: text}
   last_intent           text, -- 'GREETING' | 'ONGKIR_CHECK' | 'PRODUCT_INQUIRY' | 'ORDER'
   destination_city      text,
@@ -140,6 +143,11 @@ create table if not exists public.store_devices (
   last_inbound_at       timestamptz,                     -- pesan masuk terakhir TIBA dari Fonnte
   last_inbound_note     text,                            -- hasilnya: 'Dibalas AI' / alasan diabaikan
   is_primary            boolean not null default false,  -- device untuk pesan non-percakapan (OTP reset)
+  -- Produk yang DIJAWAB nomor ini (array id produk, jsonb).
+  -- `[]` / NULL = nomor umum: menjawab SEMUA produk toko. Paket Pro punya 3 nomor,
+  -- jadi satu nomor bisa dikhususkan untuk sebagian katalog saja — katalog yang
+  -- masuk ke prompt AI & pencocokan pesanan mengikuti daftar ini.
+  product_ids           jsonb not null default '[]'::jsonb,
   created_at            timestamptz not null default now(),
   updated_at            timestamptz not null default now()
 );
@@ -154,7 +162,47 @@ create index if not exists store_devices_token_idx on public.store_devices (fonn
 create unique index if not exists store_devices_primary_uidx
   on public.store_devices (store_id) where is_primary;
 
--- 6. Tabel Rate Limits (pembatas laju lintas-instance)
+-- 6. Tabel Buyer Orders (daftar pesanan pembeli hasil rekaman AI)
+--
+--    JANGAN dicampur dengan `public.orders` — tabel itu adalah pembayaran
+--    LANGGANAN SaaS (Midtrans). Ini pesanan PEMBELI di toko pelanggan kami:
+--    satu baris per pesanan yang berhasil AI kumpulkan dari chat WhatsApp,
+--    ditampilkan sebagai tabel (mirip spreadsheet) di dashboard dengan toggle
+--    "sudah diproses".
+create table if not exists public.buyer_orders (
+  id                    uuid primary key default gen_random_uuid(),
+  store_id              uuid not null references public.stores(id) on delete cascade,
+  -- Nomor WhatsApp toko yang menerima pesanan ini. `set null` supaya menghapus
+  -- nomor tidak menghapus riwayat pesanan yang sudah masuk.
+  device_id             uuid references public.store_devices(id) on delete set null,
+  customer_phone        text not null,
+  customer_name         text,
+  customer_address      text,
+  destination_city      text,
+  -- [{name, units, price, weight, line_total}] — snapshot saat pesanan dibuat,
+  -- bukan referensi ke `products`: harga/nama produk boleh berubah nanti, tapi
+  -- pesanan yang sudah tercatat tidak boleh ikut berubah.
+  items                 jsonb   not null default '[]'::jsonb,
+  subtotal              integer not null default 0,
+  weight_gram           integer not null default 0,
+  shipping_courier      text,
+  shipping_cost         integer,
+  note                  text,
+  status                text not null default 'new',   -- 'new' | 'done'
+  done_at               timestamptz,
+  created_at            timestamptz not null default now(),
+  updated_at            timestamptz not null default now()
+);
+
+create index if not exists buyer_orders_store_idx on public.buyer_orders (store_id, created_at desc);
+create index if not exists buyer_orders_phone_idx on public.buyer_orders (store_id, customer_phone);
+-- Satu pesanan BERJALAN per pembeli. Chat lanjutan menambah/mengubah pesanan yang
+-- sama, bukan membuat baris baru setiap kali pembeli menyebut produk. Setelah
+-- ditandai 'done' slotnya kosong lagi, jadi pesanan berikutnya jadi baris baru.
+create unique index if not exists buyer_orders_open_uidx
+  on public.buyer_orders (store_id, customer_phone) where status = 'new';
+
+-- 7. Tabel Rate Limits (pembatas laju lintas-instance)
 --
 --    Peta in-memory hanya berlaku per instance serverless: dua region yang
 --    melayani nomor yang sama masing-masing punya hitungan sendiri, jadi batas
@@ -189,6 +237,7 @@ alter table public.stores enable row level security;
 alter table public.store_devices enable row level security;
 alter table public.products enable row level security;
 alter table public.conversations enable row level security;
+alter table public.buyer_orders enable row level security;
 alter table public.rate_limits enable row level security;
 
 -- Auto-update timestamp trigger
@@ -211,6 +260,9 @@ create trigger trg_conversations_updated_at before update on public.conversation
 
 drop trigger if exists trg_store_devices_updated_at on public.store_devices;
 create trigger trg_store_devices_updated_at before update on public.store_devices for each row execute function public.set_updated_at();
+
+drop trigger if exists trg_buyer_orders_updated_at on public.buyer_orders;
+create trigger trg_buyer_orders_updated_at before update on public.buyer_orders for each row execute function public.set_updated_at();
 
 -- =====================================================================
 --  FUNGSI RPC (dipanggil server lewat /rest/v1/rpc/<nama>)
@@ -240,6 +292,16 @@ $$;
 --
 -- `p_max_messages` memangkas riwayat lama supaya satu baris tidak tumbuh tanpa
 -- batas (setiap balasan membaca & menulis ulang kolom ini).
+--
+-- `p_customer_name` / `p_customer_address` = hasil "pancingan" AI. Keduanya
+-- ditulis dengan `coalesce(nullif(...), nilai lama)` supaya pesan berikutnya yang
+-- tidak menyebut nama TIDAK menghapus nama yang sudah didapat.
+--
+-- Tanda tangan lama (7 argumen) DIBUANG dulu: `create or replace` dengan daftar
+-- argumen berbeda menghasilkan OVERLOAD, dan PostgREST yang memanggil pakai
+-- named-argument akan gagal dengan "function is not unique".
+drop function if exists public.append_conversation_message(uuid, text, text, text, text, text, integer);
+
 create or replace function public.append_conversation_message(
   p_store_id uuid,
   p_phone text,
@@ -247,7 +309,9 @@ create or replace function public.append_conversation_message(
   p_assistant_reply text,
   p_intent text default null,
   p_destination_city text default null,
-  p_max_messages integer default 200
+  p_max_messages integer default 200,
+  p_customer_name text default null,
+  p_customer_address text default null
 ) returns setof public.conversations
 language plpgsql as $$
 declare
@@ -262,16 +326,22 @@ begin
 
   return query
   insert into public.conversations (
-    store_id, customer_phone, messages, last_intent, destination_city, updated_at
+    store_id, customer_phone, messages, last_intent, destination_city,
+    customer_name, customer_address, updated_at
   )
   values (
     p_store_id, p_phone, public.trim_jsonb_tail(v_new, p_max_messages),
-    p_intent, p_destination_city, v_now
+    p_intent, p_destination_city,
+    coalesce(nullif(btrim(p_customer_name), ''), 'Pembeli WA'),
+    nullif(btrim(p_customer_address), ''),
+    v_now
   )
   on conflict (store_id, customer_phone) do update
     set messages         = public.trim_jsonb_tail(conversations.messages || v_new, p_max_messages),
         last_intent      = coalesce(p_intent, conversations.last_intent),
         destination_city = coalesce(p_destination_city, conversations.destination_city),
+        customer_name    = coalesce(nullif(btrim(p_customer_name), ''), conversations.customer_name),
+        customer_address = coalesce(nullif(btrim(p_customer_address), ''), conversations.customer_address),
         updated_at       = v_now
   returning *;
 end;
@@ -316,7 +386,7 @@ end;
 $$;
 
 grant execute on function public.trim_jsonb_tail(jsonb, integer) to service_role;
-grant execute on function public.append_conversation_message(uuid, text, text, text, text, text, integer) to service_role;
+grant execute on function public.append_conversation_message(uuid, text, text, text, text, text, integer, text, text) to service_role;
 grant execute on function public.bump_rate_limit(text, integer, integer) to service_role;
 
 -- =====================================================================
@@ -423,4 +493,21 @@ update public.stores set ai_tone = 'ramah'
 alter table public.store_devices add column if not exists autoread boolean;
 alter table public.store_devices add column if not exists last_inbound_at timestamptz;
 alter table public.store_devices add column if not exists last_inbound_note text;
+
+-- Alamat pembeli yang dipancing AI (nama sudah ada sejak awal sebagai
+-- `customer_name`, tapi dulu tidak pernah ditulis aplikasi).
+alter table public.conversations add column if not exists customer_address text;
+
+-- Cakupan produk per nomor WhatsApp. `[]` = nomor umum (semua produk).
+-- Sengaja default `[]` dan NOT NULL supaya kode tidak perlu membedakan
+-- "belum diatur" dari "umum" — keduanya berarti hal yang sama.
+alter table public.store_devices add column if not exists product_ids jsonb not null default '[]'::jsonb;
+
+-- Daftar pesanan pembeli. Tabel + indeks + RLS + trigger-nya sudah dibuat di
+-- bagian atas file dengan `if not exists`, jadi tidak ada yang perlu diulang di
+-- sini; baris ini hanya memastikan kolom yang ditambahkan setelah rilis pertama
+-- ikut menyusul di database yang sudah jalan.
+alter table public.buyer_orders add column if not exists shipping_courier text;
+alter table public.buyer_orders add column if not exists shipping_cost integer;
+alter table public.buyer_orders add column if not exists note text;
 

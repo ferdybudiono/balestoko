@@ -295,6 +295,76 @@ export function formatPaymentInstructions(payment: PaymentSettings): string {
 //  Perekat
 // ─────────────────────────────────────────────────────────────────────────────
 
+export interface OrderConfirmParams {
+  draft: OrderDraft;
+  /** Nama & alamat yang sudah terekam (dari chat sebelumnya atau pesan ini). */
+  customerName?: string | null;
+  customerAddress?: string | null;
+  destinationCity?: string | null;
+  payment?: PaymentSettings;
+  includePayment?: boolean;
+  /**
+   * Pertanyaan pemancing untuk data yang belum ada — disusun
+   * `lib/customer-slots.ts` dan diteruskan sebagai teks biasa supaya modul ini
+   * tetap tidak tahu-menahu soal aturan pembacaan slot.
+   */
+  identityAsk?: string;
+  /** Pengakuan singkat bahwa data baru barusan tercatat. */
+  ack?: string;
+}
+
+/**
+ * Balasan untuk pembeli yang MEMESAN: rincian pesanan + data penerima yang sudah
+ * tercatat + pancingan data yang belum ada + cara bayar.
+ *
+ * Sama seperti `buildOngkirReply`, seluruh angka di sini berasal dari `draft`
+ * yang sudah dihitung sistem. Balasan ini juga yang dipakai bila AI mati atau
+ * hasil tulis-ulangnya ditolak pemeriksaan angka.
+ */
+export function buildOrderConfirmReply(params: OrderConfirmParams): string {
+  const {
+    draft,
+    customerName,
+    customerAddress,
+    destinationCity,
+    payment,
+    includePayment = true,
+    identityAsk,
+    ack
+  } = params;
+
+  const blocks: string[] = [];
+
+  if (draft.lines.length > 0) blocks.push(formatOrderSummary(draft));
+
+  // Data penerima DIBACAKAN ULANG supaya pembeli bisa mengoreksi salah tulis
+  // sebelum barang dikirim — dan supaya jelas bahwa datanya benar-benar dicatat,
+  // bukan sekadar ditanyakan.
+  const identity: string[] = [];
+  if (customerName) identity.push(`👤 Nama: *${customerName}*`);
+  if (customerAddress) identity.push(`🏠 Alamat: ${customerAddress}`);
+  else if (destinationCity) identity.push(`📍 Tujuan: ${destinationCity}`);
+  if (identity.length > 0) blocks.push(`*Data penerima*\n${identity.join("\n")}`);
+
+  if (ack && ack.trim()) blocks.push(ack.trim());
+
+  if (identityAsk && identityAsk.trim()) {
+    blocks.push(identityAsk.trim());
+  } else {
+    blocks.push(
+      "Pesanan Kakak sudah kami catat dan diteruskan ke tim untuk diproses ya 🙏 " +
+        "Kalau ada yang mau diubah, kabari saja."
+    );
+  }
+
+  if (includePayment && payment) {
+    const paymentBlock = formatPaymentInstructions(payment).trimEnd();
+    if (paymentBlock) blocks.push(paymentBlock);
+  }
+
+  return blocks.join("\n\n").trim();
+}
+
 export interface OngkirReplyParams {
   draft: OrderDraft;
   /** Tarif dari Mengantar (sudah tersaring ekspedisi aktif). */

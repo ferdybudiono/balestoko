@@ -219,7 +219,10 @@ export async function POST(req: Request) {
       store,
       sender,
       messageText,
-      deviceToken: device.fonnte_token
+      deviceToken: device.fonnte_token,
+      // Device penerima ikut dikirim: katalog yang dijawab nomor ini bisa
+      // dipersempit pemilik toko, dan pesanan dicatat atas nama nomor tersebut.
+      device
     });
 
     await noteInbound(

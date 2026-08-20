@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Bot, MapPin, MessageSquare, Search, User } from "lucide-react";
+import { ArrowLeft, Bot, Home, MapPin, MessageSquare, Search, User } from "lucide-react";
 import {
   clockTime,
+  conversationLabel,
   dayLabel,
   formatPhoneDisplay,
   intentLabel,
@@ -43,6 +44,7 @@ export default function ChatsTab({ conversations, selectedPhone, onSelect }: Cha
       if (c.customer_phone.toLowerCase().includes(q)) return true;
       if ((c.customer_name || "").toLowerCase().includes(q)) return true;
       if ((c.destination_city || "").toLowerCase().includes(q)) return true;
+      if ((c.customer_address || "").toLowerCase().includes(q)) return true;
       return (c.messages || []).some((m) => (m.content || "").toLowerCase().includes(q));
     });
   }, [conversations, query]);
@@ -106,7 +108,7 @@ export default function ChatsTab({ conversations, selectedPhone, onSelect }: Cha
             <input
               type="search"
               aria-label="Cari percakapan"
-              placeholder="Cari nomor, kota, isi pesan…"
+              placeholder="Cari nama, kota, nomor, isi pesan…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm text-ink placeholder:text-slate-400 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
@@ -136,7 +138,7 @@ export default function ChatsTab({ conversations, selectedPhone, onSelect }: Cha
                     >
                       <div className="flex items-baseline justify-between gap-2">
                         <span className="font-semibold text-sm text-ink truncate">
-                          {c.customer_name || formatPhoneDisplay(c.customer_phone)}
+                          {conversationLabel(c)}
                         </span>
                         <span className="text-[10px] text-slate-400 shrink-0">
                           {relativeTime(c.updated_at || last?.timestamp)}
@@ -181,11 +183,12 @@ export default function ChatsTab({ conversations, selectedPhone, onSelect }: Cha
                 </button>
                 <div className="min-w-0 flex-1">
                   <p className="font-semibold text-sm text-ink truncate">
-                    {selected.customer_name || formatPhoneDisplay(selected.customer_phone)}
+                    {conversationLabel(selected)}
                   </p>
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 mt-0.5">
                     <span className="text-[11px] text-slate-400">
-                      {messageCount} pesan · {relativeTime(selected.updated_at)}
+                      {formatPhoneDisplay(selected.customer_phone)} · {messageCount} pesan ·{" "}
+                      {relativeTime(selected.updated_at)}
                     </span>
                     {selected.destination_city && (
                       <span className="inline-flex items-center gap-1 text-[11px] font-medium text-brand-700">
@@ -194,6 +197,15 @@ export default function ChatsTab({ conversations, selectedPhone, onSelect }: Cha
                       </span>
                     )}
                   </div>
+                  {/* Alamat yang sudah direkam bot ditampilkan penuh: ini data yang
+                      dipakai mengirim barang, jadi pemilik toko harus bisa
+                      membacanya tanpa menelusuri isi chat. */}
+                  {selected.customer_address && (
+                    <p className="flex items-start gap-1 text-[11px] text-slate-500 mt-1">
+                      <Home className="w-3 h-3 mt-0.5 shrink-0" aria-hidden="true" />
+                      <span className="break-words">{selected.customer_address}</span>
+                    </p>
+                  )}
                 </div>
               </div>
 

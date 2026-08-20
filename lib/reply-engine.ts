@@ -1,12 +1,18 @@
-import { processAICustomerService, type AIProcessResult } from "@/lib/ai";
+import { processAICustomerService, type AIProcessResult, type ChatMessage } from "@/lib/ai";
 import { sendFonnteMessage } from "@/lib/fonnte";
 import { aiContextMessagesForPackage, monthlyConversationLimit, monthStartMs } from "@/lib/packages";
 import {
   bumpRateLimit,
   countConversationsThisMonth,
   getConversation,
+  getOpenBuyerOrder,
   getProductsByStoreId,
+  normalizeDeviceProductIds,
+  recordBuyerOrder,
   saveConversationMessage,
+  type BuyerOrderItem,
+  type ProductRecord,
+  type StoreDeviceRecord,
   type StoreRecord
 } from "@/lib/supabase";
 
@@ -23,6 +29,11 @@ export interface AutoReplyOutcome {
   /** Balasan benar-benar terkirim lewat WhatsApp (bukan hanya tersimpan). */
   delivered: boolean;
   deliveryError?: string;
+  /** Nama/alamat pembeli yang BARU terbaca dari pesan ini. */
+  capturedName?: string | null;
+  capturedAddress?: string | null;
+  /** Pesanan pembeli dicatat/diperbarui di daftar pesanan. */
+  orderRecorded?: boolean;
 }
 
 // ── Pembatas laju ────────────────────────────────────────────────────────
@@ -121,6 +132,37 @@ export async function checkConversationQuota(
 }
 
 /**
+ * Katalog yang DIJAWAB satu nomor.
+ *
+ * Paket Pro punya beberapa nomor, dan pemilik toko boleh mengkhususkan satu nomor
+ * untuk sebagian produk (mis. nomor grosir vs nomor ritel). Penyaringan dilakukan
+ * di sini — sebelum produk masuk ke prompt AI maupun ke pencocokan pesanan —
+ * supaya nomor itu tidak pernah bisa mengutip harga produk yang bukan urusannya.
+ *
+ * Daftar kosong = nomor umum: seluruh katalog. Begitu juga bila penyaringnya
+ * menyisakan nol produk (id produk sudah dihapus): lebih baik menjawab seluruh
+ * katalog daripada nomor yang mendadak bisu dan tidak tahu produk apa pun.
+ */
+function productsForDevice(
+  products: ProductRecord[],
+  device?: StoreDeviceRecord | null
+): ProductRecord[] {
+  const scope = normalizeDeviceProductIds(device?.product_ids);
+  if (scope.length === 0) return products;
+  const allowed = products.filter((p) => p.id && scope.includes(p.id));
+  return allowed.length > 0 ? allowed : products;
+}
+
+/** Balasan bot terakhir dalam riwayat — penanda slot apa yang sedang ditunggu. */
+function lastAssistantText(messages: ChatMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.role === "assistant" && m.content) return m.content;
+  }
+  return null;
+}
+
+/**
  * Olah satu pesan masuk: AI menyusun balasan, balasan dikirim ke pengirim,
  * lalu percakapan disimpan.
  */
@@ -134,16 +176,24 @@ export async function runAutoReply(params: {
    * dihubungi pembeli. Kosong = balasan hanya disusun & disimpan.
    */
   deviceToken?: string | null;
+  /**
+   * Baris device penerima. Dipakai untuk dua hal: mempersempit katalog ke produk
+   * yang memang dijawab nomor ini, dan mencatat pesanan atas nama nomor tersebut.
+   */
+  device?: StoreDeviceRecord | null;
   /** false = hanya susun balasan, jangan kirim lewat WhatsApp. */
   send?: boolean;
 }): Promise<AutoReplyOutcome> {
-  const { store, sender, messageText, deviceToken, send = true } = params;
+  const { store, sender, messageText, deviceToken, device, send = true } = params;
   const storeId = store.id || "";
 
-  const [products, conversation] = await Promise.all([
+  const [allProducts, conversation] = await Promise.all([
     storeId ? getProductsByStoreId(storeId) : Promise.resolve([]),
     storeId ? getConversation(storeId, sender) : Promise.resolve(null)
   ]);
+
+  const products = productsForDevice(allProducts, device);
+  const history = conversation?.messages || [];
 
   const aiResult = await processAICustomerService({
     messageText,
@@ -155,7 +205,7 @@ export async function runAutoReply(params: {
     mengantarApiKey: store.mengantar_api_key,
     defaultWeight: store.default_weight || 1000,
     products,
-    chatHistory: conversation?.messages || [],
+    chatHistory: history,
     // Memori percakapan = fitur berbayar. Riwayatnya tetap dikirim (dipakai
     // mendeteksi sapaan pertama), tapi hanya paket Pro yang riwayatnya ikut
     // masuk ke prompt model.
@@ -171,7 +221,13 @@ export async function runAutoReply(params: {
     paymentNote: store.payment_note,
     aiTone: store.ai_tone,
     includeTotal: store.ai_include_total ?? true,
-    includePayment: store.ai_include_payment ?? true
+    includePayment: store.ai_include_payment ?? true,
+    // Nama & alamat dari KOLOM percakapan, bukan dari memori model: paket Starter
+    // tidak mengirim riwayat ke model sama sekali, jadi tanpa ini fitur rekam
+    // identitas diam-diam hanya jalan di Pro.
+    knownCustomerName: conversation?.customer_name,
+    knownCustomerAddress: conversation?.customer_address,
+    lastAssistantMessage: lastAssistantText(history)
   });
 
   let delivered = false;
@@ -195,15 +251,29 @@ export async function runAutoReply(params: {
     }
   }
 
+  let orderRecorded = false;
+
   if (storeId) {
-    await saveConversationMessage(
+    await saveConversationMessage({
       storeId,
+      phone: sender,
+      userMsg: messageText,
+      assistantReply: aiResult.replyText,
+      intent: aiResult.intent,
+      destinationCity: aiResult.detectedCity,
+      customerName: aiResult.capturedName,
+      customerAddress: aiResult.capturedAddress
+    });
+
+    orderRecorded = await recordOrderFromReply({
+      storeId,
+      deviceId: device?.id || null,
       sender,
-      messageText,
-      aiResult.replyText,
-      aiResult.intent,
-      aiResult.detectedCity
-    );
+      conversationName: conversation?.customer_name,
+      conversationAddress: conversation?.customer_address,
+      conversationCity: conversation?.destination_city,
+      result: aiResult
+    });
   }
 
   return {
@@ -211,6 +281,91 @@ export async function runAutoReply(params: {
     intent: aiResult.intent,
     detectedCity: aiResult.detectedCity,
     delivered,
-    deliveryError
+    deliveryError,
+    capturedName: aiResult.capturedName,
+    capturedAddress: aiResult.capturedAddress,
+    orderRecorded
   };
+}
+
+/**
+ * Catat pesanan pembeli ke daftar pesanan toko — bila memang sudah layak dicatat.
+ *
+ * Aturan yang dipakai (sengaja ketat, sebab daftar pesanan yang penuh oleh orang
+ * yang cuma bertanya harga jadi tidak berguna):
+ *
+ * - BARIS BARU hanya dibuat kalau ada produk yang jelas DAN ada tanda pembeli
+ *   sungguh melanjutkan: kata memesan, tujuan pengiriman, atau alamat yang baru
+ *   diberikan.
+ * - Kalau pesanan pembeli ini sudah ada dan masih berjalan, pesan apa pun
+ *   berikutnya boleh MEMPERBARUI-nya (nama, alamat, kota, tambahan barang) —
+ *   termasuk pesan yang tidak memuat kata memesan sama sekali, karena "Jl.
+ *   Merdeka 10" adalah jawaban atas pertanyaan bot, bukan pesanan baru.
+ *
+ * Gagal mencatat TIDAK boleh menggagalkan balasan: pembeli sudah menerima pesan
+ * WhatsApp-nya, dan menggagalkan request setelah itu hanya membuat webhook Fonnte
+ * mengirim ulang pesan yang sama.
+ */
+async function recordOrderFromReply(params: {
+  storeId: string;
+  deviceId: string | null;
+  sender: string;
+  conversationName?: string | null;
+  conversationAddress?: string | null;
+  conversationCity?: string | null;
+  result: AIProcessResult;
+}): Promise<boolean> {
+  const {
+    storeId,
+    deviceId,
+    sender,
+    conversationName,
+    conversationAddress,
+    conversationCity,
+    result
+  } = params;
+
+  const draft = result.orderDraft;
+  const lines = draft?.lines?.filter((l) => l.units > 0) || [];
+  const city = result.detectedCity || conversationCity || null;
+
+  const worthCreating =
+    lines.length > 0 && (result.orderCommit === true || !!result.detectedCity || !!result.capturedAddress);
+
+  if (!worthCreating) {
+    // Belum layak jadi baris baru — tapi kalau pesanannya sudah berjalan, data
+    // baru dari pesan ini tetap harus menempel ke sana.
+    const hasUpdate = !!(result.capturedName || result.capturedAddress || city || lines.length > 0);
+    if (!hasUpdate) return false;
+    const open = await getOpenBuyerOrder(storeId, sender);
+    if (!open) return false;
+  }
+
+  const items: BuyerOrderItem[] = lines.map((l) => ({
+    name: l.name,
+    units: l.units,
+    price: l.price,
+    weight: l.weight,
+    line_total: l.lineTotal
+  }));
+
+  const res = await recordBuyerOrder({
+    store_id: storeId,
+    device_id: deviceId,
+    customer_phone: sender,
+    // Nama & alamat gabungan: yang baru terbaca lebih diutamakan, tapi data lama
+    // tetap dikirim supaya baris BARU tidak lahir tanpa identitas yang sudah
+    // diketahui dari chat sebelumnya.
+    customer_name: result.capturedName || conversationName || null,
+    customer_address: result.capturedAddress || conversationAddress || null,
+    destination_city: city,
+    items,
+    subtotal: draft?.subtotal || 0,
+    weight_gram: draft?.weightGram || 0
+  });
+
+  if (!res.ok && !res.skipped) {
+    console.warn("[auto-reply] pesanan gagal dicatat:", res.error);
+  }
+  return res.ok === true;
 }

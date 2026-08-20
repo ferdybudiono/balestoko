@@ -5,6 +5,7 @@ import {
   CheckCircle,
   Inbox,
   Info,
+  Package,
   Plus,
   QrCode,
   RefreshCw,
@@ -17,7 +18,7 @@ import {
   Wrench,
   Lock
 } from "lucide-react";
-import type { StoreDevice } from "./types";
+import type { Product, StoreDevice } from "./types";
 import { formatPhoneDisplay, isDeviceConnected, isInboundReady, relativeTime } from "./types";
 
 interface WhatsappTabProps {
@@ -46,6 +47,13 @@ interface WhatsappTabProps {
   onAddDevice: () => void;
   removingDeviceId: string | null;
   onRemoveDevice: (device: StoreDevice) => void;
+
+  /** Katalog toko — sumber pilihan "produk yang dijawab nomor ini". */
+  products: Product[];
+  /** Nomor yang cakupan produknya sedang disimpan. */
+  savingScopeId: string | null;
+  /** `[]` = nomor umum (menjawab seluruh katalog). */
+  onSaveScope: (deviceId: string, productIds: string[]) => void;
 
   /** Device yang QR-nya sedang ditampilkan. */
   qrDeviceId: string | null;
@@ -84,6 +92,9 @@ export default function WhatsappTab({
   onAddDevice,
   removingDeviceId,
   onRemoveDevice,
+  products,
+  savingScopeId,
+  onSaveScope,
   qrDeviceId,
   qrUrl,
   loadingQr,
@@ -330,6 +341,18 @@ export default function WhatsappTab({
                         expectedWebhookUrl={expectedWebhookUrl}
                         repairing={!!device.id && repairingDeviceId === device.id}
                         onRepair={() => onRepairDevice(device)}
+                      />
+                    )}
+
+                    {/* Produk yang dijawab nomor ini (paket Pro: bagi tugas antar nomor) */}
+                    {!!device.id && !devicesNeedMigration && !overLimit && (
+                      <ScopePanel
+                        key={`scope-${device.id}`}
+                        device={device}
+                        products={products}
+                        multiNumberPlan={deviceLimit > 1}
+                        saving={savingScopeId === device.id}
+                        onSave={(ids) => onSaveScope(device.id!, ids)}
                       />
                     )}
 
@@ -779,6 +802,167 @@ function InboundPanel({
           >
             {expectedWebhookUrl}
           </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Produk yang DIJAWAB satu nomor WhatsApp.
+ *
+ * Gunanya di paket Pro (3 nomor): satu nomor bisa dikhususkan untuk sebagian
+ * katalog, mis. nomor 1 untuk produk A & B, nomor 2 untuk B, nomor 3 untuk C & D.
+ * Katalog yang masuk ke prompt AI ikut dipersempit, jadi bot tidak menawarkan
+ * barang yang bukan urusan nomor itu.
+ *
+ * `[]` berarti "nomor umum" — seluruh katalog. Itu default-nya, dan sengaja:
+ * nomor baru yang tiba-tiba tidak mengenali produk apa pun jauh lebih merugikan
+ * daripada nomor yang menjawab terlalu luas.
+ */
+function ScopePanel({
+  device,
+  products,
+  multiNumberPlan,
+  saving,
+  onSave
+}: {
+  device: StoreDevice;
+  products: Product[];
+  /** Paket dengan lebih dari satu nomor — di Starter fitur ini tak ada gunanya. */
+  multiNumberPlan: boolean;
+  saving: boolean;
+  onSave: (productIds: string[]) => void;
+}) {
+  const scope = (device.product_ids || []).filter((id) => !!id);
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState<string[]>(scope);
+
+  // Di Starter (1 nomor) panel ini hanya jadi kebisingan — kecuali toko itu
+  // pernah di Pro dan masih menyimpan batasan yang harus bisa dilepas kembali.
+  if (!multiNumberPlan && scope.length === 0) return null;
+  if (products.length === 0) return null;
+
+  const named = products.filter((p) => p.id && scope.includes(p.id));
+  // Id yang tersisa tapi produknya sudah dihapus dari katalog: jangan diam-diam
+  // dibuang dari tampilan, pemilik toko perlu tahu daftarnya sudah tidak utuh.
+  const missingCount = scope.length - named.length;
+
+  function toggle(id: string) {
+    setDraft((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  return (
+    <div className="px-4 pb-4 -mt-1">
+      <div className="p-3.5 border border-slate-200 bg-slate-50 rounded-xl space-y-2.5">
+        <div className="flex items-start justify-between gap-3">
+          <p className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+            <Package className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            Produk yang dijawab nomor ini
+          </p>
+          {!open && (
+            <button
+              type="button"
+              onClick={() => {
+                setDraft(scope);
+                setOpen(true);
+              }}
+              className="shrink-0 px-2.5 py-1 rounded-lg border border-slate-300 bg-white text-[11px] font-semibold text-slate-700 hover:border-brand-300 hover:text-brand-700 transition-colors"
+            >
+              Atur
+            </button>
+          )}
+        </div>
+
+        {!open ? (
+          <p className="text-[11px] text-slate-600 leading-relaxed">
+            {scope.length === 0 ? (
+              <>
+                <strong>Semua produk</strong> — nomor umum, bot menjawab seluruh katalog.
+              </>
+            ) : (
+              <>
+                {named.map((p) => p.name).join(", ") || "—"}
+                {missingCount > 0 && (
+                  <span className="text-amber-700">
+                    {" "}
+                    (+{missingCount} produk yang sudah dihapus dari katalog)
+                  </span>
+                )}
+              </>
+            )}
+          </p>
+        ) : (
+          <div className="space-y-2.5">
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              Centang produk yang boleh ditawarkan lewat nomor ini. Tanpa centang sama sekali,
+              nomor ini menjadi <strong>nomor umum</strong> dan menjawab seluruh katalog.
+            </p>
+
+            <fieldset className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+              <legend className="sr-only">
+                Produk yang dijawab {formatPhoneDisplay(device.phone)}
+              </legend>
+              {products.map((p) => {
+                if (!p.id) return null;
+                const id = p.id;
+                const inputId = `scope-${device.id}-${id}`;
+                return (
+                  <label
+                    key={id}
+                    htmlFor={inputId}
+                    className="flex items-center gap-2 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg cursor-pointer hover:border-brand-200"
+                  >
+                    <input
+                      id={inputId}
+                      type="checkbox"
+                      checked={draft.includes(id)}
+                      onChange={() => toggle(id)}
+                      disabled={saving}
+                      className="w-3.5 h-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-200"
+                    />
+                    <span className="text-[11px] text-ink truncate">{p.name}</span>
+                  </label>
+                );
+              })}
+            </fieldset>
+
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  onSave(draft);
+                  setOpen(false);
+                }}
+                disabled={saving}
+                className="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 disabled:opacity-60 text-white text-[11px] font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+              >
+                {saving && <RefreshCw className="w-3 h-3 animate-spin" aria-hidden="true" />}
+                <span>{saving ? "Menyimpan…" : "Simpan"}</span>
+              </button>
+              {draft.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setDraft([])}
+                  disabled={saving}
+                  className="text-[11px] font-medium text-slate-500 hover:text-ink"
+                >
+                  Jadikan nomor umum
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setDraft(scope);
+                  setOpen(false);
+                }}
+                disabled={saving}
+                className="text-[11px] font-medium text-slate-400 hover:text-slate-600 ml-auto"
+              >
+                Batal
+              </button>
+            </div>
+          </div>
         )}
       </div>
     </div>

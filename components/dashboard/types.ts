@@ -20,11 +20,65 @@ export interface Conversation {
   id?: string;
   customer_phone: string;
   customer_name?: string;
+  /** Alamat kirim yang sudah dipancing & direkam bot. */
+  customer_address?: string;
   messages: ChatMessage[];
   last_intent?: string;
   destination_city?: string;
   updated_at?: string;
   created_at?: string;
+}
+
+/** Satu baris barang di pesanan pembeli. */
+export interface BuyerOrderItem {
+  name: string;
+  units: number;
+  price: number;
+  weight: number;
+  line_total: number;
+}
+
+/**
+ * Pesanan pembeli hasil rekaman bot — isi tab "Pesanan".
+ *
+ * Bukan `Order` (pembayaran langganan SaaS lewat Midtrans). Dua hal berbeda yang
+ * kebetulan sama-sama bernama "order"; menyamakannya berarti mencampur uang
+ * langganan dengan pesanan pembeli.
+ */
+export interface BuyerOrder {
+  id?: string;
+  customer_phone: string;
+  customer_name?: string | null;
+  customer_address?: string | null;
+  destination_city?: string | null;
+  items: BuyerOrderItem[];
+  subtotal: number;
+  weight_gram: number;
+  shipping_courier?: string | null;
+  shipping_cost?: number | null;
+  note?: string | null;
+  status?: "new" | "done";
+  done_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/**
+ * Label pembeli di daftar chat: "Nama · Kota".
+ *
+ * Nomor telepon dipakai hanya bila nama belum terekam — nama & kota jauh lebih
+ * cepat dikenali pemilik toko saat menelusuri percakapan. `customer_name` dari
+ * database punya default 'Pembeli WA', jadi nilai itu ikut dianggap "belum ada".
+ */
+export function conversationLabel(c: {
+  customer_name?: string | null;
+  customer_phone: string;
+  destination_city?: string | null;
+}): string {
+  const name = (c.customer_name || "").trim();
+  const city = (c.destination_city || "").trim();
+  const head = name && name.toLowerCase() !== "pembeli wa" ? name : formatPhoneDisplay(c.customer_phone);
+  return city ? `${head} · ${city}` : head;
 }
 
 export interface FonnteStatus {
@@ -67,6 +121,14 @@ export interface StoreDevice {
   last_inbound_at?: string | null;
   /** Apa yang terjadi pada pesan masuk terakhir (dibalas / diabaikan + alasan). */
   last_inbound_note?: string | null;
+
+  /**
+   * Id produk yang DIJAWAB nomor ini. `[]` = nomor umum: seluruh katalog.
+   *
+   * Paket Pro punya 3 nomor, jadi satu nomor bisa dikhususkan untuk sebagian
+   * produk — katalog yang masuk ke prompt AI ikut dipersempit.
+   */
+  product_ids?: string[];
 }
 
 /** Jalur terima nomor ini siap? `null` = belum bisa disimpulkan. */
@@ -82,7 +144,7 @@ export function isDeviceConnected(device: StoreDevice): boolean {
   return String(device.device_status || "").toUpperCase() === "CONNECTED";
 }
 
-export type TabId = "overview" | "whatsapp" | "store" | "products" | "chats";
+export type TabId = "overview" | "whatsapp" | "store" | "products" | "orders" | "chats";
 
 export type ShowToast = (msg: string, type?: "success" | "error") => void;
 
@@ -91,7 +153,8 @@ export const INTENT_LABELS: Record<string, string> = {
   GREETING: "Sapaan",
   ONGKIR_CHECK: "Cek ongkir",
   PRODUCT_INQUIRY: "Tanya produk",
-  GENERAL_CHAT: "Obrolan umum"
+  GENERAL_CHAT: "Obrolan umum",
+  ORDER: "Pesanan"
 };
 
 export function intentLabel(intent?: string | null): string {

@@ -101,6 +101,15 @@ export interface StoreDeviceRecord {
   /** Apa yang terjadi pada pesan masuk terakhir ("Dibalas AI", alasan diabaikan, …). */
   last_inbound_note?: string | null;
   is_primary?: boolean;
+  /**
+   * Id produk yang dijawab nomor ini. `[]` (atau tidak ada) = nomor umum:
+   * menjawab SELURUH katalog toko.
+   *
+   * Disimpan sebagai jsonb array of string di database. Paket Pro punya 3 nomor,
+   * jadi satu nomor bisa dikhususkan untuk sebagian produk — katalog yang masuk
+   * ke prompt AI dan pencocokan pesanan ikut dipersempit.
+   */
+  product_ids?: string[] | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -121,11 +130,50 @@ export interface ConversationRecord {
   store_id: string;
   customer_phone: string;
   customer_name?: string;
+  /** Alamat kirim yang dipancing AI dari chat. */
+  customer_address?: string | null;
   messages: Array<{ role: "user" | "assistant"; content: string; timestamp?: string }>;
   last_intent?: string;
   destination_city?: string;
   updated_at?: string;
   created_at?: string;
+}
+
+/** Satu baris produk di dalam pesanan pembeli (snapshot, bukan referensi). */
+export interface BuyerOrderItem {
+  name: string;
+  units: number;
+  price: number;
+  weight: number;
+  line_total: number;
+}
+
+/**
+ * Pesanan PEMBELI hasil rekaman AI.
+ *
+ * Bukan `OrderRecord` — itu pembayaran langganan SaaS lewat Midtrans. Tabelnya
+ * pun berbeda (`buyer_orders` vs `orders`); mencampurnya akan mengacaukan
+ * penagihan.
+ */
+export interface BuyerOrderRecord {
+  id?: string;
+  store_id: string;
+  device_id?: string | null;
+  customer_phone: string;
+  customer_name?: string | null;
+  customer_address?: string | null;
+  destination_city?: string | null;
+  items: BuyerOrderItem[];
+  subtotal: number;
+  weight_gram: number;
+  shipping_courier?: string | null;
+  shipping_cost?: number | null;
+  note?: string | null;
+  /** 'new' = belum diproses toko; 'done' = sudah diproses. */
+  status?: "new" | "done";
+  done_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface OrderRecord {
@@ -527,6 +575,8 @@ export interface PublicStoreDevice {
   autoread: boolean | null;
   last_inbound_at: string | null;
   last_inbound_note: string | null;
+  /** Id produk yang dijawab nomor ini; `[]` = nomor umum (semua produk). */
+  product_ids: string[];
 }
 
 export function toPublicDevice(device: StoreDeviceRecord): PublicStoreDevice {
@@ -540,8 +590,31 @@ export function toPublicDevice(device: StoreDeviceRecord): PublicStoreDevice {
     created_at: device.created_at,
     autoread: device.autoread ?? null,
     last_inbound_at: device.last_inbound_at || null,
-    last_inbound_note: device.last_inbound_note || null
+    last_inbound_note: device.last_inbound_note || null,
+    product_ids: normalizeDeviceProductIds(device.product_ids)
   };
+}
+
+/**
+ * Bersihkan daftar id produk milik sebuah nomor.
+ *
+ * Dipakai baik saat MENYIMPAN (dari body request) maupun saat MEMBACA (kolom
+ * jsonb bisa berisi apa saja bila pernah diisi manual di SQL Editor). `[]`
+ * selalu bermakna "nomor umum", jadi nilai tak dikenal dibuang senyap ketimbang
+ * membuat nomor berhenti menjawab.
+ */
+export function normalizeDeviceProductIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || out.includes(id)) continue;
+    out.push(id);
+    // Katalog dibatasi 300 produk; daftar sepanjang itu sama saja dengan "umum".
+    if (out.length >= 300) break;
+  }
+  return out;
 }
 
 /**
@@ -1058,15 +1131,27 @@ const MAX_STORED_MESSAGES = 200;
  * Bila RPC belum ada (DB belum menjalankan `supabase/schema.sql` versi terbaru),
  * fungsi ini jatuh ke jalur baca-ubah-tulis yang lama supaya bot tetap membalas —
  * dengan peringatan di log, karena jalur itu punya celah lost-update.
+ *
+ * `customerName` / `customerAddress` hanya dikirim bila pesan ini memang
+ * mengandungnya. Nilai kosong berarti "jangan ubah yang sudah tersimpan", bukan
+ * "hapus" — pembeli tidak menyebut namanya lagi di setiap chat.
  */
-export async function saveConversationMessage(
-  storeId: string,
-  phone: string,
-  userMsg: string,
-  assistantReply: string,
-  intent?: string,
-  destinationCity?: string
-): Promise<DbResult> {
+export interface SaveConversationInput {
+  storeId: string;
+  phone: string;
+  userMsg: string;
+  assistantReply: string;
+  intent?: string;
+  destinationCity?: string;
+  customerName?: string | null;
+  customerAddress?: string | null;
+}
+
+export async function saveConversationMessage(input: SaveConversationInput): Promise<DbResult> {
+  const { storeId, phone, userMsg, assistantReply, intent, destinationCity } = input;
+  const customerName = (input.customerName || "").trim() || null;
+  const customerAddress = (input.customerAddress || "").trim() || null;
+
   const cfg = getConfig();
   if (!cfg) return { ok: false, skipped: true };
 
@@ -1081,7 +1166,9 @@ export async function saveConversationMessage(
         p_assistant_reply: assistantReply,
         p_intent: intent ?? null,
         p_destination_city: destinationCity ?? null,
-        p_max_messages: MAX_STORED_MESSAGES
+        p_max_messages: MAX_STORED_MESSAGES,
+        p_customer_name: customerName,
+        p_customer_address: customerAddress
       }),
       cache: "no-store"
     });
@@ -1089,6 +1176,11 @@ export async function saveConversationMessage(
     if (res.ok) return { ok: true };
 
     // 404 = fungsi belum ada di DB ini. Selain itu, kegagalan nyata.
+    //
+    // Versi RPC LAMA (tanpa dua parameter terakhir) menolak dengan 404 juga —
+    // PostgREST tidak menemukan fungsi dengan tanda tangan yang diminta — jadi
+    // toko yang belum menjalankan SQL terbaru otomatis memakai jalur lama dan
+    // botnya tetap membalas.
     if (res.status !== 404) {
       const text = await res.text().catch(() => "");
       return { ok: false, error: `append rpc ${res.status}: ${text}` };
@@ -1098,21 +1190,25 @@ export async function saveConversationMessage(
       "[supabase] RPC append_conversation_message belum ada — memakai jalur baca-ubah-tulis " +
         "yang bisa kehilangan pesan saat dua chat datang bersamaan. Jalankan ulang supabase/schema.sql."
     );
-    return saveConversationMessageLegacy(storeId, phone, userMsg, assistantReply, intent, destinationCity);
+    return saveConversationMessageLegacy({ ...input, customerName, customerAddress });
   } catch (err) {
     return { ok: false, error: String(err) };
   }
 }
 
 /** Jalur lama: baca array, tambah di memori, tulis ulang. Rawan lost-update. */
-async function saveConversationMessageLegacy(
-  storeId: string,
-  phone: string,
-  userMsg: string,
-  assistantReply: string,
-  intent?: string,
-  destinationCity?: string
-): Promise<DbResult> {
+async function saveConversationMessageLegacy(input: SaveConversationInput): Promise<DbResult> {
+  const {
+    storeId,
+    phone,
+    userMsg,
+    assistantReply,
+    intent,
+    destinationCity,
+    customerName,
+    customerAddress
+  } = input;
+
   const cfg = getConfig();
   if (!cfg) return { ok: false, skipped: true };
 
@@ -1137,10 +1233,30 @@ async function saveConversationMessageLegacy(
           messages: trimmed,
           last_intent: intent || existing.last_intent,
           destination_city: destinationCity || existing.destination_city,
+          customer_name: customerName || existing.customer_name,
+          customer_address: customerAddress || existing.customer_address,
           updated_at: nowStr
         }),
         cache: "no-store"
       });
+
+      // Kolom `customer_address` mungkin belum ada di DB yang belum dimigrasi.
+      // Nama & alamat itu pelengkap; kehilangan seluruh pesan karenanya jauh
+      // lebih buruk, jadi ulangi tanpa kolom baru itu.
+      if (!res.ok && res.status === 400 && customerAddress) {
+        res = await fetch(url, {
+          method: "PATCH",
+          headers: headers(cfg.key, "return=representation"),
+          body: JSON.stringify({
+            messages: trimmed,
+            last_intent: intent || existing.last_intent,
+            destination_city: destinationCity || existing.destination_city,
+            customer_name: customerName || existing.customer_name,
+            updated_at: nowStr
+          }),
+          cache: "no-store"
+        });
+      }
     } else {
       res = await fetch(`${cfg.url}/rest/v1/conversations`, {
         method: "POST",
@@ -1150,10 +1266,28 @@ async function saveConversationMessageLegacy(
           customer_phone: phone,
           messages: trimmed,
           last_intent: intent,
-          destination_city: destinationCity
+          destination_city: destinationCity,
+          customer_name: customerName || undefined,
+          customer_address: customerAddress || undefined
         }),
         cache: "no-store"
       });
+
+      if (!res.ok && res.status === 400 && customerAddress) {
+        res = await fetch(`${cfg.url}/rest/v1/conversations`, {
+          method: "POST",
+          headers: headers(cfg.key, "return=representation"),
+          body: JSON.stringify({
+            store_id: storeId,
+            customer_phone: phone,
+            messages: trimmed,
+            last_intent: intent,
+            destination_city: destinationCity,
+            customer_name: customerName || undefined
+          }),
+          cache: "no-store"
+        });
+      }
     }
 
     return { ok: res.ok };
@@ -1246,6 +1380,233 @@ export async function getStoreAuthMeta(
     return { password_changed_at: list[0]?.password_changed_at ?? null };
   } catch {
     return undefined;
+  }
+}
+
+// ---------------- PESANAN PEMBELI (buyer_orders) ----------------
+
+/** Batas baris yang dikirim ke dashboard sekali muat. */
+export const BUYER_ORDERS_PAGE_SIZE = 200;
+
+/**
+ * `true` bila kegagalan PostgREST berarti "tabel/kolom belum ada".
+ *
+ * Dipakai supaya kode yang dideploy SEBELUM `supabase/schema.sql` dijalankan
+ * tidak membuat bot berhenti membalas — pesanan tidak tercatat (dan itu terlihat
+ * di dashboard), tapi chat pembeli tetap dijawab.
+ */
+function isMissingSchema(status: number): boolean {
+  return status === 404 || status === 400;
+}
+
+/**
+ * Daftar pesanan pembeli sebuah toko, terbaru di atas.
+ *
+ * `null` = tabel belum ada (SQL terbaru belum dijalankan). Dibedakan dari `[]`
+ * karena dashboard perlu menampilkan ajakan menjalankan migrasi, bukan
+ * "belum ada pesanan".
+ */
+export async function listBuyerOrders(storeId: string): Promise<BuyerOrderRecord[] | null> {
+  const cfg = getConfig();
+  if (!cfg || !storeId) return [];
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/buyer_orders?store_id=eq.${encodeURIComponent(storeId)}` +
+      `&order=created_at.desc&limit=${BUYER_ORDERS_PAGE_SIZE}`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      if (isMissingSchema(res.status)) return null;
+      console.error("[supabase] listBuyerOrders gagal:", res.status);
+      return [];
+    }
+    const list = await res.json();
+    return Array.isArray(list) ? (list as BuyerOrderRecord[]) : [];
+  } catch (err) {
+    console.error("[supabase] listBuyerOrders error:", err);
+    return [];
+  }
+}
+
+/** Pesanan yang masih BERJALAN (belum ditandai selesai) untuk satu pembeli. */
+export async function getOpenBuyerOrder(
+  storeId: string,
+  phone: string
+): Promise<BuyerOrderRecord | null> {
+  const cfg = getConfig();
+  if (!cfg || !storeId || !phone) return null;
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/buyer_orders?store_id=eq.${encodeURIComponent(storeId)}` +
+      `&customer_phone=eq.${encodeURIComponent(phone)}&status=eq.new` +
+      `&order=created_at.desc&limit=1`;
+    const res = await fetch(url, {
+      headers: headers(cfg.key, "return=representation"),
+      cache: "no-store"
+    });
+    if (!res.ok) return null;
+    const list = await res.json();
+    return Array.isArray(list) && list.length > 0 ? (list[0] as BuyerOrderRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Catat / segarkan pesanan pembeli.
+ *
+ * Satu pesanan BERJALAN per pembeli: chat lanjutan memperbarui baris yang sama
+ * (pembeli menambah barang, menyebut alamat, memilih ekspedisi) alih-alih
+ * menumpuk baris baru setiap kali. Setelah toko menandainya selesai, pesanan
+ * berikutnya menjadi baris baru.
+ *
+ * Kegagalan di sini TIDAK boleh menggagalkan balasan — pemanggil hanya mencatat
+ * log. Itu sebabnya `skipped` dipakai untuk "tabelnya belum ada".
+ */
+export async function recordBuyerOrder(
+  order: Omit<BuyerOrderRecord, "id" | "created_at" | "updated_at">
+): Promise<DbResult<BuyerOrderRecord>> {
+  const cfg = getConfig();
+  if (!cfg || !order.store_id || !order.customer_phone) return { ok: false, skipped: true };
+
+  const payload: Record<string, unknown> = {
+    store_id: order.store_id,
+    device_id: order.device_id || null,
+    customer_phone: order.customer_phone,
+    items: order.items || [],
+    subtotal: Math.max(0, Math.round(order.subtotal || 0)),
+    weight_gram: Math.max(0, Math.round(order.weight_gram || 0)),
+    status: "new"
+  };
+  // Nilai kosong DIBUANG dari payload, bukan dikirim sebagai null: pesan
+  // lanjutan yang tidak menyebut alamat tidak boleh menghapus alamat yang sudah
+  // didapat dari pesan sebelumnya.
+  if (order.customer_name) payload.customer_name = order.customer_name;
+  if (order.customer_address) payload.customer_address = order.customer_address;
+  if (order.destination_city) payload.destination_city = order.destination_city;
+  if (order.shipping_courier) payload.shipping_courier = order.shipping_courier;
+  if (typeof order.shipping_cost === "number") payload.shipping_cost = order.shipping_cost;
+  if (order.note) payload.note = order.note;
+
+  try {
+    const existing = await getOpenBuyerOrder(order.store_id, order.customer_phone);
+
+    if (existing?.id) {
+      // Daftar barang hanya ditimpa bila pesan ini memang menyebut produk.
+      const patch = { ...payload };
+      delete patch.store_id;
+      delete patch.customer_phone;
+      delete patch.status;
+      if (!order.items || order.items.length === 0) {
+        delete patch.items;
+        delete patch.subtotal;
+        delete patch.weight_gram;
+      }
+
+      const res = await fetch(
+        `${cfg.url}/rest/v1/buyer_orders?id=eq.${encodeURIComponent(existing.id)}`,
+        {
+          method: "PATCH",
+          headers: headers(cfg.key, "return=representation"),
+          body: JSON.stringify(patch),
+          cache: "no-store"
+        }
+      );
+      if (!res.ok) {
+        if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+        const text = await res.text().catch(() => "");
+        return { ok: false, error: `buyer order update ${res.status}: ${text}` };
+      }
+      const data = await res.json();
+      return { ok: true, data: Array.isArray(data) ? data[0] : data };
+    }
+
+    const res = await fetch(`${cfg.url}/rest/v1/buyer_orders`, {
+      method: "POST",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify(payload),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      // 409 = indeks unik "satu pesanan berjalan per pembeli" menahan dua chat
+      // yang datang hampir bersamaan. Itu justru hasil yang benar: pesanannya
+      // sudah tercatat oleh request yang menang.
+      if (res.status === 409) return { ok: true, duplicate: true };
+      if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `buyer order insert ${res.status}: ${text}` };
+    }
+    const data = await res.json();
+    return { ok: true, data: Array.isArray(data) ? data[0] : data };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Tandai pesanan selesai / belum. `storeId` ikut disaring di PostgREST supaya
+ * satu toko tidak bisa mengubah pesanan toko lain hanya dengan menebak id.
+ */
+export async function setBuyerOrderStatus(
+  id: string,
+  storeId: string,
+  done: boolean
+): Promise<DbResult<BuyerOrderRecord>> {
+  const cfg = getConfig();
+  if (!cfg || !id || !storeId) return { ok: false, skipped: true };
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/buyer_orders?id=eq.${encodeURIComponent(id)}` +
+      `&store_id=eq.${encodeURIComponent(storeId)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify({
+        status: done ? "done" : "new",
+        done_at: done ? new Date().toISOString() : null
+      }),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `buyer order status ${res.status}: ${text}` };
+    }
+    const data = await res.json();
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) return { ok: false, error: "Pesanan tidak ditemukan." };
+    return { ok: true, data: row as BuyerOrderRecord };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Hapus satu pesanan (mis. salah rekam). Disaring `store_id` juga. */
+export async function deleteBuyerOrder(id: string, storeId: string): Promise<DbResult> {
+  const cfg = getConfig();
+  if (!cfg || !id || !storeId) return { ok: false, skipped: true };
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/buyer_orders?id=eq.${encodeURIComponent(id)}` +
+      `&store_id=eq.${encodeURIComponent(storeId)}`;
+    const res = await fetch(url, {
+      method: "DELETE",
+      headers: headers(cfg.key, "return=minimal"),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `buyer order delete ${res.status}: ${text}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
   }
 }
 
