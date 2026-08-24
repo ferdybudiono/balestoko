@@ -11,9 +11,11 @@ export const dynamic = "force-dynamic";
 /**
  * Webhook Payment Notification dari Midtrans.
  *
- * Set URL ini di Midtrans Dashboard:
- *   Settings -> Configuration -> Payment Notification URL
- *   => https://DOMAIN-ANDA/api/midtrans/notification
+ * URL ini TIDAK perlu disetel di dashboard Midtrans: setiap transaksi yang dibuat
+ * `/api/checkout` sudah membawa header `X-Override-Notification` berisi
+ * `https://DOMAIN-ANDA/api/midtrans/notification` (lihat `lib/midtrans.ts`).
+ * Itu yang membuat satu akun Midtrans aman dipakai beberapa project — kolom
+ * Payment Notification URL di dashboard hanya ada satu untuk seluruh akun.
  *
  * Midtrans mengirim POST JSON setiap kali status transaksi berubah.
  */
@@ -66,7 +68,21 @@ export async function POST(req: Request) {
 
   const internalStatus = mapMidtransStatus(transactionStatus, fraudStatus);
 
-  await updateOrderStatus(orderId, internalStatus, payload);
+  const result = await updateOrderStatus(orderId, internalStatus, payload);
+  const rows = Array.isArray(result.data) ? result.data : [];
+
+  // Satu akun Midtrans dipakai beberapa project dan server key-nya sama — jadi
+  // notifikasi milik project LAIN pun lolos verifikasi signature di atas. Order
+  // yang tidak ada di database ini bukan error: cukup dicatat lalu dijawab 200
+  // supaya Midtrans tidak mengulanginya, tanpa berpura-pura ada yang diperbarui.
+  if (result.ok && !result.skipped && !result.duplicate && rows.length === 0) {
+    console.warn(
+      "[webhook] order %s tidak ada di database ini — notifikasi diabaikan " +
+        "(kemungkinan milik project lain pada akun Midtrans yang sama).",
+      orderId
+    );
+    return NextResponse.json({ received: true, ignored: true });
+  }
 
   console.log(
     "[webhook] order %s -> %s (%s)",

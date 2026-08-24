@@ -52,6 +52,80 @@ export function isReachableBaseUrl(base: string): boolean {
 }
 
 /**
+ * Domain LAIN tempat aplikasi ini juga dilayani.
+ *
+ * Project ini dipasang di lebih dari satu domain (mis. `balestoko.my.id` dan
+ * `balestoko.vercel.app`). `NEXT_PUBLIC_BASE_URL` tetap SATU domain kanonik —
+ * ia yang didaftarkan ke Fonnte sebagai URL webhook device dan dipakai
+ * `metadataBase` untuk SEO, jadi nilainya tidak boleh berubah-ubah mengikuti
+ * domain yang sedang dibuka. Domain sisanya didaftarkan di sini, dan hanya
+ * dipakai untuk dua hal yang memang harus sadar-domain:
+ *   1. URL notifikasi Midtrans (semua domain didaftarkan, lihat `lib/midtrans.ts`)
+ *   2. Redirect balik pembeli setelah bayar (tetap di domain yang dia pakai)
+ */
+export function altBaseUrls(): string[] {
+  const raw = (process.env.NEXT_PUBLIC_ALT_BASE_URLS || "").trim();
+  if (!raw) return [];
+  const canonical = normalizeBaseUrl(process.env.NEXT_PUBLIC_BASE_URL);
+  const out: string[] = [];
+  for (const entry of raw.split(",")) {
+    const url = normalizeBaseUrl(entry);
+    if (!url || url === canonical || out.includes(url)) continue;
+    if (!/^https?:\/\//i.test(url) || !isReachableBaseUrl(url)) continue;
+    out.push(url);
+  }
+  return out;
+}
+
+/** Semua base URL publik aplikasi: domain kanonik lebih dulu, lalu domain lain. */
+export function knownBaseUrls(): string[] {
+  const canonical = normalizeBaseUrl(process.env.NEXT_PUBLIC_BASE_URL);
+  const list = canonical ? [canonical] : [];
+  return [...list, ...altBaseUrls()];
+}
+
+/** Buang spasi & garis miring di ujung; kembalikan "" bila kosong. */
+function normalizeBaseUrl(value?: string | null): string {
+  return (value || "").trim().replace(/\/+$/, "");
+}
+
+/** Origin request, dari header `Origin` lalu URL request itu sendiri. */
+function requestOrigin(req: Request): string {
+  const fromHeader = normalizeBaseUrl(req.headers.get("origin"));
+  if (fromHeader) return fromHeader;
+  try {
+    return normalizeBaseUrl(new URL(req.url).origin);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Base URL untuk mengembalikan PEMBELI ke aplikasi (mis. `finish` Snap).
+ *
+ * Beda dari `resolveBaseUrl()` yang selalu memilih domain kanonik: pembeli harus
+ * pulang ke domain yang BENAR-BENAR dia pakai. Cookie sesi terikat host, jadi
+ * pembeli yang checkout di `balestoko.my.id` lalu dilempar ke
+ * `balestoko.vercel.app` sesudah bayar akan tampak logout di halaman tujuan.
+ *
+ * Origin request datang dari klien, jadi tidak boleh dipercaya bulat-bulat:
+ * memakainya apa adanya berarti siapa pun bisa membuat transaksi yang
+ * mengembalikan pembeli ke domain milik penyerang ("pembayaran berhasil" palsu).
+ * Karena itu origin hanya dihormati bila cocok dengan salah satu domain yang
+ * SUDAH didaftarkan di ENV; kalau tidak, jatuh ke domain kanonik.
+ */
+export function resolveCallbackBaseUrl(req: Request): string {
+  const origin = requestOrigin(req);
+  const known = knownBaseUrls();
+
+  // ENV belum diisi (dev lokal): perilaku lama, ikut origin request.
+  if (known.length === 0) return origin || "http://localhost:3000";
+
+  const match = known.find((u) => u.toLowerCase() === origin.toLowerCase());
+  return match ?? known[0];
+}
+
+/**
  * URL webhook yang aman dikirim ke browser.
  *
  * `FONNTE_WEBHOOK_SECRET` adalah rahasia BERSAMA seluruh tenant: kalau nilainya

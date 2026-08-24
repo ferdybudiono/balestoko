@@ -5,6 +5,7 @@ import { createSnapTransaction } from "@/lib/midtrans";
 import { insertPendingOrder, getStoreByEmail } from "@/lib/supabase";
 import { hashPassword, getSessionEmail } from "@/lib/auth";
 import { validateCouponForPlan, applyDiscount } from "@/lib/coupons";
+import { resolveCallbackBaseUrl } from "@/lib/webhook-url";
 
 // Route ini butuh Node runtime (pakai crypto & Buffer) dan selalu dinamis.
 export const runtime = "nodejs";
@@ -158,10 +159,11 @@ export async function POST(req: Request) {
   const [firstName, ...rest] = cleanName.split(/\s+/);
   const phone = normalizePhone(whatsapp);
 
-  const baseUrl =
-    process.env.NEXT_PUBLIC_BASE_URL ||
-    req.headers.get("origin") ||
-    "http://localhost:3000";
+  // Pembeli pulang ke domain yang BENAR-BENAR dia pakai (aplikasi ini dilayani
+  // di beberapa domain, dan cookie sesi terikat host — dilempar ke domain lain
+  // sesudah bayar membuatnya tampak logout). Origin hanya dihormati bila cocok
+  // dengan domain yang terdaftar di ENV; lihat `resolveCallbackBaseUrl`.
+  const baseUrl = resolveCallbackBaseUrl(req);
 
   try {
     // 1) Minta Snap token ke Midtrans
@@ -198,6 +200,13 @@ export async function POST(req: Request) {
         is_renewal: isRenewal,
       },
       callbackFinishUrl: `${baseUrl}/?order=${orderId}`,
+      // Kunci URL webhook ke project ini (header X-Override-Notification).
+      // Akun Midtrans yang sama dipakai beberapa project dan dashboard hanya
+      // punya satu Payment Notification URL — tanpa ini, notifikasi pembayaran
+      // bisa terkirim ke project lain dan order di sini tersangkut PENDING.
+      // Daftar domainnya dibaca dari ENV; nilai ini hanya cadangan untuk
+      // dev/preview yang ENV-nya belum di-set.
+      notificationBaseUrl: baseUrl,
     });
 
     // 2) Simpan order status PENDING ke Supabase (best-effort)

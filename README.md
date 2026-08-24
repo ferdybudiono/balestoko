@@ -40,9 +40,12 @@ cp .env.example .env.local
 | `MIDTRANS_SERVER_KEY` | Server Key dari Midtrans (server-only). |
 | `NEXT_PUBLIC_MIDTRANS_CLIENT_KEY` | Client Key dari Midtrans (dipakai Snap.js di browser). |
 | `MIDTRANS_IS_PRODUCTION` | `false` untuk sandbox, `true` untuk production. |
+| `MIDTRANS_NOTIFICATION_URL` | *(opsional)* URL webhook yang dikirim per-transaksi lewat header `X-Override-Notification`. Kosong = otomatis dari semua domain aplikasi (`NEXT_PUBLIC_BASE_URL` + `NEXT_PUBLIC_ALT_BASE_URLS`). Boleh 1–3 URL dipisah koma. |
+| `MIDTRANS_NOTIFICATION_MODE` | `override` (default) / `append` / `off`. Lihat [Konfigurasi Webhook Midtrans](#konfigurasi-webhook-midtrans). |
 | `NEXT_PUBLIC_SUPABASE_URL` | URL project Supabase. |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service Role key Supabase (**server-only**, jangan diekspos!). |
-| `NEXT_PUBLIC_BASE_URL` | Base URL publik aplikasi (callback Snap **dan** URL webhook yang didaftarkan ke Fonnte). **Wajib domain publik di produksi** — bila masih `localhost`, bot bisa mengirim tapi tidak akan pernah menerima chat pembeli. |
+| `NEXT_PUBLIC_BASE_URL` | Base URL publik aplikasi (callback Snap **dan** URL webhook yang didaftarkan ke Fonnte). **Wajib domain publik di produksi** — bila masih `localhost`, bot bisa mengirim tapi tidak akan pernah menerima chat pembeli. Isi **satu** domain kanonik. |
+| `NEXT_PUBLIC_ALT_BASE_URLS` | *(opsional)* Domain lain tempat aplikasi ini juga dilayani, dipisah koma — mis. `https://balestoko.vercel.app` saat domain kanoniknya `https://balestoko.my.id`. Lihat [Dua domain](#dua-domain-untuk-satu-aplikasi). |
 | `AUTH_SECRET` | Kunci HMAC penandatangan session login. **Wajib di produksi.** |
 | `FONNTE_TOKEN` | Account Token Fonnte (untuk provisioning device per toko). |
 | `FONNTE_WEBHOOK_SECRET` | Shared secret pelindung `/api/fonnte/webhook`. **Sangat disarankan di produksi** — tanpa ini endpoint terbuka dan bisa dipakai sebagai relay spam. |
@@ -199,15 +202,80 @@ User bayar ──► Midtrans kirim webhook ──► POST /api/midtrans/notific
 
 ### Konfigurasi Webhook Midtrans
 
-Agar status order terupdate otomatis, set **Payment Notification URL** di
-Midtrans Dashboard (**Settings → Configuration**) ke:
+**Tidak perlu menyetel apa pun di dashboard Midtrans.** Dashboard hanya punya
+**satu** *Payment Notification URL* untuk **seluruh akun**, jadi kalau akun yang
+sama dipakai beberapa project, project yang mengisi kolom itu terakhir akan
+menelan semua notifikasi — project lain ordernya tersangkut `PENDING` walau
+uangnya sudah masuk.
+
+Karena itu `/api/checkout` mengirim URL webhook-nya sendiri di setiap transaksi
+lewat HTTP header ([docs](https://docs.midtrans.com/reference/override-notification-url)):
 
 ```
-https://DOMAIN-ANDA/api/midtrans/notification
+X-Override-Notification: https://DOMAIN-ANDA/api/midtrans/notification
 ```
 
-Saat development lokal, gunakan tunneling (mis. `ngrok http 3000`) supaya
-Midtrans bisa menjangkau endpoint webhook Anda.
+| `MIDTRANS_NOTIFICATION_MODE` | Efek |
+|---|---|
+| `override` *(default)* | URL dashboard **diabaikan** untuk transaksi ini; hanya webhook project ini yang dipanggil. Pilihan yang benar untuk akun bersama. |
+| `append` | URL dashboard **tetap** dapat notifikasi, webhook project ini ditambahkan (Midtrans membatasi total 3 URL). |
+| `off` | Header tidak dikirim — murni mengandalkan URL dashboard (perilaku lama). |
+
+URL-nya dihitung dari `MIDTRANS_NOTIFICATION_URL` bila diisi, kalau tidak dari
+**semua domain aplikasi** (`NEXT_PUBLIC_BASE_URL` + `NEXT_PUBLIC_ALT_BASE_URLS`),
+masing-masing + `/api/midtrans/notification`.
+
+Beberapa penjaga yang sengaja ada:
+
+- **URL yang tidak mungkin dijangkau tidak pernah dikirim.** `localhost`,
+  jaringan privat, dan port non-80/443 di-skip (dengan peringatan di log) dan
+  header-nya batal — mengoverride URL dashboard dengan alamat mati akan membuat
+  notifikasi hilang total, bukan sekadar tertunda. Untuk uji webhook di lokal,
+  jalankan tunnel (`ngrok http 3000`) lalu isi `MIDTRANS_NOTIFICATION_URL` dengan
+  URL ngrok + `/api/midtrans/notification`.
+- **Notifikasi project lain tidak merusak apa pun.** Server key satu akun sama
+  untuk semua project, jadi signature notifikasi project lain pun valid di sini.
+  Order yang tidak dikenal dijawab `200 {"ignored":true}` dan dicatat di log,
+  bukan diperlakukan sebagai pembayaran.
+
+---
+
+## 🌐 Dua domain untuk satu aplikasi
+
+Aplikasi ini dilayani di lebih dari satu domain. Konfigurasinya:
+
+```env
+NEXT_PUBLIC_BASE_URL=https://balestoko.my.id          # SATU domain kanonik
+NEXT_PUBLIC_ALT_BASE_URLS=https://balestoko.vercel.app # domain lainnya, dipisah koma
+```
+
+`NEXT_PUBLIC_BASE_URL` sengaja tetap satu nilai: ia yang didaftarkan ke Fonnte
+sebagai URL webhook device dan dipakai `metadataBase` (SEO). Kalau nilainya ikut
+berubah mengikuti domain yang sedang dibuka, URL webhook device akan
+**bolak-balik diperbaiki** setiap kali dashboard diakses dari domain berbeda.
+
+Yang sadar-domain hanya dua hal:
+
+| Hal | Perilaku |
+|---|---|
+| **Webhook Midtrans** | **Kedua** domain didaftarkan sekaligus di header override, jadi pembayaran tetap teraktivasi walau satu domain kena masalah DNS/SSL. Notifikasi ganda aman — transisi ke `PAID` pakai PATCH bersyarat `status=neq.PAID`, jadi hanya satu yang menang dan langganan tidak mungkin diperpanjang dua kali. |
+| **Redirect setelah bayar** | Pembeli pulang ke domain yang **dia** pakai. Cookie sesi terikat host, jadi checkout di `balestoko.my.id` yang dilempar ke `balestoko.vercel.app` akan tampak logout. |
+
+Header `Origin` datang dari klien, jadi hanya domain yang **terdaftar di ENV**
+yang dihormati sebagai tujuan redirect (`resolveCallbackBaseUrl` di
+`lib\webhook-url.ts`). Origin asing jatuh ke domain kanonik — kalau tidak, siapa
+pun bisa membuat transaksi yang mengembalikan pembeli ke halaman "pembayaran
+berhasil" palsu di domain miliknya.
+
+Yang perlu diingat saat menambah/mengganti domain:
+
+- Tambahkan domainnya ke `NEXT_PUBLIC_ALT_BASE_URLS` lalu **deploy ulang**
+  (variabel `NEXT_PUBLIC_*` ikut di-bake saat build).
+- Batas Midtrans 3 URL notifikasi: domain kanonik + 2 domain lain.
+- Cookie sesi tidak dibagi antar domain — pemilik toko yang login di
+  `balestoko.my.id` tetap harus login lagi di `balestoko.vercel.app`.
+- Setelah pindah domain kanonik, buka tab **WhatsApp** di dashboard sekali agar
+  URL webhook tiap device disinkronkan ke domain baru.
 
 ---
 
@@ -320,7 +388,7 @@ components/                      # Navbar, Hero, Features, Pricing, CheckoutModa
   dashboard/                     # komponen per tab + helper tampilan
 lib/
   packages.ts                    # sumber tunggal paket, harga, batas nomor & masa aktif
-  midtrans.ts                    # helper Snap REST + verifikasi signature
+  midtrans.ts                    # helper Snap REST + override URL notifikasi + verifikasi signature
   supabase.ts                    # klien PostgREST (server-only)
   auth.ts                        # hash password, cookie sesi, pencabutan sesi
   ai.ts                          # deteksi intent, berat kirim, format balasan WA
@@ -343,6 +411,8 @@ supabase/
 - **Batas bulan dihitung dari satu fungsi bersama** (`monthStartMs` di `lib/packages.ts`, file yang aman dipakai client): penegak kuota di server dan meter pemakaian di dashboard mustahil memakai batas bulan yang berbeda.
 - **Service Role key hanya dipakai di server** (`lib/supabase.ts`). Jangan pernah meng-import file itu dari komponen client. Token device tidak pernah dikirim ke browser — API selalu memetakannya lewat `toPublicDevice()` yang hanya membocorkan `has_token: true/false`.
 - **Webhook memverifikasi signature** `SHA512(order_id + status_code + gross_amount + server_key)` dengan timing-safe compare sebelum memperbarui status.
+- **URL notifikasi dikunci per-transaksi, bukan lewat dashboard** (`resolveNotificationTarget` di `lib\midtrans.ts`). Satu akun Midtrans punya satu Payment Notification URL untuk semua project, jadi mengandalkan dashboard berarti project yang mengisinya terakhir menelan notifikasi milik project lain. Header `X-Override-Notification` dikirim di setiap Snap request berisi **semua** domain aplikasi, dan URL yang tidak publik (localhost/jaringan privat/port non-standar) sengaja TIDAK dikirim supaya override tidak pernah mengganti URL dashboard dengan alamat mati. Webhook juga mengabaikan `order_id` yang tidak ada di database ini — signature notifikasi project lain memang valid karena server key-nya sama.
+- **Redirect setelah bayar pakai daftar domain, bukan header `Origin` apa adanya** (`resolveCallbackBaseUrl` di `lib\webhook-url.ts`). Pembeli harus pulang ke domain yang dia pakai (cookie sesi terikat host), tapi `Origin` dikendalikan klien: tanpa pembatasan, siapa pun bisa membuat transaksi yang melempar pembeli ke halaman "pembayaran berhasil" palsu. Hanya domain di `NEXT_PUBLIC_BASE_URL`/`NEXT_PUBLIC_ALT_BASE_URLS` yang dihormati; sisanya jatuh ke domain kanonik.
 - **Notifikasi pembayaran idempoten.** Transisi ke PAID dijalankan lewat PATCH bersyarat `?order_id=eq.X&status=neq.PAID`, jadi Midtrans yang mengirim notifikasi yang sama dua kali tidak bisa memperpanjang langganan dua kali.
 - **Pembayaran tidak bisa dipakai mengambil alih akun.** Checkout atas email yang sudah terdaftar wajib menyertakan sesi milik email itu (jika tidak: `409 needsLogin`), dan pada akun yang sudah ada pembayaran hanya menyentuh `is_paid` / `package_id` / `subscription_ends_at` — nama toko, nomor WhatsApp, dan kata sandi tidak pernah ditimpa oleh alur pembayaran. Dua lapis ini berdiri sendiri: sink-nya tetap aman walau pemanggilnya berubah.
 - **Reset password mencabut sesi lama.** Sukses reset menulis `password_changed_at`, dan `getSessionEmail()` menolak cookie yang terbit sebelum waktu itu (payload sesi menyimpan `iat`). Tanpa ini, korban pengambilalihan bisa mengganti password tapi penyerang tetap login sampai TTL 7 hari habis. Query yang gagal memilih **tidak** memaksa logout — satu error Supabase tidak boleh mengeluarkan semua pelanggan.
