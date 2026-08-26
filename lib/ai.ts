@@ -16,6 +16,7 @@ import {
   QuoteOption,
   buildOngkirReply,
   buildOrderConfirmReply,
+  countDraftUnits,
   formatOrderSummary,
   formatWeight,
   mergeQuoteOptions,
@@ -28,6 +29,7 @@ import {
   detectSlotAsk,
   extractCustomerAddress,
   extractCustomerName,
+  extractShippingCityQuery,
   isOrderCommit
 } from "./customer-slots";
 
@@ -87,6 +89,23 @@ export interface AIProcessParams {
   knownCustomerName?: string | null;
   knownCustomerAddress?: string | null;
   /**
+   * Kota/kecamatan tujuan yang sudah pernah dihitung di percakapan ini.
+   *
+   * Dipakai sebagai cadangan terakhir saat pembeli menyatakan memesan tanpa
+   * menyebut tujuan lagi dan alamat lengkapnya belum ada. Karena asalnya dari
+   * pencarian lokasi kurir yang berhasil sebelumnya, tujuan ini sudah terbukti
+   * ada — bukan tebakan baru.
+   */
+  knownDestinationCity?: string | null;
+  /**
+   * Matikan penulisan ulang oleh AI untuk pemanggilan INI saja.
+   *
+   * Dipakai pratinjau dashboard: pemilik toko bisa melihat isi balasan yang
+   * dihitung sistem tanpa memanggil model sama sekali (instan & tanpa biaya),
+   * lalu meminta versi finalnya secara terpisah saat ingin menilai gaya bicara.
+   */
+  disableAiNarration?: boolean;
+  /**
    * Balasan bot terakhir — dipakai memetakan jawaban singkat pembeli ("Budi",
    * "Jl. Merdeka 10 …") ke slot yang memang sedang ditanyakan.
    */
@@ -109,14 +128,27 @@ export interface AIProcessResult {
   orderDraft?: OrderDraft;
   /** `true` bila pesan ini memang niat memesan, bukan sekadar bertanya. */
   orderCommit?: boolean;
+  /** `true` bila kalimat akhir ditulis AI; `false` = format bawaan sistem. */
+  aiNarrated?: boolean;
+  /** Kenapa tulisan AI tidak dipakai (lihat `AITrace.reason`). */
+  aiFallbackReason?: AITrace["reason"];
+  /** Angka asing yang membuat tulisan AI ditolak. */
+  aiRejectedNumber?: string;
 }
 
 type ProductLike = { name: string; price: number; weight: number; description?: string };
 
 /** Di atas ini hampir pasti salah parse, dan kurir memang beda skema tarif. */
 const MAX_SHIPPING_WEIGHT_GRAM = 50_000;
-/** Batas jumlah unit yang diakui dari satu penyebutan produk. */
-const MAX_UNITS_PER_PRODUCT = 20;
+/**
+ * Batas jumlah unit yang diakui dari satu penyebutan produk.
+ *
+ * Dinaikkan dari 20 saat satuan borongan didukung: "10 lusin" = 120 potong itu
+ * pesanan grosir yang wajar, dan memotongnya ke 20 berarti mengutip subtotal &
+ * ongkir yang jauh lebih murah dari yang seharusnya. Batasnya tetap ada supaya
+ * satu salah baca tidak melahirkan pesanan ribuan potong.
+ */
+const MAX_UNITS_PER_PRODUCT = 200;
 
 function normalizeForMatch(text: string): string {
   return text
@@ -126,25 +158,122 @@ function normalizeForMatch(text: string): string {
     .trim();
 }
 
+// ── Pembacaan jumlah barang ──────────────────────────────────────────────
+//
+// Pembeli Indonesia menulis jumlah dengan banyak cara: "2 kaos", "kaos x3",
+// "kaos 3 pcs", "dua kaos", "selusin kaos", "2 lusin kaos". Sebelumnya hanya
+// bentuk berangka yang terbaca, jadi "dua kaos" tercatat 1 potong — pesanan
+// yang salah jumlah sejak awal, dan ongkirnya ikut salah.
+
+/** Kata satuan barang (bukan satuan ukuran). */
+const UNIT_NOUN = "pcs|pes|pc|buah|biji|unit|potong|helai|lembar|bungkus|botol|kaleng|pack|pak|set|pasang|batang|roll";
+
+/** Satuan borongan: pengalinya jelas dan dipakai sehari-hari di grosir. */
+const BULK_UNIT = "lusin|kodi";
+const BULK_MULTIPLIER: Record<string, number> = { lusin: 12, kodi: 20 };
+
 /**
- * Jumlah unit yang disebut di sekitar nama produk: "2 kaos", "kaos x3",
- * "kaos 2 pcs". Tidak yakin → 1, karena menebak terlalu banyak berarti mengutip
- * ongkir lebih mahal dari seharusnya.
+ * Satuan UKURAN — angka di depannya bukan jumlah barang.
+ *
+ * Ini gerbang yang menjaga "kaos 2 kg", "sirup 500 ml", dan "budget 200 rb"
+ * tidak terbaca sebagai jumlah unit. Diurut dari yang terpanjang supaya
+ * "kilogram" tidak tertelan oleh alternatif "kilo".
+ */
+const MEASURE_UNIT =
+  "kilogram|kilo|gram|meter|liter|persen|juta|ribu|inch|ons|ltr|rb|jt|kg|gr|cm|mm|ml|g|k|m|l";
+
+/** Angka yang ditulis sebagai kata. */
+const WORD_NUMBERS: Record<string, number> = {
+  satu: 1,
+  sebuah: 1,
+  sepotong: 1,
+  sebiji: 1,
+  sepasang: 2,
+  dua: 2,
+  tiga: 3,
+  empat: 4,
+  lima: 5,
+  enam: 6,
+  tujuh: 7,
+  delapan: 8,
+  sembilan: 9,
+  sepuluh: 10,
+  sebelas: 11,
+  selusin: 12,
+  sekodi: 20
+};
+
+/** "dua belas" → 12, "tiga puluh" → 30. */
+function compoundWordNumber(text: string): number | null {
+  const m = /\b(dua|tiga|empat|lima|enam|tujuh|delapan|sembilan)\s+(belas|puluh)\s*$/.exec(text);
+  if (!m) return null;
+  const base = WORD_NUMBERS[m[1]];
+  return m[2] === "belas" ? 10 + base : base * 10;
+}
+
+/** Jumlah dari teks SEBELUM nama produk: "2 kaos", "3 pcs kaos", "dua lusin kaos". */
+function unitsFromBefore(before: string): number | null {
+  // Borongan didahulukan: "2 lusin " harus terbaca 24, bukan 2.
+  const bulkDigit = new RegExp(`(?:^|\\D)(\\d{1,2})\\s*(${BULK_UNIT})\\s*$`).exec(before);
+  if (bulkDigit) return Number(bulkDigit[1]) * BULK_MULTIPLIER[bulkDigit[2]];
+
+  const bulkWord = new RegExp(`\\b([a-z]+)\\s+(${BULK_UNIT})\\s*$`).exec(before);
+  if (bulkWord && WORD_NUMBERS[bulkWord[1]] !== undefined) {
+    return WORD_NUMBERS[bulkWord[1]] * BULK_MULTIPLIER[bulkWord[2]];
+  }
+
+  // `(?:^|\D)` menjaga agar "kaos 250 gram" tidak dibaca 25 unit.
+  const digit = new RegExp(`(?:^|\\D)(\\d{1,2})\\s*(?:${UNIT_NOUN}|x)?\\s*$`).exec(before);
+  if (digit) return Number(digit[1]);
+
+  const compound = compoundWordNumber(before);
+  if (compound !== null) return compound;
+
+  const word = new RegExp(`\\b([a-z]+)\\s*(?:${UNIT_NOUN})?\\s*$`).exec(before);
+  if (word && WORD_NUMBERS[word[1]] !== undefined) return WORD_NUMBERS[word[1]];
+
+  return null;
+}
+
+/** Jumlah dari teks SESUDAH nama produk: "kaos 2", "kaos x3", "kaos 2 lusin". */
+function unitsFromAfter(after: string): number | null {
+  const bulkDigit = new RegExp(`^\\s*(?:x|sebanyak)?\\s*(\\d{1,2})\\s*(${BULK_UNIT})\\b`).exec(after);
+  if (bulkDigit) return Number(bulkDigit[1]) * BULK_MULTIPLIER[bulkDigit[2]];
+
+  const bulkWord = new RegExp(`^\\s*(?:sebanyak\\s*)?([a-z]+)\\s+(${BULK_UNIT})\\b`).exec(after);
+  if (bulkWord && WORD_NUMBERS[bulkWord[1]] !== undefined) {
+    return WORD_NUMBERS[bulkWord[1]] * BULK_MULTIPLIER[bulkWord[2]];
+  }
+
+  const digit = /^\s*(?:x|sebanyak)?\s*(\d{1,2})(?!\d)([\s\S]*)$/.exec(after);
+  if (digit) {
+    // Angka yang diikuti satuan ukuran bukan jumlah barang.
+    if (new RegExp(`^\\s*(?:${MEASURE_UNIT})\\b`).test(digit[2])) return null;
+    return Number(digit[1]);
+  }
+
+  const word = new RegExp(`^\\s*(?:sebanyak\\s*)?([a-z]+)\\s*(?:${UNIT_NOUN})?\\b`).exec(after);
+  if (word && WORD_NUMBERS[word[1]] !== undefined) return WORD_NUMBERS[word[1]];
+
+  return null;
+}
+
+/**
+ * Jumlah unit yang disebut di sekitar nama produk.
+ *
+ * Tidak yakin → 1, karena menebak terlalu banyak berarti mengutip subtotal dan
+ * ongkir lebih mahal dari seharusnya. Jendela 24 karakter (dulu 14) supaya frasa
+ * seperti "sebanyak dua lusin " masih terbaca utuh.
  */
 function unitsMentioned(haystack: string, needle: string): number {
   const idx = haystack.indexOf(needle);
   if (idx < 0) return 1;
-  const before = haystack.slice(Math.max(0, idx - 14), idx);
-  const after = haystack.slice(idx + needle.length, idx + needle.length + 14);
+  const before = haystack.slice(Math.max(0, idx - 24), idx);
+  const after = haystack.slice(idx + needle.length, idx + needle.length + 24);
 
-  // `(?!\d)` / `(?:^|\D)` menjaga agar "kaos 250 gram" tidak dibaca 25 unit.
-  const raw =
-    /(?:^|\D)(\d{1,2})\s*(?:pcs|pes|buah|biji|unit|x)?\s*$/.exec(before)?.[1] ||
-    /^\s*(?:x|sebanyak)?\s*(\d{1,2})(?!\d)\s*(?:pcs|pes|buah|biji|unit)?/.exec(after)?.[1];
-
-  const n = raw ? parseInt(raw, 10) : 1;
-  if (!Number.isFinite(n) || n < 1) return 1;
-  return Math.min(n, MAX_UNITS_PER_PRODUCT);
+  const raw = unitsFromBefore(before) ?? unitsFromAfter(after);
+  if (raw === null || !Number.isFinite(raw) || raw < 1) return 1;
+  return Math.min(Math.round(raw), MAX_UNITS_PER_PRODUCT);
 }
 
 /**
@@ -194,6 +323,7 @@ export function resolveOrderDraft(
   const blank: OrderDraft = {
     lines: [],
     subtotal: 0,
+    totalUnits: 0,
     weightGram: fallback,
     weightSource: "default",
     ambiguous: []
@@ -297,6 +427,8 @@ export function resolveOrderDraft(
   return {
     lines,
     subtotal,
+    // Σ units — dipakai balasan untuk menyebut "Total barang: n pcs".
+    totalUnits: countDraftUnits(lines),
     weightGram: weightOk ? Math.min(totalWeight, MAX_SHIPPING_WEIGHT_GRAM) : fallback,
     weightSource: weightOk ? "matched" : "default",
     ambiguous: ambiguousList
@@ -438,6 +570,29 @@ function replyKeepsNumbersHonest(
 }
 
 /**
+ * Catatan singkat tentang bagaimana satu balasan dihasilkan.
+ *
+ * ADA UNTUK APA: pemilik toko perlu tahu apakah kalimat yang dilihatnya di
+ * pratinjau benar-benar tulisan AI, atau format bawaan sistem karena tulisan AI
+ * ditolak pemeriksaan angka. Tanpa penanda ini, pratinjau "balasan final" bisa
+ * menyesatkan — pemilik toko mengira sudah melihat gaya bicara AI padahal yang
+ * tampil adalah format cadangan.
+ */
+export interface AITrace {
+  /** `true` bila teks akhir memang tulisan model, bukan format deterministik. */
+  narrated: boolean;
+  /**
+   * Kenapa tulisan model tidak dipakai.
+   * `no-key` GEMINI_API_KEY belum di-set · `no-reply` model tidak membalas ·
+   * `bad-numbers` balasan model memuat angka tanpa dasar · `deterministic`
+   * jalur ini memang tidak melibatkan model (mis. pesan sapaan toko).
+   */
+  reason?: "no-key" | "no-reply" | "bad-numbers" | "deterministic";
+  /** Angka asing yang membuat tulisan model ditolak — untuk ditampilkan ke pemilik toko. */
+  offender?: string;
+}
+
+/**
  * Minta Gemini menuliskan ulang sebuah balasan, lalu pakai hasilnya HANYA bila
  * angkanya lolos pemeriksaan. Gagal apa pun (API mati, balasan kosong, angka
  * asing) → balasan deterministik yang sudah disiapkan pemanggil.
@@ -451,12 +606,18 @@ async function narrateWithGemini(params: {
   fallback: string;
   guard: NumberGuard;
   label: string;
+  /** Diisi di tempat supaya pemanggil bisa tahu hasilnya dipakai atau dibuang. */
+  trace?: AITrace;
 }): Promise<string> {
-  const { apiKey, prompt, fallback, guard, label } = params;
+  const { apiKey, prompt, fallback, guard, label, trace } = params;
 
   const draftText = await generateGeminiReply(prompt, apiKey);
   if (!draftText) {
     console.warn(`[ai] ${label}: Gemini tidak membalas — pakai format deterministik.`);
+    if (trace) {
+      trace.narrated = false;
+      trace.reason = "no-reply";
+    }
     return fallback;
   }
 
@@ -465,9 +626,19 @@ async function narrateWithGemini(params: {
     console.warn(
       `[ai] ${label}: balasan Gemini memuat angka tanpa dasar ("${verdict.offender}") — dibuang, pakai format deterministik.`
     );
+    if (trace) {
+      trace.narrated = false;
+      trace.reason = "bad-numbers";
+      trace.offender = verdict.offender;
+    }
     return fallback;
   }
 
+  if (trace) {
+    trace.narrated = true;
+    trace.reason = undefined;
+    trace.offender = undefined;
+  }
   return draftText;
 }
 
@@ -593,8 +764,15 @@ function renderOrderFacts(draft: OrderDraft, guard: NumberGuard): string {
   guard.amounts.add(draft.subtotal);
   guard.amounts.add(draft.weightGram);
 
+  // Jumlah barang didaftarkan juga: pada pesanan grosir (mis. 10 lusin = 120)
+  // angkanya bisa melewati MONEY_SCALE_MIN, dan tanpa ini pagar angka akan
+  // menolak tulisan model yang sebetulnya benar.
+  const units = draft.totalUnits > 0 ? draft.totalUnits : countDraftUnits(draft.lines);
+  guard.amounts.add(units);
+
   return `Produk yang disebut pembeli:
 ${rows.join("\n")}
+Total barang: ${units} pcs
 Subtotal produk: Rp ${draft.subtotal.toLocaleString("id-ID")}
 Berat paket: ${formatWeight(draft.weightGram)}${
     draft.weightSource === "default" ? " (perkiraan, bukan dari data produk)" : ""
@@ -707,9 +885,33 @@ function withIdentitySuffix(reply: string, ack: string, ask: string): string {
 }
 
 /**
- * Proses pesan pembeli yang masuk melalui WhatsApp
+ * Proses pesan pembeli yang masuk melalui WhatsApp.
+ *
+ * Pembungkus tipis di atas `runCustomerService`: ia menyiapkan satu `AITrace`,
+ * meneruskannya ke jalur mana pun yang dipakai, lalu menempelkan hasilnya ke
+ * nilai kembalian. Dibungkus alih-alih menambah field di ~10 titik `return`
+ * supaya penandanya tidak mungkin lupa dipasang di salah satu jalur.
  */
 export async function processAICustomerService(params: AIProcessParams): Promise<AIProcessResult> {
+  const trace: AITrace = {
+    narrated: false,
+    // Jalur yang memang tidak melibatkan model (pesan sapaan toko, atau
+    // pratinjau yang sengaja mematikan AI) berhenti di nilai awal ini; kalau
+    // kuncinya belum di-set, itu yang dilaporkan.
+    reason: params.disableAiNarration || process.env.GEMINI_API_KEY ? "deterministic" : "no-key"
+  };
+
+  const result = await runCustomerService(params, trace);
+
+  return {
+    ...result,
+    aiNarrated: trace.narrated,
+    aiFallbackReason: trace.narrated ? undefined : trace.reason,
+    aiRejectedNumber: trace.narrated ? undefined : trace.offender
+  };
+}
+
+async function runCustomerService(params: AIProcessParams, trace: AITrace): Promise<AIProcessResult> {
   const {
     messageText,
     storeName,
@@ -732,6 +934,8 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     includePayment = true,
     knownCustomerName,
     knownCustomerAddress,
+    knownDestinationCity,
+    disableAiNarration = false,
     lastAssistantMessage
   } = params;
 
@@ -748,8 +952,10 @@ export async function processAICustomerService(params: AIProcessParams): Promise
   const rawMessage = messageText.trim();
   const lowerMsg = rawMessage.toLowerCase();
 
-  const geminiApiKey = process.env.GEMINI_API_KEY;
-  if (!geminiApiKey) {
+  // Pratinjau "isi balasan" mematikan jalur model dengan sengaja: seluruh kode
+  // di bawah sudah memakai `geminiApiKey` sebagai penentu, jadi cukup satu baris.
+  const geminiApiKey = disableAiNarration ? undefined : process.env.GEMINI_API_KEY;
+  if (!geminiApiKey && !disableAiNarration) {
     console.warn("[ai] GEMINI_API_KEY belum di-set — balasan dipakai apa adanya dari format deterministik.");
   }
 
@@ -784,6 +990,20 @@ export async function processAICustomerService(params: AIProcessParams): Promise
   const slotAck = buildSlotAck({ name: capturedName, address: capturedAddress });
 
   const orderCommit = isOrderCommit(rawMessage);
+
+  /**
+   * Draf pesanan — produk yang DISEBUT pembeli beserta jumlahnya.
+   *
+   * Dihitung SEKALI di sini, bukan lagi di masing-masing jalur balasan. Dulu
+   * jalur ongkir dan jalur pesanan menghitungnya sendiri-sendiri, sehingga
+   * "pesan 2 kaos, kirim ke Coblong" hanya bisa masuk salah satu jalur: yang
+   * satu tahu jumlah barangnya tapi tidak menghitung ongkir, yang lain
+   * sebaliknya. Dengan satu draf, kedua angka bisa muncul di balasan yang sama —
+   * inilah "jumlah barang + ongkirnya" yang diminta pemilik toko.
+   */
+  const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
+  /** Pesanan sungguhan: niat memesan DAN ada produk yang benar-benar cocok. */
+  const commitWithLines = orderCommit && draft.lines.length > 0;
 
   // Identitas & aturan toko, dipakai SEMUA jalur balasan AI di bawah.
   const voiceText = renderStoreVoice({
@@ -866,13 +1086,56 @@ export async function processAICustomerService(params: AIProcessParams): Promise
     }
   }
 
-  // Jika kata kunci ongkir ditemukan dan ada lokasi tujuan
-  if (isOngkirQuery || targetLocationQuery) {
-    // Draf pesanan: produk yang DISEBUT pembeli beserta jumlah & harganya, bukan
-    // produk pertama di katalog. Tidak ada yang cocok → berat default toko.
-    const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
+  /**
+   * Tujuan pengiriman yang akan dicari ke Mengantar.
+   *
+   * Tiga sumber, dari yang paling dipercaya: (1) tujuan yang disebut di pesan
+   * ini, (2) kecamatan/kota yang tersimpan di alamat lengkap pembeli, (3) tujuan
+   * yang sudah pernah berhasil dihitung di percakapan ini. Sumber 2 & 3 yang
+   * membuat "oke pesan 2 kaos" — tanpa menyebut kota lagi — tetap bisa dibalas
+   * lengkap dengan ongkir, alih-alih menanyakan alamat yang sudah dikirim
+   * pembeli beberapa pesan sebelumnya.
+   */
+  const destQuery =
+    targetLocationQuery ||
+    extractShippingCityQuery(knownAddress) ||
+    (knownDestinationCity || "").split(",")[0].trim();
+  const destFromMessage = !!targetLocationQuery;
+  const wantsOngkir = isOngkirQuery || !!targetLocationQuery;
 
-    if (!targetLocationQuery) {
+  /**
+   * Tujuan yang benar-benar dipakai menghitung tarif.
+   *
+   * `searchMengantarLocation` SELALU mengembalikan hasil — kalau tidak ketemu ia
+   * mengarang lokasi dengan id "99999…" dan `source: "mock"`. Untuk tujuan yang
+   * disebut langsung di pesan, hasil karangan itu tetap dipakai (pembeli memang
+   * menyebut tempat itu, dan balasannya jelas ditandai perkiraan). Tapi untuk
+   * tujuan yang hanya DITEBAK dari alamat atau catatan percakapan, hanya lokasi
+   * yang sungguh dikenali kurir yang boleh dipakai — mengarang tarif ke tempat
+   * yang tidak pernah disebut pembeli jauh lebih buruk daripada sekadar tidak
+   * menyebut ongkir.
+   */
+  let resolvedDest: { id: string; name: string; source: RateSource } | null = null;
+  // Pencarian lokasi hanya dijalankan bila hasilnya akan dipakai: jalur ongkir,
+  // atau pesanan sungguhan yang tujuannya sudah diketahui.
+  if (destQuery && (wantsOngkir || commitWithLines)) {
+    const { locations, source: locSource } = await searchMengantarLocation(destQuery, mengantarApiKey);
+    const loc = locations[0];
+    if (loc && (destFromMessage || locSource === "live")) {
+      resolvedDest = {
+        id: loc.id,
+        name: `${loc.subdistrict_name}, ${loc.city_name}`,
+        source: locSource
+      };
+    }
+  }
+
+  // Jalur ongkir dibuka juga untuk pesanan yang tujuannya sudah diketahui, walau
+  // pembeli tidak menyebut kata "ongkir" sama sekali. Sebaliknya, pesanan yang
+  // tujuannya TIDAK bisa dipastikan tidak masuk sini — ia jatuh ke jalur
+  // konfirmasi pesanan di bawah, yang tidak menyebut angka ongkir sama sekali.
+  if (wantsOngkir || resolvedDest) {
+    if (!resolvedDest) {
       // Menanyakan ongkir tanpa menyebut kota. Ongkirnya belum bisa dihitung,
       // tapi subtotal produknya sudah bisa — jadi pembeli tetap dapat sesuatu
       // yang berguna sambil dimintai kota tujuan.
@@ -902,6 +1165,7 @@ export async function processAICustomerService(params: AIProcessParams): Promise
         guard,
         fallback,
         label: "ongkir-tanpa-tujuan",
+        trace,
         prompt: `${voiceText}
 
 DATA:
@@ -929,11 +1193,10 @@ pengantar.`
       };
     }
 
-    // Cari lokasi di Mengantar
-    const { locations, source: locSource } = await searchMengantarLocation(targetLocationQuery, mengantarApiKey);
-    const destLoc = locations[0];
-    const destName = destLoc ? `${destLoc.subdistrict_name}, ${destLoc.city_name}` : targetLocationQuery;
-    const destId = destLoc ? destLoc.id : "3273010";
+    // Tujuan sudah pasti — hitung tarifnya.
+    const destName = resolvedDest!.name;
+    const destId = resolvedDest!.id;
+    const locSource = resolvedDest!.source;
 
     const { rates, source: rateSource } = await calculateMengantarOngkir({
       originSubdistrictId,
@@ -959,7 +1222,13 @@ pengantar.`
       payment,
       includeTotal,
       includePayment,
-      courierFilterActive: activeGroups.length > 0
+      courierFilterActive: activeGroups.length > 0,
+      // Data penerima dibacakan ulang HANYA pada balasan yang menutup pesanan.
+      // Pada pertanyaan ongkir biasa, orang yang baru menanyakan tarif belum
+      // tentu memesan — membacakan nama & alamatnya di situ terasa seperti
+      // pesanan yang tiba-tiba sudah jadi.
+      customerName: commitWithLines ? knownName : undefined,
+      customerAddress: commitWithLines ? knownAddress : undefined
     });
 
     // Pembeli sudah menyebut tujuan: ini saat paling wajar meminta nama & alamat
@@ -980,6 +1249,7 @@ pengantar.`
         guard,
         fallback: detWithIdentity,
         label: "ongkir",
+        trace,
         prompt: `${voiceText}
 
 DATA — dihitung sistem, bukan olehmu:
@@ -1009,7 +1279,11 @@ ${rewriteTask(deterministic)}${identityTask(identityAsk, slotAck)}`
 
     return {
       replyText,
-      intent: "ONGKIR_CHECK",
+      // Pesanan yang sekaligus mendapat ongkir tetap dicatat sebagai PESANAN,
+      // bukan sebagai pertanyaan tarif — kalau tidak, pesanan yang paling
+      // lengkap (produk + jumlah + tujuan sekaligus) justru tidak masuk daftar
+      // pesanan toko.
+      intent: commitWithLines ? "ORDER" : "ONGKIR_CHECK",
       shippingDetails: rates,
       detectedCity: destName,
       rateSource: effectiveSource,
@@ -1028,15 +1302,27 @@ ${rewriteTask(deterministic)}${identityTask(identityAsk, slotAck)}`
   //    daftar katalog. Syaratnya ada produk yang benar-benar cocok: niat memesan
   //    tanpa produk yang jelas ("mau beli dong") lebih baik jatuh ke jalur
   //    katalog/obrolan yang akan menanyakan produknya dulu.
-  const commitDraft = orderCommit ? resolveOrderDraft(rawMessage, products, defaultWeight) : null;
-  if (commitDraft && commitDraft.lines.length > 0) {
+  //
+  //    Yang sampai ke sini adalah pesanan yang tujuan kirimnya BELUM bisa
+  //    dipastikan — pesanan yang tujuannya sudah jelas dibalas lengkap dengan
+  //    ongkir di jalur di atas.
+  if (commitWithLines) {
+    // Ongkir belum bisa dihitung, jadi tujuannya yang dipancing. Kalau alamatnya
+    // sendiri belum ada, `identityAsk` sudah menanyakan itu — bertanya dua hal
+    // sekaligus membuat pembeli menjawab salah satunya saja.
+    const destinationAsk =
+      identityAsk || !knownAddress
+        ? ""
+        : "Boleh konfirmasi *Kecamatan* dan *Kota* tujuannya ya Kak, biar ongkirnya kami hitung dengan tepat 🚚";
+    const ask = identityAsk || destinationAsk;
+
     const deterministic = buildOrderConfirmReply({
-      draft: commitDraft,
+      draft,
       customerName: knownName,
       customerAddress: knownAddress,
       payment,
       includePayment,
-      identityAsk,
+      identityAsk: ask,
       ack: slotAck
     });
 
@@ -1046,26 +1332,27 @@ ${rewriteTask(deterministic)}${identityTask(identityAsk, slotAck)}`
         intent: "ORDER",
         capturedName,
         capturedAddress,
-        orderDraft: commitDraft,
+        orderDraft: draft,
         orderCommit: true
       };
     }
 
     const guard = baseGuard();
-    const orderFacts = renderOrderFacts(commitDraft, guard);
+    const orderFacts = renderOrderFacts(draft, guard);
 
     const replyText = await narrateWithGemini({
       apiKey: geminiApiKey,
       guard,
       fallback: deterministic,
       label: "pesanan",
+      trace,
       prompt: `${voiceText}
 
 DATA — dihitung sistem, bukan olehmu:
 ${orderFacts}
 Ongkir belum dihitung; angkanya BELUM ada.${
-        commitDraft.ambiguous.length > 0
-          ? `\nPRODUK AMBIGU: yang disebut pembeli cocok dengan beberapa produk (${commitDraft.ambiguous.join(
+        draft.ambiguous.length > 0
+          ? `\nPRODUK AMBIGU: yang disebut pembeli cocok dengan beberapa produk (${draft.ambiguous.join(
               ", "
             )}). Tanyakan yang mana.`
           : ""
@@ -1076,7 +1363,7 @@ ${NUMBER_RULES}
 
 Pesan pembeli: "${rawMessage}"
 
-${rewriteTask(deterministic)}${identityTask(identityAsk, slotAck)}`
+${rewriteTask(deterministic)}${identityTask(ask, slotAck)}`
     });
 
     return {
@@ -1084,7 +1371,7 @@ ${rewriteTask(deterministic)}${identityTask(identityAsk, slotAck)}`
       intent: "ORDER",
       capturedName,
       capturedAddress,
-      orderDraft: commitDraft,
+      orderDraft: draft,
       orderCommit: true
     };
   }
@@ -1104,9 +1391,9 @@ ${rewriteTask(deterministic)}${identityTask(identityAsk, slotAck)}`
 
     const prodWithIdentity = withIdentitySuffix(prodText, slotAck, nameAsk);
 
-    // Draf pesanan ikut dikirim supaya "harga 2 kaos berapa?" dijawab dengan
-    // hitungannya, bukan dengan seluruh katalog yang harus dihitung pembeli.
-    const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
+    // Draf pesanan (dihitung sekali di atas) ikut dikirim supaya "harga 2 kaos
+    // berapa?" dijawab dengan hitungannya, bukan dengan seluruh katalog yang
+    // harus dihitung sendiri oleh pembeli.
 
     if (!geminiApiKey) {
       return {
@@ -1128,6 +1415,7 @@ ${rewriteTask(deterministic)}${identityTask(identityAsk, slotAck)}`
       guard,
       fallback: prodWithIdentity,
       label: "katalog",
+      trace,
       prompt: `${voiceText}
 
 DATA — katalog produk toko:
@@ -1200,6 +1488,7 @@ Tugasmu: jawab pertanyaan pembeli soal produk/harga memakai DATA di atas.
       guard,
       fallback: defaultGreeting,
       label: "sapaan",
+      trace,
       prompt: `${voiceText}
 
 DATA — katalog produk toko:
@@ -1232,7 +1521,6 @@ pengantar.`
     `Pesan Kakak sudah kami terima. Kami siap membantu pertanyaan seputar produk maupun pengecekan tarif ongkos kirim (ongkir) kurir ke seluruh wilayah Indonesia.\n\n` +
     `Boleh diinfokan nama kota/kecamatan tujuan Kakak agar langsung kami bantu cek tarif ongkirnya? 📍`;
 
-  const draft = resolveOrderDraft(rawMessage, products, defaultWeight);
   const generalFallback = withIdentitySuffix(fallbackReply, slotAck, nameAsk);
 
   if (!geminiApiKey) {
@@ -1255,6 +1543,7 @@ pengantar.`
     guard,
     fallback: generalFallback,
     label: "obrolan",
+    trace,
     prompt: `${voiceText}
 
 DATA — katalog produk toko:

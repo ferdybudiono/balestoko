@@ -248,17 +248,25 @@ export default function CheckoutModal({
         onClick={() => !busy && onClose()}
       />
 
-      {/* Panel */}
-      <div className="relative w-full max-w-md animate-scale-in rounded-t-3xl bg-white shadow-card-lg sm:rounded-3xl">
+      {/*
+        Panel — TINGGI DIBATASI & isinya yang menggulir, bukan halaman.
+        Scroll body dimatikan selama modal terbuka (lihat efek di atas), jadi
+        panel tanpa batas tinggi berarti tombol "Bayar" di bawahnya keluar dari
+        layar dan tidak bisa dijangkau sama sekali pada ponsel pendek atau saat
+        keyboard virtual muncul. Karena itu: kolom flex dengan tinggi maksimum,
+        satu-satunya area yang menggulir adalah isian formulir, dan footer
+        (tombol bayar) selalu menempel di dasar panel.
+      */}
+      <div className="relative flex max-h-[100dvh] w-full max-w-md flex-col overflow-hidden animate-scale-in rounded-t-3xl bg-white shadow-card-lg sm:max-h-[calc(100dvh-2rem)] sm:rounded-3xl">
         {/* Header */}
-        <div className="flex items-start justify-between gap-4 border-b border-slate-100 p-6 pb-5">
+        <div className="flex shrink-0 items-start justify-between gap-4 border-b border-slate-100 p-5 pb-4 sm:p-6 sm:pb-5">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wider text-brand-600">
               Checkout Pembayaran
             </p>
             <h2
               id="checkout-title"
-              className="mt-1 text-xl font-bold text-ink"
+              className="mt-1 text-lg font-bold text-ink sm:text-xl"
             >
               Paket {plan.name}
             </h2>
@@ -278,9 +286,11 @@ export default function CheckoutModal({
         {terminal ? (
           <ResultView status={status} planName={plan.name} email={form.email} onClose={onClose} />
         ) : (
-          <form onSubmit={handleSubmit} className="p-6 pt-5">
+          <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+            {/* Area isian — SATU-SATUNYA bagian yang menggulir. */}
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-4 sm:px-6 sm:py-5">
             {/* Ringkasan harga */}
-            <div className="mb-5 flex items-center justify-between rounded-2xl bg-brand-50 px-4 py-3">
+            <div className="mb-4 flex items-center justify-between rounded-2xl bg-brand-50 px-4 py-3">
               <span className="text-sm font-medium text-brand-800">
                 Total pembayaran
               </span>
@@ -370,7 +380,8 @@ export default function CheckoutModal({
                   revealable
                   autoComplete="new-password"
                 />
-              )}              <div>
+              )}
+              <div>
                 <Field
                   icon={<Ticket className="h-4 w-4" />}
                   label="Kode Kupon (opsional)"
@@ -408,11 +419,17 @@ export default function CheckoutModal({
                 </div>
               </div>
             )}
+            </div>
 
+            {/*
+              Footer tetap — tombol bayar tidak pernah ikut tergulir keluar.
+              `pb` memakai safe-area agar tidak tertutup home indicator iOS.
+            */}
+            <div className="shrink-0 border-t border-slate-100 bg-white px-5 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6">
             <button
               type="submit"
               disabled={busy}
-              className="group mt-5 flex w-full items-center justify-center gap-2 rounded-2xl bg-brand-600 px-5 py-3.5 text-base font-semibold text-white shadow-glow transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-70"
+              className="group flex w-full items-center justify-center gap-2 rounded-2xl bg-brand-600 px-5 py-3.5 text-base font-semibold text-white shadow-glow transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-70"
             >
               {status.kind === "submitting" ? (
                 <>
@@ -432,9 +449,10 @@ export default function CheckoutModal({
               )}
             </button>
 
-            <div className="mt-4 flex items-center justify-center gap-1.5 text-xs text-ink-muted">
+            <div className="mt-3 flex items-center justify-center gap-1.5 text-xs text-ink-muted">
               <ShieldCheck className="h-3.5 w-3.5 text-brand-500" />
               Pembayaran aman &amp; terenkripsi via Midtrans
+            </div>
             </div>
           </form>
         )}
@@ -546,7 +564,7 @@ function ResultView({
       : "";
 
   return (
-    <div className="p-8 text-center space-y-4">
+    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] text-center space-y-4 sm:p-8">
       <div
         className={`mx-auto flex h-16 w-16 items-center justify-center rounded-full ${
           success ? "bg-emerald-100" : "bg-amber-100"

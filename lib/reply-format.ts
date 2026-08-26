@@ -28,6 +28,15 @@ export interface OrderDraftLine {
 export interface OrderDraft {
   lines: OrderDraftLine[];
   subtotal: number;
+  /**
+   * Jumlah SELURUH barang (Σ units), bukan jumlah baris.
+   *
+   * Dipisahkan sebagai field sendiri karena inilah angka yang paling sering
+   * dikonfirmasi pembeli ("jadi 5 pcs ya?") dan yang dipakai gudang menyiapkan
+   * paket. Menghitungnya ulang di tiap pemanggil berarti cepat atau lambat ada
+   * satu tempat yang lupa mengalikan dengan `units`.
+   */
+  totalUnits: number;
   weightGram: number;
   /** `matched` = berat dari produk yang disebut pembeli; `default` = asumsi toko. */
   weightSource: "matched" | "default";
@@ -163,6 +172,11 @@ function leader(label: string): string {
 //  Blok teks
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Σ units — satu-satunya tempat jumlah barang dihitung. */
+export function countDraftUnits(lines: OrderDraftLine[]): number {
+  return lines.reduce((sum, l) => sum + (Number.isFinite(l.units) && l.units > 0 ? l.units : 0), 0);
+}
+
 /**
  * Rincian produk + subtotal + berat.
  *
@@ -178,7 +192,12 @@ export function formatOrderSummary(draft: OrderDraft): string {
     return `${leader(label)} ${amount}`;
   });
 
+  const units = draft.totalUnits > 0 ? draft.totalUnits : countDraftUnits(draft.lines);
+
   let text = `🛍️ *Ringkasan pesanan*\n${rows.join("\n")}\n${SEPARATOR}\n`;
+  // Jumlah barang dicetak hanya bila memang lebih dari satu: pada pesanan satu
+  // potong, baris "Total barang: 1 pcs" cuma menambah panjang pesan.
+  if (units > 1) text += `${leader("Total barang")} ${units} pcs\n`;
   text += `${leader("Subtotal produk")} ${rp(draft.subtotal)}\n`;
   text += `⚖️ Berat paket: ${formatWeight(draft.weightGram)}`;
   if (draft.weightSource === "default") text += ` (perkiraan)`;
@@ -382,6 +401,15 @@ export interface OngkirReplyParams {
   /** Pemilik toko membatasi ekspedisi — mempengaruhi bunyi pesan "kosong". */
   courierFilterActive?: boolean;
   maxOptions?: number;
+  /**
+   * Data penerima yang sudah tercatat. Diisi HANYA saat balasan ini menutup
+   * sebuah pesanan (pembeli menyatakan memesan), supaya pembeli bisa mengoreksi
+   * salah tulis sebelum paket dikirim. Pada pertanyaan ongkir biasa dibiarkan
+   * kosong — orang yang baru bertanya tarif belum tentu memesan, dan membacakan
+   * datanya di situ terasa seperti pesanan yang tiba-tiba sudah jadi.
+   */
+  customerName?: string | null;
+  customerAddress?: string | null;
 }
 
 /**
@@ -400,7 +428,9 @@ export function buildOngkirReply(params: OngkirReplyParams): string {
     includeTotal = true,
     includePayment = true,
     courierFilterActive = false,
-    maxOptions = MAX_WHATSAPP_OPTIONS
+    maxOptions = MAX_WHATSAPP_OPTIONS,
+    customerName,
+    customerAddress
   } = params;
 
   const estimate = source === "mock";
@@ -412,6 +442,12 @@ export function buildOngkirReply(params: OngkirReplyParams): string {
   const blocks: string[] = [];
 
   if (hasLines) blocks.push(formatOrderSummary(draft));
+
+  // Data penerima dibacakan ulang pada balasan yang menutup pesanan.
+  const identity: string[] = [];
+  if (customerName) identity.push(`👤 Nama: *${customerName}*`);
+  if (customerAddress) identity.push(`🏠 Alamat: ${customerAddress}`);
+  if (identity.length > 0) blocks.push(`*Data penerima*\n${identity.join("\n")}`);
 
   let header = estimate
     ? `🚚 *Perkiraan ongkir ke ${destinationName}*`

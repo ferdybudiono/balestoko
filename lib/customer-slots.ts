@@ -204,6 +204,80 @@ export function isOrderCommit(message: string): boolean {
   return ORDER_COMMIT_PATTERNS.some((p) => p.test(text));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Tujuan pengiriman dari alamat
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Kata yang sering menempel di potongan alamat tapi bukan bagian nama tempat.
+ * Tanpa ini, "Kec. Coblong Kota Bandung 40132" menghasilkan kandidat yang tidak
+ * pernah ditemukan pencarian lokasi kurir.
+ */
+const PLACE_NOISE = [
+  "kec", "kecamatan", "kel", "kelurahan", "desa", "kota", "kab", "kabupaten",
+  "provinsi", "prov", "kode", "pos", "kodepos", "no", "nomor", "rt", "rw",
+  "blok", "jl", "jln", "jalan", "gang", "gg", "rumah", "dekat", "depan"
+];
+
+/**
+ * Rapikan satu kandidat nama tempat: buang angka, tanda baca, dan kata penanda,
+ * lalu batasi 2 kata. Pencarian lokasi kurir mencocokkan nama kecamatan/kota —
+ * "coblong bandung jawa barat" justru tidak ketemu, sedangkan "coblong" ketemu.
+ */
+function cleanPlace(raw: string): string {
+  const words = raw
+    .toLowerCase()
+    .replace(/[^a-z\s]+/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !PLACE_NOISE.includes(w));
+  if (words.length === 0) return "";
+  return words.slice(0, 2).join(" ").slice(0, 40);
+}
+
+/**
+ * Tebak kata kunci tujuan pengiriman dari alamat lengkap yang sudah tercatat.
+ *
+ * DIPAKAI UNTUK APA: ketika pembeli menyatakan memesan tanpa menyebut kota lagi
+ * ("oke pesan 2 kaos") padahal alamatnya sudah dikirim di chat sebelumnya,
+ * ongkirnya seharusnya bisa langsung dihitung dari alamat itu — bukan malah
+ * bertanya ulang "kirim ke mana?" pada orang yang sudah menjawabnya.
+ *
+ * Urutan aturan mengikuti apa yang paling berguna bagi kurir: kecamatan dulu
+ * (tarif dihitung per kecamatan), lalu kota/kabupaten, terakhir potongan koma
+ * yang murni huruf. Hasilnya sengaja hanya KATA KUNCI PENCARIAN — benar atau
+ * tidaknya ditentukan oleh pencarian lokasi kurir, bukan oleh fungsi ini.
+ */
+export function extractShippingCityQuery(address?: string | null): string {
+  const text = collapse(address || "");
+  if (!text) return "";
+
+  // 1. Kecamatan — satuan tarif yang paling tepat.
+  const kec = /\bkec(?:amatan)?\.?\s+([a-zA-Z\s]{3,30})/.exec(text);
+  if (kec) {
+    const place = cleanPlace(kec[1]);
+    if (place) return place;
+  }
+
+  // 2. Kota / kabupaten.
+  const city = /\b(?:kota|kab(?:upaten)?)\.?\s+([a-zA-Z\s]{3,30})/.exec(text);
+  if (city) {
+    const place = cleanPlace(city[1]);
+    if (place) return place;
+  }
+
+  // 3. Potongan koma terakhir yang murni huruf — pola alamat "…, Coblong,
+  //    Bandung, 40132" sangat umum, dan bagian belakangnya justru yang berisi
+  //    nama wilayah. Kode pos dan nomor rumah otomatis tersaring.
+  const segments = text.split(",").map((s) => s.trim()).filter(Boolean);
+  for (let i = segments.length - 1; i >= 0; i--) {
+    if (!/^[a-zA-Z\s.]+$/.test(segments[i])) continue;
+    const place = cleanPlace(segments[i]);
+    if (place) return place;
+  }
+
+  return "";
+}
+
 /**
  * Pertanyaan pemancing untuk slot yang belum terisi.
  *

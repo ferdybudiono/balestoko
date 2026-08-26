@@ -112,13 +112,15 @@ export default function TrialModal({ open, onClose }: TrialModalProps) {
   return (
     <div className="fixed inset-0 z-[100] flex items-end justify-center p-0 sm:items-center sm:p-4" role="dialog" aria-modal="true" aria-labelledby="trial-title">
       <div className="absolute inset-0 bg-ink/60 backdrop-blur-sm animate-fade-in" onClick={() => !submitting && onClose()} />
-      <div className="relative w-full max-w-md animate-scale-in rounded-t-3xl bg-white shadow-card-lg sm:rounded-3xl">
-        <div className="flex items-start justify-between gap-4 border-b border-slate-100 p-6 pb-5">
+      {/* Tinggi dibatasi & isian yang menggulir — lihat CheckoutModal: tanpa ini
+          tombol di dasar panel bisa keluar layar pada viewport pendek. */}
+      <div className="relative flex max-h-[100dvh] w-full max-w-md flex-col overflow-hidden animate-scale-in rounded-t-3xl bg-white shadow-card-lg sm:max-h-[calc(100dvh-2rem)] sm:rounded-3xl">
+        <div className="flex shrink-0 items-start justify-between gap-4 border-b border-slate-100 p-5 pb-4 sm:p-6 sm:pb-5">
           <div>
             <p className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-emerald-600">
               <Gift className="h-3.5 w-3.5" /> Uji Coba Gratis
             </p>
-            <h2 id="trial-title" className="mt-1 text-xl font-bold text-ink">Coba 7 Hari Tanpa Bayar</h2>
+            <h2 id="trial-title" className="mt-1 text-lg font-bold text-ink sm:text-xl">Coba 7 Hari Tanpa Bayar</h2>
             <p className="mt-0.5 text-sm text-ink-muted">Akses penuh fitur Pro. Tanpa kartu kredit.</p>
           </div>
           <button onClick={() => !submitting && onClose()} disabled={submitting} aria-label="Tutup" className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40">
@@ -126,7 +128,8 @@ export default function TrialModal({ open, onClose }: TrialModalProps) {
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 pt-5">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-4 sm:px-6 sm:py-5">
           <div className="space-y-3.5">
             <TrialField ref={firstFieldRef} icon={<User className="h-4 w-4" />} label="Nama Lengkap" placeholder="mis. Budi Santoso" value={form.name} onChange={(v) => update("name", v)} error={errors.name} autoComplete="name" />
             <TrialField icon={<Phone className="h-4 w-4" />} label="Nomor WhatsApp Toko" placeholder="mis. 0812xxxxxxx" value={form.whatsapp} onChange={(v) => update("whatsapp", v)} error={errors.whatsapp} inputMode="tel" autoComplete="tel" />
@@ -141,13 +144,16 @@ export default function TrialModal({ open, onClose }: TrialModalProps) {
               <span>{serverError}</span>
             </div>
           )}
+          </div>
 
-          <button type="submit" disabled={submitting} className="mt-5 flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-5 py-3.5 text-base font-semibold text-white shadow-glow transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-70">
+          <div className="shrink-0 border-t border-slate-100 bg-white px-5 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6">
+          <button type="submit" disabled={submitting} className="flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-5 py-3.5 text-base font-semibold text-white shadow-glow transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-70">
             {submitting ? (<><Loader2 className="h-5 w-5 animate-spin" /> Membuat akun uji coba…</>) : (<><Gift className="h-4 w-4" /> Mulai Uji Coba 7 Hari <ArrowRight className="h-4 w-4" /></>)}
           </button>
-          <p className="mt-4 text-center text-xs text-ink-muted">
+          <p className="mt-3 text-center text-xs text-ink-muted">
             Setelah 7 hari, langganan berbayar diperlukan untuk melanjutkan.
           </p>
+          </div>
         </form>
       </div>
     </div>

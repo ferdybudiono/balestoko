@@ -227,6 +227,10 @@ export async function runAutoReply(params: {
     // identitas diam-diam hanya jalan di Pro.
     knownCustomerName: conversation?.customer_name,
     knownCustomerAddress: conversation?.customer_address,
+    // Tujuan yang sudah pernah dihitung di percakapan ini — dipakai supaya
+    // "oke pesan 2 kaos" tetap dibalas lengkap dengan ongkir tanpa memaksa
+    // pembeli menyebut kotanya lagi.
+    knownDestinationCity: conversation?.destination_city,
     lastAssistantMessage: lastAssistantText(history)
   });
 

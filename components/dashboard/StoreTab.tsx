@@ -52,6 +52,37 @@ interface Rate {
   belowMinimumWeight?: boolean;
 }
 
+/**
+ * Hasil pratinjau dari `/api/store/preview-reply` — balasan yang disusun dengan
+ * KATALOG SUNGGUHAN toko ini, bukan produk karangan.
+ */
+interface PreviewRun {
+  reply: string;
+  intent: string;
+  /** `true` = kalimatnya benar-benar ditulis ulang AI (bukan format sistem). */
+  aiNarrated: boolean;
+  aiFallbackReason?: "no-key" | "no-reply" | "bad-numbers" | "deterministic";
+  /** Angka karangan AI yang membuat balasannya ditolak. */
+  aiRejectedNumber?: string;
+  detectedCity?: string;
+  rateSource?: "live" | "mock";
+  shippingWeightGram?: number;
+  totalUnits: number;
+  subtotal: number;
+  matchedProducts: { name: string; units: number }[];
+  ambiguous: string[];
+  /** Pemilik toko menekan tombol "balasan final AI", bukan tombol isi. */
+  requestedFinal: boolean;
+}
+
+/** Kenapa balasan AI tidak dipakai — ditampilkan apa adanya ke pemilik toko. */
+const FALLBACK_NOTE: Record<NonNullable<PreviewRun["aiFallbackReason"]>, string> = {
+  "deterministic": "Kalimat disusun sistem (AI tidak dipanggil).",
+  "no-key": "GEMINI_API_KEY belum terpasang, jadi kalimat sistem yang dikirim.",
+  "no-reply": "AI tidak menjawab (jaringan/kuota), kalimat sistem dipakai sebagai pengganti.",
+  "bad-numbers": "Balasan AI dibuang karena memuat angka di luar hitungan sistem."
+};
+
 export interface StoreForm {
   storeName: string;
   originCityName: string;
@@ -126,6 +157,20 @@ export default function StoreTab({
   const [rateDest, setRateDest] = useState("");
   const [calculating, setCalculating] = useState(false);
 
+  // ── Pratinjau balasan dengan contoh milik pemilik toko ────────────────
+  // Pesan contohnya BOLEH DIUBAH: itulah yang membuat pratinjau ini berguna.
+  // Pemilik toko menulis kalimat seperti pembelinya sungguhan ("mau 2 kaos
+  // polos kirim ke Bandung"), lalu melihat apa yang benar-benar dibalas —
+  // termasuk apakah jumlah barangnya terbaca benar dan ongkirnya ikut dihitung.
+  const [sampleMessage, setSampleMessage] = useState(
+    "Halo kak, mau pesan 2 kaos polos, kirim ke Bandung ya"
+  );
+  const [sampleName, setSampleName] = useState("");
+  const [sampleAddress, setSampleAddress] = useState("");
+  const [previewRun, setPreviewRun] = useState<PreviewRun | null>(null);
+  /** Tombol mana yang sedang berjalan — supaya keduanya tidak bisa ditekan bersamaan. */
+  const [previewBusy, setPreviewBusy] = useState<"content" | "final" | null>(null);
+
   const searchLocations = async (
     q: string,
     apply: (items: LocationOption[], source: "live" | "mock") => void,
@@ -176,6 +221,84 @@ export default function StoreTab({
       showToast("Gagal menghitung ongkir.", "error");
     } finally {
       setCalculating(false);
+    }
+  };
+
+  /**
+   * Jalankan pratinjau di server dengan KATALOG SUNGGUHAN toko.
+   *
+   * `final = false` → hanya isi balasan yang dihitung sistem: instan, tanpa
+   * memanggil Gemini sama sekali. `final = true` → minta AI menuliskan ulang,
+   * jadi inilah kalimat yang benar-benar diterima pembeli.
+   *
+   * Pengaturan dikirim dari FORM yang sedang dibuka, termasuk yang belum
+   * disimpan — supaya pemilik toko bisa menilai perubahan instruksi & nada
+   * bicara sebelum menekan Simpan. Endpoint-nya tidak mengirim WhatsApp, tidak
+   * menyimpan percakapan, dan tidak memotong kuota bulanan.
+   */
+  const runPreview = async (final: boolean) => {
+    const message = sampleMessage.trim();
+    if (!message) {
+      showToast("Tulis dulu contoh pesan pembelinya.", "error");
+      return;
+    }
+    setPreviewBusy(final ? "final" : "content");
+    try {
+      const res = await fetch("/api/store/preview-reply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message,
+          final,
+          customerName: sampleName.trim() || undefined,
+          customerAddress: sampleAddress.trim() || undefined,
+          settings: {
+            store_name: form.storeName,
+            origin_subdistrict_id: form.originSubdistrictId,
+            origin_city_name: form.originCityName,
+            default_weight: Number(form.defaultWeight) || 1000,
+            ai_prompt_system: form.aiPromptSystem,
+            greeting_message: form.greetingMessage,
+            active_couriers: form.activeCouriers,
+            local_courier: {
+              enabled: form.localCourierEnabled,
+              label: form.localCourierLabel,
+              cost: Number(form.localCourierCost) || 0,
+              etd: form.localCourierEtd
+            },
+            payment_accounts: form.paymentAccounts,
+            cod_enabled: form.codEnabled,
+            payment_note: form.paymentNote,
+            ai_tone: form.aiTone,
+            ai_include_total: form.includeTotal,
+            ai_include_payment: form.includePayment
+          }
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        showToast(data.error || "Gagal menyusun pratinjau balasan.", "error");
+        return;
+      }
+      setPreviewRun({
+        reply: String(data.reply || ""),
+        intent: String(data.intent || ""),
+        aiNarrated: data.aiNarrated === true,
+        aiFallbackReason: data.aiFallbackReason,
+        aiRejectedNumber: data.aiRejectedNumber,
+        detectedCity: data.detectedCity,
+        rateSource: data.rateSource === "mock" ? "mock" : data.rateSource === "live" ? "live" : undefined,
+        shippingWeightGram: Number(data.shippingWeightGram) || undefined,
+        totalUnits: Number(data.totalUnits) || 0,
+        subtotal: Number(data.subtotal) || 0,
+        matchedProducts: Array.isArray(data.matchedProducts) ? data.matchedProducts : [],
+        ambiguous: Array.isArray(data.ambiguous) ? data.ambiguous : [],
+        requestedFinal: final
+      });
+    } catch {
+      showToast("Gagal menghubungi server untuk pratinjau.", "error");
+    } finally {
+      setPreviewBusy(null);
     }
   };
 
@@ -253,6 +376,7 @@ export default function StoreTab({
         { name: "Kaos Polos", units: 2, weight: 250, price: 60000, lineTotal: 120000 },
         { name: "Topi Rajut", units: 1, weight: 250, price: 45000, lineTotal: 45000 }
       ],
+      totalUnits: 3,
       subtotal: 165000,
       weightGram: 750,
       weightSource: "matched",
@@ -880,6 +1004,188 @@ export default function StoreTab({
               isi yang sama dengan gaya bahasa sesuai instruksi &amp; nada di atas &mdash; semua
               angka tetap dari hitungan sistem, tidak pernah dari AI.
             </p>
+          </div>
+
+          {/* ── Coba dengan contoh sendiri ───────────────────────────────
+              Bedanya dengan pratinjau di atas: yang ini berjalan di server
+              dengan KATALOG SUNGGUHAN toko dan pengaturan yang sedang dibuka
+              (termasuk yang belum disimpan). Tidak ada WhatsApp terkirim,
+              percakapan tidak disimpan, dan kuota bulanan tidak terpotong. */}
+          <div className="p-4 sm:p-5 bg-slate-50 border border-slate-200 rounded-2xl space-y-4">
+            <div>
+              <h4 className="text-sm font-bold text-ink flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-brand-600" aria-hidden="true" />
+                Coba sendiri: tulis contoh pesan pembeli
+              </h4>
+              <p className="text-xs text-slate-500 mt-1">
+                Dijalankan dengan <strong>produk asli toko Anda</strong> dan pengaturan di halaman
+                ini &mdash; termasuk yang belum disimpan. Tidak ada pesan WhatsApp yang dikirim,
+                percakapan tidak disimpan, dan kuota bulanan tidak terpakai.
+              </p>
+            </div>
+
+            <div>
+              <label htmlFor="preview-message" className={labelCls}>
+                Contoh pesan pembeli
+              </label>
+              <textarea
+                id="preview-message"
+                rows={2}
+                maxLength={600}
+                value={sampleMessage}
+                onChange={(e) => setSampleMessage(e.target.value)}
+                placeholder="mau pesan 2 kaos polos kirim ke Bandung"
+                className={`${inputCls} py-3 bg-white`}
+              />
+              <p className="text-xs text-slate-400 mt-1.5">
+                Tulis seperti pembeli sungguhan, lengkap dengan jumlahnya (&ldquo;2 pcs&rdquo;,
+                &ldquo;3 lusin&rdquo;) dan kota tujuannya. {sampleMessage.length}/600
+              </p>
+            </div>
+
+            <div className="grid sm:grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="preview-name" className={labelCls}>
+                  Nama pembeli (opsional)
+                </label>
+                <input
+                  id="preview-name"
+                  type="text"
+                  maxLength={60}
+                  value={sampleName}
+                  onChange={(e) => setSampleName(e.target.value)}
+                  placeholder="Budi Santoso"
+                  className={`${inputCls} bg-white`}
+                />
+              </div>
+              <div>
+                <label htmlFor="preview-address" className={labelCls}>
+                  Alamat pembeli (opsional)
+                </label>
+                <input
+                  id="preview-address"
+                  type="text"
+                  maxLength={400}
+                  value={sampleAddress}
+                  onChange={(e) => setSampleAddress(e.target.value)}
+                  placeholder="Jl. Merdeka 10, Kec. Coblong, Kota Bandung 40132"
+                  className={`${inputCls} bg-white`}
+                />
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 -mt-1">
+              Isi keduanya untuk meniru pembeli yang datanya sudah tercatat: ongkirnya dihitung dari
+              alamat itu walau pesannya tidak menyebut kota lagi.
+            </p>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => runPreview(false)}
+                disabled={previewBusy !== null}
+                className="px-4 py-2.5 bg-white hover:bg-slate-100 disabled:opacity-60 border border-slate-200 text-sm font-medium text-slate-700 rounded-xl transition-colors flex items-center gap-1.5"
+              >
+                {previewBusy === "content" ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Calculator className="w-3.5 h-3.5" aria-hidden="true" />
+                )}
+                <span>Lihat isi balasan</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => runPreview(true)}
+                disabled={previewBusy !== null}
+                className="px-4 py-2.5 bg-brand-600 hover:bg-brand-700 disabled:opacity-60 text-white text-sm font-semibold rounded-xl transition-colors flex items-center gap-1.5 shadow-card"
+              >
+                {previewBusy === "final" ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <MessageSquare className="w-3.5 h-3.5" aria-hidden="true" />
+                )}
+                <span>Lihat balasan final AI</span>
+              </button>
+            </div>
+
+            {previewRun && (
+              <div className="space-y-3">
+                <div className="p-4 bg-white border border-slate-200 rounded-2xl overflow-x-auto">
+                  <p className="text-[13px] leading-relaxed text-ink whitespace-pre-wrap">
+                    {previewRun.reply || "(balasan kosong)"}
+                  </p>
+                </div>
+
+                {/* Label sumber kalimat: pemilik toko harus tahu apakah yang dia
+                    baca benar-benar tulisan AI, atau format sistem karena
+                    balasan AI-nya ditolak/tidak ada. */}
+                <div className="flex flex-wrap items-center gap-2">
+                  {previewRun.aiNarrated ? (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-brand-50 border border-brand-100 text-brand-700 text-xs font-semibold rounded-lg">
+                      <Sparkles className="w-3 h-3" aria-hidden="true" />
+                      Kalimat ditulis AI
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 border border-slate-200 text-slate-600 text-xs font-semibold rounded-lg">
+                      <CheckCircle className="w-3 h-3" aria-hidden="true" />
+                      Kalimat sistem
+                    </span>
+                  )}
+                  {previewRun.intent && (
+                    <span className="px-2.5 py-1 bg-slate-100 border border-slate-200 text-slate-600 text-xs font-medium rounded-lg">
+                      {previewRun.intent}
+                    </span>
+                  )}
+                  {previewRun.totalUnits > 0 && (
+                    <span className="px-2.5 py-1 bg-slate-100 border border-slate-200 text-slate-600 text-xs font-medium rounded-lg">
+                      {previewRun.totalUnits} barang &middot; {formatRupiah(previewRun.subtotal)}
+                    </span>
+                  )}
+                  {previewRun.detectedCity && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 bg-slate-100 border border-slate-200 text-slate-600 text-xs font-medium rounded-lg">
+                      <MapPin className="w-3 h-3" aria-hidden="true" />
+                      {previewRun.detectedCity}
+                      {previewRun.shippingWeightGram ? ` · ${previewRun.shippingWeightGram} g` : ""}
+                    </span>
+                  )}
+                  {previewRun.rateSource === "mock" && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 bg-amber-50 border border-amber-200 text-amber-700 text-xs font-semibold rounded-lg">
+                      <TriangleAlert className="w-3 h-3" aria-hidden="true" />
+                      Tarif perkiraan
+                    </span>
+                  )}
+                </div>
+
+                {previewRun.matchedProducts.length > 0 && (
+                  <p className="text-xs text-slate-500">
+                    Produk yang terbaca:{" "}
+                    {previewRun.matchedProducts.map((p) => `${p.name} ×${p.units}`).join(", ")}
+                  </p>
+                )}
+                {previewRun.matchedProducts.length === 0 && (
+                  <p className="text-xs text-slate-500">
+                    Tidak ada produk katalog yang terbaca dari pesan ini. Sebut nama produknya persis
+                    seperti di tab Produk agar jumlah &amp; ongkirnya dihitung.
+                  </p>
+                )}
+                {previewRun.ambiguous.length > 0 && (
+                  <p className="text-xs text-amber-700">
+                    Nama yang masih ambigu: {previewRun.ambiguous.join(", ")}
+                  </p>
+                )}
+                {!previewRun.aiNarrated && previewRun.aiFallbackReason && (
+                  <p className="text-xs text-slate-500">
+                    {FALLBACK_NOTE[previewRun.aiFallbackReason]}
+                    {previewRun.aiRejectedNumber ? ` Angka yang ditolak: ${previewRun.aiRejectedNumber}.` : ""}
+                  </p>
+                )}
+                {previewRun.requestedFinal && (
+                  <p className="text-xs text-slate-400">
+                    Angka pada balasan di atas selalu dari hitungan sistem. Balasan AI yang
+                    menyelipkan angka lain otomatis dibuang dan versi sistem yang dikirim.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
