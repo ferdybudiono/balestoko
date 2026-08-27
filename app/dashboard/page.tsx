@@ -5,11 +5,14 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   Bot,
+  BookOpen,
   CheckCircle,
+  CircleHelp,
   ClipboardList,
   Clock,
   Crown,
   LayoutDashboard,
+  LifeBuoy,
   LogOut,
   MapPin,
   MessageSquare,
@@ -27,11 +30,13 @@ import OrdersTab from "@/components/dashboard/OrdersTab";
 import OverviewTab from "@/components/dashboard/OverviewTab";
 import ProductsTab from "@/components/dashboard/ProductsTab";
 import StoreTab, { type StoreForm } from "@/components/dashboard/StoreTab";
+import TeamMembers from "@/components/dashboard/TeamMembers";
 import WhatsappTab from "@/components/dashboard/WhatsappTab";
 import { computeStats } from "@/components/dashboard/stats";
 import { isDeviceConnected } from "@/components/dashboard/types";
 import type {
   BuyerOrder,
+  BuyerOrderStatus,
   Conversation,
   FonnteStatus,
   Product,
@@ -55,6 +60,14 @@ const TABS: Array<{ id: TabId; icon: typeof LayoutDashboard; label: string; shor
 ];
 
 const TAB_IDS = TABS.map((t) => t.id);
+
+/** Konfirmasi per tahap — kalimatnya menyebut apa yang berubah, bukan "berhasil". */
+const ORDER_STATUS_TOAST: Record<BuyerOrderStatus, string> = {
+  new: "Pesanan dibuka kembali.",
+  paid: "Pesanan ditandai sudah dibayar.",
+  shipped: "Pesanan ditandai sudah dikirim.",
+  done: "Pesanan ditandai selesai."
+};
 
 /**
  * Status masa aktif toko — cerminan `storeActivityState()` di server.
@@ -92,7 +105,10 @@ const EMPTY_FORM: StoreForm = {
 
   aiTone: "ramah",
   includeTotal: true,
-  includePayment: true
+  includePayment: true,
+
+  alertPhone: "",
+  notifyEnabled: true
 };
 
 /** Bandingkan isi form (flat, semua kunci sama) untuk deteksi perubahan. */
@@ -109,6 +125,15 @@ function isMengantarId(id: string): boolean {
 }
 
 const POLL_MS = 25_000;
+/**
+ * Penyegaran khusus saat tab Chat terbuka.
+ *
+ * 25 detik cukup untuk kartu ringkasan, tapi terasa rusak pada percakapan yang
+ * sedang ditangani manusia: pemilik toko sudah membalas dan menunggu jawaban
+ * pembeli sambil menatap layar. Hanya berjalan saat tab Chat aktif & terlihat,
+ * jadi biayanya tidak dibayar tab lain.
+ */
+const CHAT_POLL_MS = 8_000;
 const QR_POLL_MS = 5_000;
 /** QR Fonnte kedaluwarsa; berhenti polling setelah ~3 menit. */
 const QR_MAX_TICKS = 36;
@@ -197,6 +222,9 @@ export default function DashboardPage() {
   // Simpan NOMOR, bukan objek: refetch berkala tidak lagi melempar user
   // kembali ke percakapan pertama.
   const [selectedPhone, setSelectedPhone] = useState<string | null>(null);
+  // Balasan manual sedang dikirim / mode AI sedang diubah untuk nomor ini.
+  const [chatSending, setChatSending] = useState(false);
+  const [chatPausingPhone, setChatPausingPhone] = useState<string | null>(null);
 
   // Pesanan pembeli hasil rekaman AI (tab "Pesanan").
   const [buyerOrders, setBuyerOrders] = useState<BuyerOrder[]>([]);
@@ -340,7 +368,13 @@ export default function DashboardPage() {
           // `?? true`: kolomnya baru, jadi baris yang belum pernah disimpan sejak
           // migrasi harus tetap dianggap menyertakan total & cara bayar.
           includeTotal: s.ai_include_total ?? true,
-          includePayment: s.ai_include_payment ?? true
+          includePayment: s.ai_include_payment ?? true,
+
+          alertPhone: s.alert_phone || "",
+          // Kolom `not null default true`, tapi baris lama yang dibaca sebelum
+          // migrasi bisa mengirim undefined — dan diam-diam mematikan kabar
+          // penting jauh lebih merugikan daripada mengirim satu kabar berlebih.
+          notifyEnabled: s.notify_enabled ?? true
         };
         // Jangan timpa apa yang sedang diedit user saat polling berjalan.
         const wasDirty = !sameForm(formRef.current, savedFormRef.current);
@@ -398,6 +432,17 @@ export default function DashboardPage() {
       document.removeEventListener("visibilitychange", tick);
     };
   }, [fetchStoreData]);
+
+  // Tab Chat: penyegaran lebih cepat, dan HANYA selama tab itu terbuka. Pemilik
+  // toko yang sedang membalas sendiri menunggu jawaban pembeli sambil menatap
+  // layar — 25 detik terasa seperti aplikasinya menggantung.
+  useEffect(() => {
+    if (activeTab !== "chats") return;
+    const id = setInterval(() => {
+      if (document.visibilityState === "visible") fetchStoreData({ light: true, silent: true });
+    }, CHAT_POLL_MS);
+    return () => clearInterval(id);
+  }, [activeTab, fetchStoreData]);
 
   // Countdown uji coba ikut berjalan tanpa perlu refresh halaman.
   useEffect(() => {
@@ -662,7 +707,9 @@ export default function DashboardPage() {
         payment_note: form.paymentNote,
         ai_tone: form.aiTone,
         ai_include_total: form.includeTotal,
-        ai_include_payment: form.includePayment
+        ai_include_payment: form.includePayment,
+        alert_phone: form.alertPhone.trim(),
+        notify_enabled: form.notifyEnabled
       };
 
       const res = await fetch("/api/store", {
@@ -732,19 +779,39 @@ export default function DashboardPage() {
 
   // ── Pesanan pembeli ───────────────────────────────────────────────────
   //
-  // Perubahan status ditulis OPTIMIS ke state supaya centang "selesai" terasa
-  // langsung, lalu dikembalikan bila server menolak. Tanpa itu tombol terasa
-  // menggantung selama satu round-trip PostgREST.
-  const handleToggleOrderDone = useCallback(
-    async (order: BuyerOrder, done: boolean) => {
+  // Perubahan status ditulis OPTIMIS ke state supaya tombol tahap berikutnya
+  // terasa langsung, lalu SELURUH baris lama dipulihkan bila server menolak.
+  // Memulihkan barisnya (bukan hanya `status`) penting sejak pesanan punya empat
+  // tahap: satu PATCH gagal juga tidak boleh meninggalkan stempel waktu atau
+  // nomor resi yang sebenarnya tidak pernah tersimpan.
+  const handleSetOrderStatus = useCallback(
+    async (
+      order: BuyerOrder,
+      status: BuyerOrderStatus,
+      extra?: { tracking_number?: string; payment_proof_url?: string }
+    ) => {
       if (!order.id) return;
       const id = order.id;
-      const before = order.status;
+      const before = order;
+      const nowIso = new Date().toISOString();
       setOrderBusyId(id);
       setBuyerOrders((prev) =>
         prev.map((o) =>
           o.id === id
-            ? { ...o, status: done ? "done" : "new", done_at: done ? new Date().toISOString() : null }
+            ? {
+                ...o,
+                status,
+                ...(extra?.tracking_number !== undefined
+                  ? { tracking_number: extra.tracking_number || null }
+                  : {}),
+                ...(extra?.payment_proof_url !== undefined
+                  ? { payment_proof_url: extra.payment_proof_url || null }
+                  : {}),
+                paid_at: status === "new" ? null : o.paid_at || nowIso,
+                shipped_at:
+                  status === "shipped" || status === "done" ? o.shipped_at || nowIso : null,
+                done_at: status === "done" ? nowIso : null
+              }
             : o
         )
       );
@@ -752,17 +819,22 @@ export default function DashboardPage() {
         const res = await fetch("/api/buyer-orders", {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id, done })
+          body: JSON.stringify({ id, status, ...(extra || {}) })
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          setBuyerOrders((prev) => prev.map((o) => (o.id === id ? { ...o, status: before } : o)));
+          setBuyerOrders((prev) => prev.map((o) => (o.id === id ? before : o)));
           showToast(data.error || "Gagal memperbarui pesanan.", "error");
           return;
         }
-        showToast(done ? "Pesanan ditandai selesai." : "Pesanan dibuka kembali.");
+        // Server mengembalikan baris hasilnya; dipakai supaya stempel waktu di
+        // layar adalah yang BENAR-BENAR tersimpan, bukan tebakan optimis.
+        if (data.order?.id) {
+          setBuyerOrders((prev) => prev.map((o) => (o.id === id ? (data.order as BuyerOrder) : o)));
+        }
+        showToast(ORDER_STATUS_TOAST[status]);
       } catch {
-        setBuyerOrders((prev) => prev.map((o) => (o.id === id ? { ...o, status: before } : o)));
+        setBuyerOrders((prev) => prev.map((o) => (o.id === id ? before : o)));
         showToast("Terjadi kesalahan saat memperbarui pesanan.", "error");
       } finally {
         setOrderBusyId(null);
@@ -795,6 +867,131 @@ export default function DashboardPage() {
     },
     [showToast]
   );
+
+  // ── Ambil alih percakapan dari bot ────────────────────────────────────
+  //
+  // Tiga aksi yang membuat tab Chat bukan lagi jendela baca-saja: kirim balasan
+  // sendiri, jeda/lanjutkan AI, dan tandai sudah dibaca. Semuanya lewat
+  // `/api/conversations`, dan `store_id`-nya selalu dari session — nomor pembeli
+  // di body hanya dipakai untuk mencari percakapan milik toko ini.
+  const handleSendManualReply = useCallback(
+    async (phone: string, message: string): Promise<boolean> => {
+      const text = message.trim();
+      if (!phone || !text) return false;
+      setChatSending(true);
+      try {
+        const res = await fetch("/api/conversations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone, message: text })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(data.error || "Pesan gagal dikirim.", "error");
+          return false;
+        }
+        // Tampilkan pesannya SEKARANG. Pesan sudah benar-benar terkirim ke
+        // pembeli (server mengirim dulu, mencatat kemudian), jadi menunggu
+        // polling berikutnya hanya membuat pemilik toko ragu apakah tombolnya
+        // bekerja.
+        const nowIso = new Date().toISOString();
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.customer_phone === phone
+              ? {
+                  ...c,
+                  messages: [
+                    ...(Array.isArray(c.messages) ? c.messages : []),
+                    { role: "assistant" as const, content: text, timestamp: nowIso }
+                  ],
+                  ai_paused: data.aiPaused === true ? true : c.ai_paused,
+                  last_seen_at: nowIso,
+                  updated_at: nowIso
+                }
+              : c
+          )
+        );
+        if (data.stored === false) {
+          // Terkirim, tapi gagal masuk riwayat. Muat ulang supaya layar tidak
+          // memamerkan pesan yang tidak ada di database.
+          fetchStoreData({ light: true, silent: true });
+        }
+        if (data.aiPaused === true) showToast("Balasan terkirim. AI dijeda untuk chat ini.");
+        else showToast("Balasan terkirim.");
+        return true;
+      } catch {
+        showToast("Terjadi kesalahan saat mengirim balasan.", "error");
+        return false;
+      } finally {
+        setChatSending(false);
+      }
+    },
+    [fetchStoreData, showToast]
+  );
+
+  const handleToggleAiPause = useCallback(
+    async (phone: string, paused: boolean) => {
+      if (!phone) return;
+      setChatPausingPhone(phone);
+      const before = conversations.find((c) => c.customer_phone === phone)?.ai_paused ?? null;
+      setConversations((prev) =>
+        prev.map((c) => (c.customer_phone === phone ? { ...c, ai_paused: paused } : c))
+      );
+      try {
+        const res = await fetch("/api/conversations", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone, ai_paused: paused })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setConversations((prev) =>
+            prev.map((c) => (c.customer_phone === phone ? { ...c, ai_paused: before } : c))
+          );
+          showToast(data.error || "Gagal mengubah mode AI.", "error");
+          return;
+        }
+        showToast(
+          paused
+            ? "AI dijeda. Chat ini menunggu balasan Anda."
+            : "AI kembali menjawab chat ini otomatis."
+        );
+      } catch {
+        setConversations((prev) =>
+          prev.map((c) => (c.customer_phone === phone ? { ...c, ai_paused: before } : c))
+        );
+        showToast("Terjadi kesalahan saat mengubah mode AI.", "error");
+      } finally {
+        setChatPausingPhone(null);
+      }
+    },
+    [conversations, showToast]
+  );
+
+  /**
+   * Tandai percakapan sudah dibaca saat dibuka.
+   *
+   * Sengaja tidak pernah memunculkan pesan galat: ini penanda kenyamanan, dan
+   * kegagalannya paling banyak menyisakan satu lencana "belum dibaca" — jauh
+   * lebih kecil ruginya daripada toast merah setiap kali pemilik toko mengklik
+   * sebuah chat.
+   */
+  const handleMarkChatSeen = useCallback(async (phone: string) => {
+    if (!phone) return;
+    const nowIso = new Date().toISOString();
+    setConversations((prev) =>
+      prev.map((c) => (c.customer_phone === phone ? { ...c, last_seen_at: nowIso } : c))
+    );
+    try {
+      await fetch("/api/conversations", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone, seen: true })
+      });
+    } catch {
+      /* diamkan — polling berikutnya memuat status yang benar */
+    }
+  }, []);
 
   // ── Cakupan produk per nomor WhatsApp ─────────────────────────────────
   const handleSaveDeviceScope = useCallback(
@@ -837,8 +1034,36 @@ export default function DashboardPage() {
     router.push("/login");
   }, [router]);
 
+  // ── Menu bantuan ──────────────────────────────────────────────────────
+  //
+  // Sebelumnya dashboard tidak punya satu pun jalan keluar ketika pemilik toko
+  // bingung: tautan panduan & alamat support hanya ada di halaman pemasaran,
+  // yang justru tidak dibuka orang yang sudah login.
+  const [helpOpen, setHelpOpen] = useState(false);
+  const helpRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!helpOpen) return;
+    const onPointer = (e: MouseEvent) => {
+      if (!helpRef.current?.contains(e.target as Node)) setHelpOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setHelpOpen(false);
+    };
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [helpOpen]);
+
   // ── Turunan ───────────────────────────────────────────────────────────
-  const stats = useMemo(() => computeStats(conversations, products), [conversations, products]);
+  // `buyerOrders` ikut masuk: tanpa itu Ringkasan hanya bisa bercerita soal
+  // jumlah chat — bukan berapa yang jadi pesanan dan berapa rupiah yang masuk.
+  const stats = useMemo(
+    () => computeStats(conversations, products, buyerOrders),
+    [conversations, products, buyerOrders]
+  );
   const dirty = useMemo(() => !sameForm(form, savedForm), [form, savedForm]);
   const originValid = isMengantarId(savedForm.originSubdistrictId);
 
@@ -966,6 +1191,80 @@ export default function DashboardPage() {
                 <span className="sm:hidden">Nonaktif</span>
               </span>
             )}
+
+            <div className="relative shrink-0" ref={helpRef}>
+              <button
+                type="button"
+                onClick={() => setHelpOpen((v) => !v)}
+                aria-haspopup="menu"
+                aria-expanded={helpOpen}
+                aria-label="Bantuan"
+                title="Bantuan"
+                className="p-2 text-slate-400 hover:text-ink hover:bg-slate-100 rounded-xl transition-colors"
+              >
+                <CircleHelp className="w-5 h-5" aria-hidden="true" />
+              </button>
+              {helpOpen && (
+                <div
+                  role="menu"
+                  aria-label="Bantuan"
+                  className="absolute right-0 mt-2 w-64 bg-white border border-slate-200 rounded-2xl shadow-card-lg p-2 z-50"
+                >
+                  <p className="px-3 pt-1.5 pb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                    Butuh bantuan?
+                  </p>
+                  <Link
+                    href="/#cara-kerja"
+                    role="menuitem"
+                    onClick={() => setHelpOpen(false)}
+                    className="flex items-start gap-2 px-3 py-2 rounded-xl hover:bg-slate-50"
+                  >
+                    <BookOpen className="w-4 h-4 mt-0.5 text-brand-600 shrink-0" aria-hidden="true" />
+                    <span>
+                      <span className="block text-sm font-medium text-ink">Panduan cara kerja</span>
+                      <span className="block text-[11px] text-slate-400">
+                        Dari sambungkan nomor sampai bot menjawab
+                      </span>
+                    </span>
+                  </Link>
+                  <Link
+                    href="/#faq"
+                    role="menuitem"
+                    onClick={() => setHelpOpen(false)}
+                    className="flex items-start gap-2 px-3 py-2 rounded-xl hover:bg-slate-50"
+                  >
+                    <CircleHelp
+                      className="w-4 h-4 mt-0.5 text-brand-600 shrink-0"
+                      aria-hidden="true"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-ink">Pertanyaan umum</span>
+                      <span className="block text-[11px] text-slate-400">
+                        Ongkir, kuota chat, ganti nomor
+                      </span>
+                    </span>
+                  </Link>
+                  {/* Email dibawa lengkap dengan email akun & paket: keluhan yang
+                      menyertakannya bisa langsung ditelusuri tanpa tanya-jawab. */}
+                  <a
+                    href={`mailto:halo@balestoko.ai?subject=${encodeURIComponent(
+                      "Bantuan dashboard BalesToko"
+                    )}&body=${encodeURIComponent(
+                      `Email akun: ${userEmail}\nPaket: ${planName}\n\nKendala saya:\n`
+                    )}`}
+                    role="menuitem"
+                    onClick={() => setHelpOpen(false)}
+                    className="flex items-start gap-2 px-3 py-2 rounded-xl hover:bg-slate-50"
+                  >
+                    <LifeBuoy className="w-4 h-4 mt-0.5 text-brand-600 shrink-0" aria-hidden="true" />
+                    <span>
+                      <span className="block text-sm font-medium text-ink">Hubungi tim support</span>
+                      <span className="block text-[11px] text-slate-400">halo@balestoko.ai</span>
+                    </span>
+                  </a>
+                </div>
+              )}
+            </div>
 
             <button
               type="button"
@@ -1257,16 +1556,22 @@ export default function DashboardPage() {
 
             <div role="tabpanel" id="panel-store" aria-labelledby="tab-store" hidden={activeTab !== "store"}>
               {activeTab === "store" && (
-                <StoreTab
-                  form={form}
-                  setForm={patchForm}
-                  dirty={dirty}
-                  saving={saving}
-                  onSave={handleSaveStoreConfig}
-                  onReset={() => setForm(savedForm)}
-                  originValid={originValid}
-                  showToast={showToast}
-                />
+                /* TeamMembers berdiri di luar StoreTab, bukan di dalamnya: akar
+                   StoreTab adalah <form>, dan form bersarang tidak sah di HTML
+                   — tombol "Tambah anggota" akan ikut men-submit pengaturan toko. */
+                <div className="space-y-6">
+                  <StoreTab
+                    form={form}
+                    setForm={patchForm}
+                    dirty={dirty}
+                    saving={saving}
+                    onSave={handleSaveStoreConfig}
+                    onReset={() => setForm(savedForm)}
+                    originValid={originValid}
+                    showToast={showToast}
+                  />
+                  <TeamMembers showToast={showToast} />
+                </div>
               )}
             </div>
 
@@ -1286,7 +1591,7 @@ export default function DashboardPage() {
                   orders={buyerOrders}
                   needsMigration={ordersNeedMigration}
                   busyId={orderBusyId}
-                  onToggleDone={handleToggleOrderDone}
+                  onSetStatus={handleSetOrderStatus}
                   onDelete={handleDeleteOrder}
                   showToast={showToast}
                 />
@@ -1299,6 +1604,12 @@ export default function DashboardPage() {
                   conversations={conversations}
                   selectedPhone={selectedPhone}
                   onSelect={(phone) => setSelectedPhone(phone || null)}
+                  onSendReply={handleSendManualReply}
+                  onToggleAiPause={handleToggleAiPause}
+                  onMarkSeen={handleMarkChatSeen}
+                  sending={chatSending}
+                  pausingPhone={chatPausingPhone}
+                  canSend={!locked}
                 />
               )}
             </div>

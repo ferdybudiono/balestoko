@@ -18,6 +18,7 @@ import {
   buildOrderConfirmReply,
   countDraftUnits,
   formatOrderSummary,
+  formatStockNotice,
   formatWeight,
   mergeQuoteOptions,
   normalizeAiTone,
@@ -51,7 +52,15 @@ export interface AIProcessParams {
   mengantarApiKey?: string;
   /** Berat default (gram) dari pengaturan toko; dipakai bila berat produk tidak diketahui. */
   defaultWeight?: number;
-  products?: Array<{ name: string; price: number; weight: number; description?: string }>;
+  products?: Array<{
+    id?: string | null;
+    name: string;
+    price: number;
+    weight: number;
+    description?: string;
+    stock?: number | null;
+    image_url?: string | null;
+  }>;
   chatHistory?: ChatMessage[];
   /**
    * Berapa pesan terakhir dari `chatHistory` yang boleh ikut ke prompt AI.
@@ -114,7 +123,15 @@ export interface AIProcessParams {
 
 export interface AIProcessResult {
   replyText: string;
-  intent: "GREETING" | "ONGKIR_CHECK" | "PRODUCT_INQUIRY" | "GENERAL_CHAT" | "ORDER";
+  /**
+   * `FALLBACK` = pesan pembeli TIDAK terjawab oleh salah satu jalur di atas dan
+   * dijawab dengan kalimat umum "akan diteruskan ke penjual".
+   *
+   * Sengaja jadi intent tersendiri, bukan digabung ke `GENERAL_CHAT`: inilah satu-
+   * satunya cara pemilik toko bisa melihat daftar pertanyaan yang bot-nya tidak
+   * bisa jawab. Tanpa ini, kegagalan bot terlihat identik dengan obrolan santai.
+   */
+  intent: "GREETING" | "ONGKIR_CHECK" | "PRODUCT_INQUIRY" | "GENERAL_CHAT" | "ORDER" | "FALLBACK";
   shippingDetails?: ShippingOption[];
   detectedCity?: string;
   /** `mock` = tarif simulasi (lokasi asal toko belum valid), bukan tarif kurir asli. */
@@ -128,6 +145,15 @@ export interface AIProcessResult {
   orderDraft?: OrderDraft;
   /** `true` bila pesan ini memang niat memesan, bukan sekadar bertanya. */
   orderCommit?: boolean;
+  /**
+   * Ada produk HABIS di antara yang disebut pembeli.
+   *
+   * Pemanggil memakai ini untuk TIDAK mencatat pesanan: mencatat pesanan barang
+   * kosong berarti daftar pesanan toko berisi barang yang tidak mungkin dikirim.
+   */
+  stockBlocked?: boolean;
+  /** URL foto produk yang dikutip — dikirim sebagai media bersama balasan. */
+  mediaUrls?: string[];
   /** `true` bila kalimat akhir ditulis AI; `false` = format bawaan sistem. */
   aiNarrated?: boolean;
   /** Kenapa tulisan AI tidak dipakai (lihat `AITrace.reason`). */
@@ -136,7 +162,39 @@ export interface AIProcessResult {
   aiRejectedNumber?: string;
 }
 
-type ProductLike = { name: string; price: number; weight: number; description?: string };
+type ProductLike = {
+  id?: string | null;
+  name: string;
+  price: number;
+  weight: number;
+  description?: string;
+  /**
+   * Stok tersisa. `undefined`/`null` = toko tidak memakai pencatatan stok, yang
+   * berarti SELALU tersedia. Membedakan ini dari `0` itu wajib: memperlakukan
+   * kolom kosong sebagai habis akan membuat seluruh katalog toko lama mendadak
+   * dijawab "stok habis".
+   */
+  stock?: number | null;
+  image_url?: string | null;
+};
+
+/** Stok yang dianggap "tinggal sedikit" — di bawah ini pembeli diberi tahu. */
+const LOW_STOCK_THRESHOLD = 5;
+
+/**
+ * Stok efektif sebuah produk, atau `null` bila toko tidak memakai stok.
+ *
+ * Satu-satunya tempat aturan "kolom kosong = tak terbatas" ditegakkan, supaya
+ * prompt AI, pencocokan pesanan, dan balasan stok tidak bisa berbeda pendapat.
+ */
+function stockOf(p: ProductLike | undefined | null): number | null {
+  if (!p) return null;
+  const raw = p.stock;
+  if (raw === null || raw === undefined) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.floor(n));
+}
 
 /** Di atas ini hampir pasti salah parse, dan kurir memang beda skema tarif. */
 const MAX_SHIPPING_WEIGHT_GRAM = 50_000;
@@ -401,6 +459,8 @@ export function resolveOrderDraft(
   let subtotal = 0;
   let totalWeight = 0;
   let weightValid = true;
+  const outOfStock: string[] = [];
+  const insufficient: Array<{ name: string; requested: number; stock: number }> = [];
 
   // Urut menurut katalog supaya balasan ke pembeli selalu berurutan sama.
   for (const [idx, anchor] of [...hits.entries()].sort((a, b) => a[0] - b[0])) {
@@ -417,8 +477,29 @@ export function resolveOrderDraft(
     // hanya berat paket yang jatuh ke asumsi toko.
     if (weight <= 0) weightValid = false;
 
+    // Stok DICATAT, bukan dipakai membuang baris: pembeli tetap harus melihat
+    // bahwa produk yang ia sebut sudah terbaca — yang berubah adalah balasannya
+    // berterus terang dan pesanannya tidak dicatat sebagai transaksi.
+    const stock = stockOf(p);
+    let shortfall: number | undefined;
+    if (stock === 0) {
+      outOfStock.push(p.name);
+    } else if (stock !== null && units > stock) {
+      shortfall = units - stock;
+      insufficient.push({ name: p.name, requested: units, stock });
+    }
+
     const lineTotal = price * units;
-    lines.push({ name: p.name, units, weight, price, lineTotal });
+    lines.push({
+      name: p.name,
+      id: p.id ?? null,
+      units,
+      weight,
+      price,
+      lineTotal,
+      ...(stock === null ? {} : { stock }),
+      ...(shortfall ? { shortfall } : {})
+    });
     subtotal += lineTotal;
     totalWeight += weight * units;
   }
@@ -431,8 +512,21 @@ export function resolveOrderDraft(
     totalUnits: countDraftUnits(lines),
     weightGram: weightOk ? Math.min(totalWeight, MAX_SHIPPING_WEIGHT_GRAM) : fallback,
     weightSource: weightOk ? "matched" : "default",
-    ambiguous: ambiguousList
+    ambiguous: ambiguousList,
+    outOfStock,
+    insufficient
   };
+}
+
+/** Ada produk yang habis / kurang stok di draft ini? */
+export function draftHasStockIssue(draft: OrderDraft | undefined | null): boolean {
+  if (!draft) return false;
+  return (draft.outOfStock?.length || 0) > 0 || (draft.insufficient?.length || 0) > 0;
+}
+
+/** Ada produk yang benar-benar HABIS (bukan cuma kurang)? Pesanan tidak boleh dicatat. */
+export function draftHasSoldOut(draft: OrderDraft | undefined | null): boolean {
+  return (draft?.outOfStock?.length || 0) > 0;
 }
 
 /**
@@ -788,9 +882,22 @@ function renderCatalogFacts(products: ProductLike[], guard: NumberGuard): string
       if (Number.isFinite(price) && price > 0) guard.amounts.add(Math.round(price));
       const weight = Number(p.weight);
       if (Number.isFinite(weight) && weight > 0) guard.amounts.add(Math.round(weight));
+
+      // Status stok masuk ke FAKTA, bukan cuma ke pemeriksaan pesanan: pembeli
+      // yang bertanya "ready?" harus dijawab benar tanpa menyebut jumlah unit,
+      // dan model tidak boleh mengarang ketersediaan yang tidak diketahuinya.
+      const stock = stockOf(p);
+      let availability = "";
+      if (stock === 0) {
+        availability = " · STOK HABIS (jangan terima pesanan produk ini)";
+      } else if (stock !== null && stock <= LOW_STOCK_THRESHOLD) {
+        guard.amounts.add(stock);
+        availability = ` · sisa ${stock} pcs`;
+      }
+
       return `- ${p.name}: Rp ${price.toLocaleString("id-ID")} · ${p.weight} gram${
         p.description ? ` · ${p.description}` : ""
-      }`;
+      }${availability}`;
     })
     .join("\n");
 }
@@ -903,12 +1010,60 @@ export async function processAICustomerService(params: AIProcessParams): Promise
 
   const result = await runCustomerService(params, trace);
 
+  // ── Pemberitahuan stok ditempel DI LUAR jalur model ─────────────────────
+  //
+  // Sengaja di sini, bukan di dalam prompt tiap jalur: kalimat "stok habis" tidak
+  // boleh bergantung pada kepatuhan model. Model yang mengabaikannya satu kali
+  // saja berarti toko menerima uang untuk barang yang tidak ada. Ditempel di
+  // ATAS balasan supaya pembeli membacanya sebelum angka total bayar.
+  const notice = formatStockNotice(result.orderDraft || { lines: [], subtotal: 0, totalUnits: 0, weightGram: 0, weightSource: "default", ambiguous: [] });
+  const replyText = notice ? `${notice}\n\n${result.replyText}` : result.replyText;
+
+  // Foto produk yang benar-benar disebut pembeli — bukan seluruh katalog. Mengirim
+  // sepuluh gambar sekaligus ke WhatsApp membuat chat tidak terbaca dan tagihan
+  // media Fonnte membengkak tanpa menambah kejelasan.
+  const mediaUrls = collectDraftImages(result.orderDraft, params.products);
+
   return {
     ...result,
+    replyText,
+    stockBlocked: draftHasSoldOut(result.orderDraft),
+    mediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
     aiNarrated: trace.narrated,
     aiFallbackReason: trace.narrated ? undefined : trace.reason,
     aiRejectedNumber: trace.narrated ? undefined : trace.offender
   };
+}
+
+/**
+ * URL foto produk yang dikutip balasan ini (maksimal `MAX_MEDIA_PER_REPLY`).
+ *
+ * Dicocokkan dari draf pesanan, jadi hanya produk yang MEMANG disebut pembeli
+ * yang fotonya terkirim. Duplikat dibuang: dua baris pesanan bisa menunjuk produk
+ * yang sama setelah pembeli memperbaiki jumlahnya.
+ */
+const MAX_MEDIA_PER_REPLY = 3;
+
+function collectDraftImages(
+  draft: OrderDraft | undefined,
+  products: AIProcessParams["products"]
+): string[] {
+  if (!draft || draft.lines.length === 0 || !products || products.length === 0) return [];
+
+  const byName = new Map<string, string>();
+  for (const p of products) {
+    const url = (p.image_url || "").trim();
+    if (url) byName.set(normalizeForMatch(p.name || ""), url);
+  }
+  if (byName.size === 0) return [];
+
+  const out: string[] = [];
+  for (const line of draft.lines) {
+    const url = byName.get(normalizeForMatch(line.name || ""));
+    if (url && !out.includes(url)) out.push(url);
+    if (out.length >= MAX_MEDIA_PER_REPLY) break;
+  }
+  return out;
 }
 
 async function runCustomerService(params: AIProcessParams, trace: AITrace): Promise<AIProcessResult> {
@@ -1035,6 +1190,37 @@ async function runCustomerService(params: AIProcessParams, trace: AITrace): Prom
     allowTextNumbers(guard, knownAddress);
     return guard;
   };
+
+  // 0. Pesanan yang memuat barang HABIS ditolak lebih dulu dari jalur mana pun.
+  //
+  //    Diletakkan di paling atas dengan sengaja: kalau pembeli menyebut kota tujuan
+  //    sekaligus, jalur ongkir di bawah akan menjawab dengan tarif dan total bayar
+  //    untuk barang yang tidak mungkin dikirim. Menghitung ongkir barang kosong
+  //    bukan cuma sia-sia, tapi terbaca sebagai pesanan yang sudah diterima.
+  //
+  //    Sengaja deterministik (model tidak dipanggil): ini satu-satunya balasan yang
+  //    isinya penolakan, dan penulisan ulang yang terlalu ramah bisa berubah rasa
+  //    menjadi persetujuan. Pemanggil juga tidak akan mencatat pesanannya karena
+  //    `stockBlocked` — jadi balasan dan basis data sepakat.
+  if (commitWithLines && draftHasSoldOut(draft)) {
+    const availableNames = draft.lines.filter((l) => l.stock !== 0).map((l) => l.name);
+    const soldOutReply =
+      `Mohon maaf Kak, ada barang yang stoknya sedang habis, jadi pesanannya belum kami catat dulu 🙏\n\n` +
+      (availableNames.length > 0
+        ? `Yang masih tersedia: ${availableNames.join(", ")}.\nMau kami proses yang tersedia saja, atau ditunggu sampai stoknya masuk?`
+        : `Boleh pilih produk lain, atau mau kami kabari begitu stoknya masuk lagi?`);
+
+    return {
+      replyText: withIdentitySuffix(soldOutReply, slotAck, nameAsk),
+      // Tetap ORDER + orderCommit: niat memesannya nyata, dan pemilik toko perlu
+      // melihatnya sebagai permintaan yang hilang karena stok — bukan obrolan biasa.
+      intent: "ORDER",
+      capturedName,
+      capturedAddress,
+      orderDraft: draft,
+      orderCommit: true
+    };
+  }
 
   // 1. Deteksi Kata Kunci Ongkir / Kota / Alamat
   const isOngkirQuery =
@@ -1307,6 +1493,7 @@ ${rewriteTask(deterministic)}${identityTask(identityAsk, slotAck)}`
   //    dipastikan — pesanan yang tujuannya sudah jelas dibalas lengkap dengan
   //    ongkir di jalur di atas.
   if (commitWithLines) {
+
     // Ongkir belum bisa dihitung, jadi tujuannya yang dipancing. Kalau alamatnya
     // sendiri belum ada, `identityAsk` sudah menanyakan itu — bertanya dua hal
     // sekaligus membuat pembeli menjawab salah satunya saja.
@@ -1381,9 +1568,16 @@ ${rewriteTask(deterministic)}${identityTask(ask, slotAck)}`
   if (isProductQuery && products.length > 0) {
     let prodText = `🛍️ *Katalog Produk - ${storeName}*\n\n`;
     products.forEach((p, idx) => {
-      prodText += `${idx + 1}. *${p.name}*\n`;
+      const stock = stockOf(p);
+      prodText += `${idx + 1}. *${p.name}*${stock === 0 ? " — _stok habis_" : ""}\n`;
       prodText += `   💰 Rp ${p.price.toLocaleString("id-ID")}\n`;
       prodText += `   ⚖️ Berat: ${p.weight} gram\n`;
+      // Sisa stok hanya ditampilkan saat menipis. Menulis "sisa 480 pcs" pada
+      // barang yang menumpuk tidak menolong pembeli, sedangkan "sisa 2 pcs"
+      // adalah alasan untuk memesan sekarang.
+      if (stock !== null && stock > 0 && stock <= LOW_STOCK_THRESHOLD) {
+        prodText += `   📦 Sisa ${stock} pcs\n`;
+      }
       if (p.description) prodText += `   📝 ${p.description}\n`;
       prodText += `\n`;
     });
@@ -1523,10 +1717,28 @@ pengantar.`
 
   const generalFallback = withIdentitySuffix(fallbackReply, slotAck, nameAsk);
 
+  // ── Kapan sebuah pesan dihitung "tidak terjawab" ────────────────────────
+  //
+  // Balasan di atas adalah kalimat umum "pesan Kakak sudah kami terima" — pembeli
+  // tidak mendapat jawaban, hanya tanda terima. Itu ditandai FALLBACK, bukan
+  // GENERAL_CHAT, supaya pemilik toko bisa melihat daftar pertanyaan yang bot-nya
+  // gagal jawab; tanpa pembeda ini kegagalan bot terlihat identik dengan obrolan
+  // santai dan tidak akan pernah diperbaiki.
+  //
+  // Yang menyelamatkan pesan dari label itu ada dua: sistem menangkap sesuatu yang
+  // konkret (produk, produk ambigu, nama, alamat), ATAU model berhasil menulis
+  // jawaban sendiri — dalam kedua hal itu pembeli menerima balasan yang benar-benar
+  // menanggapi pesannya.
+  const understoodSomething =
+    draft.lines.length > 0 ||
+    draft.ambiguous.length > 0 ||
+    Boolean(capturedName) ||
+    Boolean(capturedAddress);
+
   if (!geminiApiKey) {
     return {
       replyText: generalFallback,
-      intent: "GENERAL_CHAT",
+      intent: understoodSomething ? "GENERAL_CHAT" : "FALLBACK",
       capturedName,
       capturedAddress,
       orderDraft: draft,
@@ -1572,7 +1784,7 @@ Tugasmu: balas sebagai Customer Service WhatsApp yang solutif.
 
   return {
     replyText,
-    intent: "GENERAL_CHAT",
+    intent: trace.narrated || understoodSomething ? "GENERAL_CHAT" : "FALLBACK",
     capturedName,
     capturedAddress,
     orderDraft: draft,

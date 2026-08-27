@@ -90,6 +90,24 @@ function parseProductFields(
     fields.description = "";
   }
 
+  if (body.image_url !== undefined) {
+    const raw = String(body.image_url ?? "").trim();
+    if (!raw) {
+      // String kosong = hapus foto. Disimpan `null`, bukan "", supaya kolomnya
+      // benar-benar kosong saat dibaca `collectDraftImages`.
+      fields.image_url = null;
+    } else if (!/^https?:\/\/\S+$/i.test(raw)) {
+      return { ok: false, error: "URL foto harus diawali http:// atau https://." };
+    } else if (raw.includes(",")) {
+      // Fonnte mengirim beberapa foto lewat SATU field `url` yang dipisah koma,
+      // jadi URL bermuatan koma akan terpotong dan fotonya tidak pernah sampai.
+      // Ditolak di sini supaya pemilik toko tahu — bukan gagal senyap saat kirim.
+      return { ok: false, error: "URL foto tidak boleh mengandung tanda koma." };
+    } else {
+      fields.image_url = raw.slice(0, 500);
+    }
+  }
+
   if (partial && Object.keys(fields).length === 0) {
     return { ok: false, error: "Tidak ada perubahan yang dikirim." };
   }

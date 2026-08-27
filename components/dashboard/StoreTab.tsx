@@ -3,6 +3,7 @@
 import { useState } from "react";
 import {
   Banknote,
+  BellRing,
   Calculator,
   CheckCircle,
   ChevronRight,
@@ -113,6 +114,16 @@ export interface StoreForm {
   aiTone: AiTone;
   includeTotal: boolean;
   includePayment: boolean;
+
+  /**
+   * Nomor WhatsApp PRIBADI pemilik toko untuk kabar penting (nomor terputus,
+   * kuota hampir habis, pesanan baru). Kosong = pakai nomor akun toko.
+   *
+   * Sengaja dipisah dari nomor toko: kabar "nomor toko terputus" tidak mungkin
+   * sampai kalau dikirim ke nomor yang sedang terputus itu juga.
+   */
+  alertPhone: string;
+  notifyEnabled: boolean;
 }
 
 interface StoreTabProps {
@@ -1189,36 +1200,105 @@ export default function StoreTab({
           </div>
         </div>
 
-        {/* ── Aksi simpan ────────────────────────────────────────────── */}
-        <div className="flex flex-wrap items-center gap-3 pt-2">
-          <button
-            type="submit"
-            disabled={saving || !dirty}
-            className="px-6 py-3 bg-brand-600 hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm rounded-xl transition-colors shadow-card flex items-center gap-2"
-          >
-            {saving ? (
-              <RefreshCw className="w-4 h-4 animate-spin" aria-hidden="true" />
-            ) : (
-              <Save className="w-4 h-4" aria-hidden="true" />
-            )}
-            <span>{saving ? "Menyimpan…" : "Simpan pengaturan"}</span>
-          </button>
+        {/* ── Kabar ke WhatsApp pemilik toko ─────────────────────────── */}
+        <div className="pt-6 border-t border-slate-100">
+          <h3 className="text-sm font-bold text-ink flex items-center gap-2">
+            <BellRing className="w-4 h-4 text-brand-600" aria-hidden="true" />
+            Kabar penting ke WhatsApp Anda
+          </h3>
+          <p className="text-xs text-slate-500 mt-1">
+            Tiga hal dikabarkan langsung lewat WhatsApp: nomor toko terputus, kuota percakapan
+            hampir habis, dan pesanan baru masuk. Tanpa ini, semuanya baru diketahui saat Anda
+            membuka dashboard.
+          </p>
 
-          {dirty && !saving && (
-            <>
-              <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-500" aria-hidden="true" />
-                Ada perubahan yang belum disimpan
+          <label className="mt-4 flex items-start gap-3 p-3.5 bg-slate-50 border border-slate-200 rounded-xl cursor-pointer">
+            <input
+              type="checkbox"
+              checked={form.notifyEnabled}
+              onChange={(e) => setForm({ notifyEnabled: e.target.checked })}
+              className="mt-0.5 w-4 h-4 rounded border-slate-300 text-brand-600 focus:ring-brand-400"
+            />
+            <span className="min-w-0">
+              <span className="block text-sm font-semibold text-ink">
+                Kirim kabar penting ke WhatsApp
               </span>
-              <button
-                type="button"
-                onClick={onReset}
-                className="text-xs font-medium text-slate-400 hover:text-slate-600 underline"
-              >
-                Batalkan perubahan
-              </button>
-            </>
-          )}
+              <span className="block text-xs text-slate-500 mt-0.5">
+                Dimatikan berarti nomor toko bisa mati berhari-hari tanpa Anda tahu.
+              </span>
+            </span>
+          </label>
+
+          <div className="mt-3 space-y-1.5">
+            <label htmlFor="alert-phone" className={labelCls}>
+              Nomor WhatsApp Anda <span className="text-slate-400 normal-case">(opsional)</span>
+            </label>
+            <input
+              id="alert-phone"
+              type="tel"
+              inputMode="tel"
+              placeholder="08123456789"
+              value={form.alertPhone}
+              onChange={(e) => setForm({ alertPhone: e.target.value })}
+              disabled={!form.notifyEnabled}
+              className={`${inputCls} disabled:opacity-60`}
+            />
+            <p className="text-xs text-slate-400">
+              Kosongkan untuk memakai nomor akun toko. Isi nomor pribadi Anda kalau ingin tetap
+              menerima kabar saat nomor toko yang bermasalah — kabar dikirim lewat nomor toko lain
+              yang masih tersambung.
+            </p>
+          </div>
+        </div>
+
+        {/* ── Aksi simpan ────────────────────────────────────────────── */}
+        {/*
+          Menempel di bawah viewport.
+
+          Formulir ini panjangnya lebih dari empat layar. Dengan tombol simpan
+          hanya di ujung bawah, perubahan kecil di bagian atas (mis. nada bicara
+          AI) menuntut menggulir sampai habis — dan itulah cara pengaturan
+          hilang tanpa pernah tersimpan. Latar solid + garis atas dipakai supaya
+          isi form tidak terbaca menembus bar.
+        */}
+        <div className="sticky bottom-0 -mx-5 sm:-mx-6 -mb-5 sm:-mb-6 mt-2 px-5 sm:px-6 py-4 bg-white/95 backdrop-blur border-t border-slate-200 rounded-b-2xl">
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="submit"
+              disabled={saving || !dirty}
+              className="px-6 py-3 bg-brand-600 hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm rounded-xl transition-colors shadow-card flex items-center gap-2"
+            >
+              {saving ? (
+                <RefreshCw className="w-4 h-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <Save className="w-4 h-4" aria-hidden="true" />
+              )}
+              <span>{saving ? "Menyimpan…" : "Simpan pengaturan"}</span>
+            </button>
+
+            {dirty && !saving ? (
+              <>
+                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" aria-hidden="true" />
+                  Ada perubahan yang belum disimpan
+                </span>
+                <button
+                  type="button"
+                  onClick={onReset}
+                  className="text-xs font-medium text-slate-400 hover:text-slate-600 underline"
+                >
+                  Batalkan perubahan
+                </button>
+              </>
+            ) : (
+              !saving && (
+                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-400">
+                  <CheckCircle className="w-3.5 h-3.5 text-emerald-500" aria-hidden="true" />
+                  Semua perubahan tersimpan
+                </span>
+              )
+            )}
+          </div>
         </div>
       </section>
 

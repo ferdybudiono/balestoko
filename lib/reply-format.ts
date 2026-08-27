@@ -17,12 +17,22 @@ import { LocalCourierConfig } from "./couriers";
 
 export interface OrderDraftLine {
   name: string;
+  /** Id produk asal (bila diketahui) — dipakai mengurangi stok tanpa mencocokkan nama. */
+  id?: string | null;
   units: number;
   /** Berat satuan (gram); `0` bila data produk tidak valid. */
   weight: number;
   /** Harga satuan; `0` bila tidak valid. */
   price: number;
   lineTotal: number;
+  /**
+   * Stok tersisa saat draft dibuat. `undefined` = toko tidak memakai stok
+   * (kolomnya kosong), yang HARUS diperlakukan sebagai "selalu tersedia" —
+   * bukan sebagai nol.
+   */
+  stock?: number;
+  /** Unit yang diminta melebihi stok: `units - stock`, hanya bila positif. */
+  shortfall?: number;
 }
 
 export interface OrderDraft {
@@ -46,6 +56,17 @@ export interface OrderDraft {
    * Isi array ini berarti balasan harus MENANYAKAN, bukan menebak.
    */
   ambiguous: string[];
+  /**
+   * Produk yang disebut pembeli tapi stoknya HABIS (stock = 0).
+   *
+   * Dipisahkan dari `lines` karena konsekuensinya berbeda: barisnya tetap ada
+   * (pembeli memang menyebutnya) tapi pesanan tidak boleh dicatat dan balasannya
+   * wajib berterus terang. Menjual barang yang tidak ada adalah kerugian yang
+   * paling mahal — uang sudah masuk, barangnya tidak pernah bisa dikirim.
+   */
+  outOfStock?: string[];
+  /** Produk yang stoknya ADA tapi kurang dari yang diminta. */
+  insufficient?: Array<{ name: string; requested: number; stock: number }>;
 }
 
 export interface QuoteOption {
@@ -202,6 +223,30 @@ export function formatOrderSummary(draft: OrderDraft): string {
   text += `⚖️ Berat paket: ${formatWeight(draft.weightGram)}`;
   if (draft.weightSource === "default") text += ` (perkiraan)`;
   return text;
+}
+
+/**
+ * Pemberitahuan stok yang menempel di atas balasan pesanan.
+ *
+ * Kejujuran stok dijawab SEBELUM harga & ongkir dengan sengaja: pembeli yang
+ * membaca total bayar lebih dulu akan menganggap barangnya tersedia, dan
+ * membatalkan setelah uang ditransfer jauh lebih merusak kepercayaan daripada
+ * mengatakan "kosong" di kalimat pertama.
+ *
+ * String kosong = tidak ada kendala stok, jadi pemanggil bisa langsung
+ * menggabungkannya tanpa memeriksa apa pun.
+ */
+export function formatStockNotice(draft: OrderDraft): string {
+  const out = draft.outOfStock || [];
+  const short = draft.insufficient || [];
+  if (out.length === 0 && short.length === 0) return "";
+
+  const rows: string[] = [];
+  for (const name of out) rows.push(`${leader(name)} stok habis`);
+  for (const s of short) {
+    rows.push(`${leader(s.name)} sisa ${s.stock} pcs (diminta ${s.requested} pcs)`);
+  }
+  return `⚠️ *Ketersediaan stok*\n${rows.join("\n")}`;
 }
 
 /**

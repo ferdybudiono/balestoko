@@ -8,7 +8,7 @@
 
 import crypto from "crypto";
 import { cookies } from "next/headers";
-import { getStoreAuthMeta } from "@/lib/supabase";
+import { getStoreAuthMeta, getStoreMemberByEmail } from "@/lib/supabase";
 
 export const SESSION_COOKIE = "bt_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 hari
@@ -85,19 +85,39 @@ function sign(payloadB64: string): string {
   return base64url(crypto.createHmac("sha256", getSecret()).update(payloadB64).digest());
 }
 
-/** Buat token session untuk sebuah email. */
-export function signSession(email: string): string {
+/**
+ * Buat token session untuk sebuah email.
+ *
+ * `storeEmail` diisi HANYA untuk login anggota tim (`store_members`): `email`
+ * tetap identitas orang yang login, sedangkan `store` menunjuk email pemilik toko
+ * yang datanya dia akses. Dua field, bukan satu, supaya menghapus satu anggota
+ * bisa mencabut aksesnya tanpa menyentuh akun pemilik — dan supaya catatan login
+ * terakhir tetap menunjuk orang yang benar.
+ */
+export function signSession(email: string, storeEmail?: string): string {
   const nowSec = Math.floor(Date.now() / 1000);
   // `iat` (waktu terbit) dipakai untuk mencabut sesi: sesi yang terbit sebelum
   // `stores.password_changed_at` ditolak, jadi ganti/reset password benar-benar
   // mengeluarkan siapa pun yang sedang memakai akun itu.
-  const payload = JSON.stringify({ email, iat: nowSec, exp: nowSec + SESSION_TTL_SECONDS });
+  const payload = JSON.stringify({
+    email,
+    // Dihilangkan saat sama dengan `email` supaya token pemilik toko tetap
+    // berbentuk sama persis seperti sebelum fitur ini ada.
+    ...(storeEmail && storeEmail !== email ? { store: storeEmail } : {}),
+    iat: nowSec,
+    exp: nowSec + SESSION_TTL_SECONDS
+  });
   const payloadB64 = base64url(payload);
   return `${payloadB64}.${sign(payloadB64)}`;
 }
 
 export interface SessionPayload {
   email: string;
+  /**
+   * Email PEMILIK toko yang datanya diakses. `null` = yang login adalah pemilik
+   * toko itu sendiri (bentuk token lama, dan mayoritas sesi).
+   */
+  store: string | null;
   /** Waktu terbit (epoch detik). `0` untuk token lama yang belum punya field ini. */
   iat: number;
 }
@@ -122,6 +142,7 @@ export function verifySessionPayload(token?: string | null): SessionPayload | nu
     if (payload.exp < Math.floor(Date.now() / 1000)) return null;
     return {
       email: String(payload.email),
+      store: payload.store ? String(payload.store) : null,
       iat: typeof payload.iat === "number" ? payload.iat : 0
     };
   } catch {
@@ -129,16 +150,27 @@ export function verifySessionPayload(token?: string | null): SessionPayload | nu
   }
 }
 
-/** Verifikasi token; kembalikan email bila valid & belum kedaluwarsa, selain itu null. */
+/**
+ * Verifikasi token; kembalikan email ORANG yang login (bukan email toko).
+ *
+ * Untuk akses data pakai `getSessionEmail()` — pada sesi anggota tim keduanya
+ * berbeda, dan yang menentukan data toko mana yang dibuka adalah yang kedua.
+ */
 export function verifySession(token?: string | null): string | null {
   return verifySessionPayload(token)?.email ?? null;
 }
 
 // ---------------- COOKIE HELPERS ----------------
 
-export async function setSessionCookie(email: string): Promise<void> {
+/**
+ * Terbitkan cookie sesi.
+ *
+ * `storeEmail` hanya diisi saat yang login adalah anggota tim; tanpa itu email
+ * yang sama dipakai untuk identitas dan untuk akses data (kasus pemilik toko).
+ */
+export async function setSessionCookie(email: string, storeEmail?: string): Promise<void> {
   const store = await cookies();
-  store.set(SESSION_COOKIE, signSession(email), {
+  store.set(SESSION_COOKIE, signSession(email, storeEmail), {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
@@ -152,8 +184,18 @@ export async function clearSessionCookie(): Promise<void> {
   store.set(SESSION_COOKIE, "", { httpOnly: true, path: "/", maxAge: 0 });
 }
 
+/** Siapa yang login & toko mana yang dia akses. */
+export interface SessionActor {
+  /** Email orang yang login (anggota tim atau pemilik). */
+  email: string;
+  /** Email pemilik toko yang datanya diakses. */
+  storeEmail: string;
+  /** `true` = login lewat `store_members`, bukan akun pemilik. */
+  isMember: boolean;
+}
+
 /**
- * Email user yang sedang login, atau null.
+ * Email TOKO yang datanya boleh diakses sesi ini, atau null.
  *
  * Selain memeriksa tanda tangan & kedaluwarsa cookie, fungsi ini menolak sesi
  * yang diterbitkan SEBELUM password akun terakhir berubah. Tanpa itu, reset
@@ -161,21 +203,48 @@ export async function clearSessionCookie(): Promise<void> {
  * sah sampai TTL 7 hari habis, jadi korban pengambilalihan akun tidak punya cara
  * mengusirnya.
  *
+ * Yang dikembalikan adalah email PEMILIK toko, juga saat yang login anggota tim.
+ * Itu disengaja: seluruh route memakai nilai ini untuk `getStoreByEmail()`, jadi
+ * anggota tim membaca data toko yang sama tanpa satu pun route perlu diubah.
+ * Konsekuensinya juga disengaja dan harus diingat: anggota tim punya akses yang
+ * sama luas dengan pemilik, KECUALI pengelolaan anggota (lihat `/api/members`,
+ * yang memeriksa `isMember`). Yang dibeli fitur ini adalah kredensial terpisah
+ * yang bisa dicabut satu per satu — bukan pembatasan peran.
+ *
  * Biayanya satu query ringan (satu kolom, lewat indeks email) per request
- * terautentikasi. Sengaja tidak di-memoize lewat `cache()` React supaya
- * perilakunya sama di Route Handler maupun Server Component.
+ * terautentikasi, dua untuk sesi anggota tim. Sengaja tidak di-memoize lewat
+ * `cache()` React supaya perilakunya sama di Route Handler maupun Server Component.
  *
  * Gagal-TERBUKA saat query gagal: pemeriksaan ini lapisan tambahan, dan
  * memaksa semua user logout karena satu blip database bukan pertukaran yang baik.
  */
 export async function getSessionEmail(): Promise<string | null> {
+  return (await getSessionActor())?.storeEmail ?? null;
+}
+
+export async function getSessionActor(): Promise<SessionActor | null> {
   const store = await cookies();
   const payload = verifySessionPayload(store.get(SESSION_COOKIE)?.value);
   if (!payload) return null;
 
-  const meta = await getStoreAuthMeta(payload.email);
-  if (meta === undefined) return payload.email; // query gagal → jangan paksa logout
-  if (meta === null) return payload.email; // akun belum ada (mis. baru checkout)
+  const storeEmail = payload.store || payload.email;
+  const isMember = !!payload.store;
+
+  // Sesi anggota tim: barisnya harus MASIH ADA. Menghapus anggota adalah satu-satunya
+  // cara pemilik toko mencabut akses seseorang, jadi pemeriksaan ini yang membuat
+  // tombol "hapus" benar-benar berarti — tanpa itu cookie-nya tetap sah 7 hari.
+  if (isMember) {
+    const member = await getStoreMemberByEmail(payload.email);
+    if (!member) return null;
+    if (member.password_changed_at) {
+      const changedSec = Math.floor(new Date(member.password_changed_at).getTime() / 1000);
+      if (Number.isFinite(changedSec) && payload.iat <= changedSec) return null;
+    }
+  }
+
+  const meta = await getStoreAuthMeta(storeEmail);
+  // query gagal → jangan paksa logout; akun belum ada (mis. baru checkout) → lewat.
+  if (meta === undefined || meta === null) return { email: payload.email, storeEmail, isMember };
 
   if (meta.password_changed_at) {
     const changedSec = Math.floor(new Date(meta.password_changed_at).getTime() / 1000);
@@ -184,5 +253,5 @@ export async function getSessionEmail(): Promise<string | null> {
     if (Number.isFinite(changedSec) && payload.iat <= changedSec) return null;
   }
 
-  return payload.email;
+  return { email: payload.email, storeEmail, isMember };
 }

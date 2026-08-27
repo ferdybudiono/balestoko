@@ -9,6 +9,7 @@ import {
   type StoreRecord
 } from "@/lib/supabase";
 import { checkConversationQuota, checkRateLimit, runAutoReply } from "@/lib/reply-engine";
+import { notifyQuotaThreshold } from "@/lib/notify";
 import {
   buildFonnteWebhookUrl,
   isWebhookUrlSynced,
@@ -193,6 +194,14 @@ export async function POST(req: Request) {
     // Kuota percakapan bulanan paket (Starter 1.000/bulan, Pro tanpa batas).
     // Diperiksa SEBELUM Gemini dipanggil karena di sinilah biayanya muncul.
     const quota = await checkConversationQuota(store, sender);
+
+    // Kabar kuota dikirim dari sini — satu-satunya tempat yang tahu angka
+    // terpakainya tanpa query tambahan. `void` (tidak di-await): pembeli tidak
+    // boleh menunggu satu kirim WhatsApp ke pemilik toko selesai lebih dulu.
+    if (quota.used !== null && quota.limit !== null) {
+      void notifyQuotaThreshold({ store, used: quota.used, limit: quota.limit });
+    }
+
     if (!quota.ok) {
       console.warn(
         `[fonnte webhook] kuota percakapan bulanan toko habis (${quota.used}/${quota.limit}), ` +
@@ -227,9 +236,11 @@ export async function POST(req: Request) {
 
     await noteInbound(
       device,
-      outcome.delivered
-        ? "Dibalas AI"
-        : `Balasan gagal dikirim: ${outcome.deliveryError || "penyebab tidak diketahui"}`
+      outcome.aiPaused
+        ? "Masuk saat AI dijeda — menunggu balasan manual"
+        : outcome.delivered
+          ? "Dibalas AI"
+          : `Balasan gagal dikirim: ${outcome.deliveryError || "penyebab tidak diketahui"}`
     );
 
     return NextResponse.json({
@@ -237,7 +248,8 @@ export async function POST(req: Request) {
       sender,
       intent: outcome.intent,
       reply: outcome.replyText,
-      delivered: outcome.delivered
+      delivered: outcome.delivered,
+      aiPaused: outcome.aiPaused === true
     });
   } catch (err) {
     console.error("[fonnte webhook error]:", err);

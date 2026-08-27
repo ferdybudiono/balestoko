@@ -2,22 +2,29 @@
 
 import { useMemo, useState } from "react";
 import {
+  BadgeCheck,
   CheckCircle2,
   ClipboardList,
-  Circle,
   Copy,
   Download,
   MapPin,
   Phone,
+  Receipt,
   Search,
-  Trash2
+  Trash2,
+  Truck,
+  Undo2,
+  Wallet
 } from "lucide-react";
 import {
+  BUYER_ORDER_STATUS_LABELS,
   formatPhoneDisplay,
   formatRupiah,
   formatWeight,
+  nextOrderStatus,
   relativeTime,
   type BuyerOrder,
+  type BuyerOrderStatus,
   type ShowToast
 } from "./types";
 
@@ -26,18 +33,56 @@ interface OrdersTabProps {
   /** Tabel pesanan belum ada di database (SQL terbaru belum dijalankan). */
   needsMigration?: boolean;
   busyId?: string | null;
-  onToggleDone: (order: BuyerOrder, done: boolean) => void;
+  /**
+   * Pindahkan pesanan ke tahap tertentu. `extra` dipakai saat tahapnya butuh
+   * data tambahan: nomor resi ketika dikirim, bukti transfer ketika dibayar.
+   */
+  onSetStatus: (
+    order: BuyerOrder,
+    status: BuyerOrderStatus,
+    extra?: { tracking_number?: string; payment_proof_url?: string }
+  ) => void;
   onDelete: (order: BuyerOrder) => void;
   showToast: ShowToast;
 }
 
-type Filter = "all" | "new" | "done";
+type Filter = "all" | "open" | "new" | "paid" | "shipped" | "done";
 
 const FILTERS: Array<{ id: Filter; label: string }> = [
-  { id: "new", label: "Perlu diproses" },
+  { id: "open", label: "Perlu diproses" },
+  { id: "new", label: "Belum bayar" },
+  { id: "paid", label: "Siap kirim" },
+  { id: "shipped", label: "Dikirim" },
   { id: "done", label: "Selesai" },
   { id: "all", label: "Semua" }
 ];
+
+/** Warna lencana per tahap — urutannya ikut menceritakan kemajuan pesanan. */
+const STATUS_BADGE: Record<BuyerOrderStatus, string> = {
+  new: "bg-amber-50 border-amber-200 text-amber-800",
+  paid: "bg-sky-50 border-sky-200 text-sky-800",
+  shipped: "bg-indigo-50 border-indigo-200 text-indigo-800",
+  done: "bg-emerald-50 border-emerald-200 text-emerald-800"
+};
+
+/** Kalimat tombol tahap berikutnya — perintah, bukan nama status. */
+const ADVANCE_LABEL: Record<BuyerOrderStatus, string> = {
+  new: "Buka kembali",
+  paid: "Sudah bayar",
+  shipped: "Kirim",
+  done: "Selesai"
+};
+
+const ADVANCE_ICON: Record<BuyerOrderStatus, typeof Wallet> = {
+  new: Undo2,
+  paid: Wallet,
+  shipped: Truck,
+  done: BadgeCheck
+};
+
+function statusOf(order: BuyerOrder): BuyerOrderStatus {
+  return order.status || "new";
+}
 
 function itemsSummary(order: BuyerOrder): string {
   const items = order.items || [];
@@ -61,6 +106,7 @@ function orderAsText(order: BuyerOrder): string {
     `Berat  : ${formatWeight(order.weight_gram)}`
   ];
   if (order.shipping_courier) lines.push(`Kurir  : ${order.shipping_courier}`);
+  if (order.tracking_number) lines.push(`Resi   : ${order.tracking_number}`);
   return lines.join("\n");
 }
 
@@ -75,24 +121,35 @@ function toCsv(orders: BuyerOrder[]): string {
     "Kota tujuan",
     "Barang",
     "Subtotal",
+    "Ongkir",
     "Berat (gram)",
-    "Kurir"
+    "Kurir",
+    "Nomor resi",
+    "Dibayar",
+    "Dikirim",
+    "Selesai"
   ];
   // Tanda kutip di dalam sel digandakan sesuai aturan CSV; tanpa itu satu alamat
   // yang memuat kutip bisa menggeser seluruh kolom berikutnya.
   const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const stamp = (iso?: string | null) => (iso ? new Date(iso).toLocaleString("id-ID") : "");
   const rows = orders.map((o) =>
     [
       o.created_at ? new Date(o.created_at).toLocaleString("id-ID") : "",
-      o.status === "done" ? "Selesai" : "Perlu diproses",
+      BUYER_ORDER_STATUS_LABELS[statusOf(o)],
       o.customer_name || "",
       o.customer_phone,
       o.customer_address || "",
       o.destination_city || "",
       itemsSummary(o),
       o.subtotal || 0,
+      o.shipping_cost || 0,
       o.weight_gram || 0,
-      o.shipping_courier || ""
+      o.shipping_courier || "",
+      o.tracking_number || "",
+      stamp(o.paid_at),
+      stamp(o.shipped_at),
+      stamp(o.done_at)
     ]
       .map(esc)
       .join(",")
@@ -104,19 +161,33 @@ export default function OrdersTab({
   orders,
   needsMigration = false,
   busyId,
-  onToggleDone,
+  onSetStatus,
   onDelete,
   showToast
 }: OrdersTabProps) {
-  const [filter, setFilter] = useState<Filter>("new");
+  const [filter, setFilter] = useState<Filter>("open");
   const [query, setQuery] = useState("");
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  // Pesanan yang sedang diisi nomor resinya. Resi diminta SEBELUM status berubah
+  // ke "dikirim": pembeli yang ditagih nomor resi lewat chat tidak bisa dijawab
+  // dari kolom yang tidak pernah terisi.
+  const [trackingFor, setTrackingFor] = useState<string | null>(null);
+  const [trackingValue, setTrackingValue] = useState("");
+  // Bukti transfer: URL, bukan berkas. Aplikasi ini belum punya penyimpanan
+  // media sendiri, jadi menampung berkas berarti menjanjikan tempat simpan yang
+  // tidak ada — sedangkan tautan foto yang dikirim pembeli sudah cukup untuk
+  // ditelusuri kembali saat ada sengketa.
+  const [proofFor, setProofFor] = useState<string | null>(null);
+  const [proofValue, setProofValue] = useState("");
 
   const counts = useMemo(
     () => ({
       all: orders.length,
-      new: orders.filter((o) => o.status !== "done").length,
-      done: orders.filter((o) => o.status === "done").length
+      open: orders.filter((o) => statusOf(o) !== "done").length,
+      new: orders.filter((o) => statusOf(o) === "new").length,
+      paid: orders.filter((o) => statusOf(o) === "paid").length,
+      shipped: orders.filter((o) => statusOf(o) === "shipped").length,
+      done: orders.filter((o) => statusOf(o) === "done").length
     }),
     [orders]
   );
@@ -124,14 +195,16 @@ export default function OrdersTab({
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return orders.filter((o) => {
-      if (filter === "new" && o.status === "done") return false;
-      if (filter === "done" && o.status !== "done") return false;
+      const st = statusOf(o);
+      if (filter === "open" && st === "done") return false;
+      if (filter !== "all" && filter !== "open" && st !== filter) return false;
       if (!q) return true;
       return (
         o.customer_phone.toLowerCase().includes(q) ||
         (o.customer_name || "").toLowerCase().includes(q) ||
         (o.customer_address || "").toLowerCase().includes(q) ||
         (o.destination_city || "").toLowerCase().includes(q) ||
+        (o.tracking_number || "").toLowerCase().includes(q) ||
         itemsSummary(o).toLowerCase().includes(q)
       );
     });
@@ -158,6 +231,24 @@ export default function OrdersTab({
     URL.revokeObjectURL(url);
   }
 
+  /**
+   * Klik tombol tahap berikutnya.
+   *
+   * Khusus perpindahan ke "dikirim", formulir resi dibuka lebih dulu supaya nomor
+   * resi dan perubahan status tersimpan dalam SATU permintaan — kalau dipisah,
+   * pesanan bisa berstatus "dikirim" tanpa resi ketika permintaan kedua gagal.
+   */
+  function advance(order: BuyerOrder) {
+    const next = nextOrderStatus(statusOf(order));
+    if (!next || !order.id) return;
+    if (next === "shipped") {
+      setTrackingFor(order.id);
+      setTrackingValue(order.tracking_number || "");
+      return;
+    }
+    onSetStatus(order, next);
+  }
+
   return (
     <section className="bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6 space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -167,8 +258,8 @@ export default function OrdersTab({
             Daftar pesanan
           </h2>
           <p className="text-sm text-slate-500 mt-1">
-            Pesanan yang direkam AI dari chat WhatsApp. Centang <strong>Selesai</strong> setelah
-            pesanan diproses.
+            Pesanan yang direkam AI dari chat WhatsApp. Geser tahapnya mengikuti kenyataan:{" "}
+            <strong>Baru → Sudah bayar → Dikirim → Selesai</strong>.
           </p>
         </div>
         {orders.length > 0 && (
@@ -244,14 +335,14 @@ export default function OrdersTab({
             </p>
           ) : (
             <div className="border border-slate-200 rounded-2xl overflow-x-auto">
-              <table className="w-full text-sm min-w-[880px]">
+              <table className="w-full text-sm min-w-[980px]">
                 <caption className="sr-only">
-                  Daftar pesanan pembeli beserta status pemrosesannya
+                  Daftar pesanan pembeli beserta tahap pemrosesannya
                 </caption>
                 <thead>
                   <tr className="bg-slate-50 text-left text-[11px] uppercase tracking-wide text-slate-500">
-                    <th scope="col" className="px-4 py-3 font-semibold w-[92px]">
-                      Selesai
+                    <th scope="col" className="px-4 py-3 font-semibold w-[210px]">
+                      Tahap
                     </th>
                     <th scope="col" className="px-4 py-3 font-semibold">
                       Pembeli
@@ -275,34 +366,168 @@ export default function OrdersTab({
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {filtered.map((o) => {
-                    const done = o.status === "done";
+                    const st = statusOf(o);
+                    const done = st === "done";
                     const busy = !!o.id && busyId === o.id;
+                    const next = nextOrderStatus(st);
+                    const NextIcon = next ? ADVANCE_ICON[next] : CheckCircle2;
+                    const askTracking = !!o.id && trackingFor === o.id;
+                    const askProof = !!o.id && proofFor === o.id;
                     return (
                       <tr key={o.id || o.customer_phone} className={done ? "bg-slate-50/60" : ""}>
                         <td className="px-4 py-3 align-top">
-                          <button
-                            type="button"
-                            onClick={() => onToggleDone(o, !done)}
-                            disabled={busy || !o.id}
-                            aria-pressed={done}
-                            aria-label={
-                              done
-                                ? `Buka kembali pesanan ${o.customer_name || o.customer_phone}`
-                                : `Tandai pesanan ${o.customer_name || o.customer_phone} selesai`
-                            }
-                            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-[11px] font-semibold border transition-colors disabled:opacity-50 ${
-                              done
-                                ? "bg-emerald-50 border-emerald-200 text-emerald-700 hover:bg-emerald-100"
-                                : "bg-white border-slate-200 text-slate-500 hover:bg-slate-50"
-                            }`}
+                          <span
+                            className={`inline-flex items-center px-2.5 py-1 rounded-full border text-[11px] font-semibold ${STATUS_BADGE[st]}`}
                           >
-                            {done ? (
-                              <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
-                            ) : (
-                              <Circle className="w-3.5 h-3.5" aria-hidden="true" />
+                            {BUYER_ORDER_STATUS_LABELS[st]}
+                          </span>
+
+                          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                            {next && (
+                              <button
+                                type="button"
+                                onClick={() => advance(o)}
+                                disabled={busy || !o.id}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-[11px] font-semibold text-white bg-brand-600 hover:bg-brand-700 disabled:opacity-50"
+                              >
+                                <NextIcon className="w-3.5 h-3.5" aria-hidden="true" />
+                                {ADVANCE_LABEL[next]}
+                              </button>
                             )}
-                            {done ? "Selesai" : "Proses"}
-                          </button>
+                            {/* Satu langkah MUNDUR selalu tersedia: status salah klik
+                                jauh lebih sering terjadi daripada pesanan yang benar-benar
+                                perlu dihapus. */}
+                            {st !== "new" && (
+                              <button
+                                type="button"
+                                onClick={() => onSetStatus(o, "new")}
+                                disabled={busy || !o.id}
+                                className="inline-flex items-center gap-1 px-2 py-1.5 rounded-xl text-[11px] font-semibold text-slate-500 border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-50"
+                                aria-label={`Buka kembali pesanan ${o.customer_name || o.customer_phone}`}
+                              >
+                                <Undo2 className="w-3 h-3" aria-hidden="true" />
+                                Buka
+                              </button>
+                            )}
+                          </div>
+
+                          {askTracking && (
+                            <form
+                              onSubmit={(e) => {
+                                e.preventDefault();
+                                setTrackingFor(null);
+                                onSetStatus(o, "shipped", {
+                                  tracking_number: trackingValue.trim()
+                                });
+                              }}
+                              className="mt-2 space-y-1.5"
+                            >
+                              <label
+                                className="block text-[11px] font-semibold text-slate-500"
+                                htmlFor={`resi-${o.id}`}
+                              >
+                                Nomor resi (boleh dikosongkan)
+                              </label>
+                              <input
+                                id={`resi-${o.id}`}
+                                type="text"
+                                autoFocus
+                                value={trackingValue}
+                                onChange={(e) => setTrackingValue(e.target.value)}
+                                placeholder="mis. JP1234567890"
+                                className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs text-ink placeholder:text-slate-400 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                              />
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="submit"
+                                  disabled={busy}
+                                  className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-white bg-brand-600 hover:bg-brand-700 disabled:opacity-50"
+                                >
+                                  Simpan & tandai dikirim
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setTrackingFor(null)}
+                                  className="px-2 py-1.5 text-[11px] font-semibold text-slate-500 hover:text-ink"
+                                >
+                                  Batal
+                                </button>
+                              </div>
+                            </form>
+                          )}
+
+                          {o.tracking_number && !askTracking && (
+                            <p className="mt-2 text-[11px] text-slate-500">
+                              Resi: <span className="font-semibold text-ink">{o.tracking_number}</span>
+                            </p>
+                          )}
+
+                          {st !== "new" &&
+                            (askProof ? (
+                              <form
+                                onSubmit={(e) => {
+                                  e.preventDefault();
+                                  setProofFor(null);
+                                  onSetStatus(o, st, { payment_proof_url: proofValue.trim() });
+                                }}
+                                className="mt-2 space-y-1.5"
+                              >
+                                <label
+                                  className="block text-[11px] font-semibold text-slate-500"
+                                  htmlFor={`bukti-${o.id}`}
+                                >
+                                  Tautan bukti transfer
+                                </label>
+                                <input
+                                  id={`bukti-${o.id}`}
+                                  type="url"
+                                  autoFocus
+                                  value={proofValue}
+                                  onChange={(e) => setProofValue(e.target.value)}
+                                  placeholder="https://…"
+                                  className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs text-ink placeholder:text-slate-400 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                                />
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="submit"
+                                    disabled={busy}
+                                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-white bg-brand-600 hover:bg-brand-700 disabled:opacity-50"
+                                  >
+                                    Simpan
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setProofFor(null)}
+                                    className="px-2 py-1.5 text-[11px] font-semibold text-slate-500 hover:text-ink"
+                                  >
+                                    Batal
+                                  </button>
+                                </div>
+                              </form>
+                            ) : o.payment_proof_url ? (
+                              <a
+                                href={o.payment_proof_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="mt-2 inline-flex items-center gap-1 text-[11px] font-semibold text-brand-700 hover:underline"
+                              >
+                                <Receipt className="w-3 h-3" aria-hidden="true" />
+                                Lihat bukti bayar
+                              </a>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setProofFor(o.id || null);
+                                  setProofValue("");
+                                }}
+                                disabled={!o.id}
+                                className="mt-2 inline-flex items-center gap-1 text-[11px] font-semibold text-slate-500 hover:text-ink disabled:opacity-40"
+                              >
+                                <Receipt className="w-3 h-3" aria-hidden="true" />
+                                Catat bukti bayar
+                              </button>
+                            ))}
                         </td>
 
                         <td className="px-4 py-3 align-top">
@@ -338,12 +563,29 @@ export default function OrdersTab({
                           </span>
                         </td>
 
-                        <td className="px-4 py-3 align-top text-right font-semibold text-ink whitespace-nowrap">
-                          {formatRupiah(o.subtotal)}
+                        <td className="px-4 py-3 align-top text-right whitespace-nowrap">
+                          <span className="font-semibold text-ink">{formatRupiah(o.subtotal)}</span>
+                          {/* Ongkir dipisah, bukan dilebur: pemilik toko menagih
+                              totalnya, tapi yang jadi pendapatan barang hanya subtotal. */}
+                          {!!o.shipping_cost && (
+                            <span className="block text-[11px] text-slate-400">
+                              + ongkir {formatRupiah(o.shipping_cost)}
+                            </span>
+                          )}
                         </td>
 
                         <td className="px-4 py-3 align-top text-[11px] text-slate-400 whitespace-nowrap">
                           {relativeTime(o.created_at)}
+                          {o.paid_at && (
+                            <span className="block text-sky-600">
+                              dibayar {relativeTime(o.paid_at)}
+                            </span>
+                          )}
+                          {o.shipped_at && (
+                            <span className="block text-indigo-600">
+                              dikirim {relativeTime(o.shipped_at)}
+                            </span>
+                          )}
                           {done && o.done_at && (
                             <span className="block text-emerald-600">
                               selesai {relativeTime(o.done_at)}

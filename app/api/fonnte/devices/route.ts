@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getSessionEmail } from "@/lib/auth";
 import { createFonnteDevice, deleteFonnteDevice, formatFonntePhone } from "@/lib/fonnte";
 import { maxDevicesForPackage, getPlan } from "@/lib/packages";
+import { notifyDeviceDisconnected, notifyDeviceReconnected } from "@/lib/notify";
 import {
   deleteStoreDevice,
   getStoreByEmail,
@@ -87,6 +88,19 @@ export async function GET(req: Request) {
         health.set(d.id || d.phone, h);
 
         const next = h.connected ? "CONNECTED" : "DISCONNECTED";
+
+        // Kabar "nomor terputus" ke pemilik toko.
+        //
+        // Dipasang di sini karena inilah satu-satunya tempat status sebenarnya
+        // dibaca dari Fonnte. Anti-spamnya ada di `notifyDeviceDisconnected`
+        // (dashboard memanggil endpoint ini tiap 25 detik) dan `void` dipakai
+        // supaya tampilan dashboard tidak menunggu kirim WhatsApp selesai.
+        if (h.connected) {
+          void notifyDeviceReconnected(d);
+        } else {
+          void notifyDeviceDisconnected({ store, device: d, devices });
+        }
+
         if (next === d.device_status) return;
         d.device_status = next;
         if (d.id) await updateStoreDevice(d.id, { device_status: next });

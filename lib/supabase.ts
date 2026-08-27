@@ -69,6 +69,16 @@ export interface StoreRecord {
   ai_include_total?: boolean | null;
   /** Sertakan blok instruksi pembayaran pada balasan ongkir. */
   ai_include_payment?: boolean | null;
+  /**
+   * Nomor WhatsApp PRIBADI pemilik untuk menerima peringatan sistem.
+   * Wajib berbeda dari nomor toko: peringatan "nomor terputus" tidak mungkin
+   * dikirim lewat nomor yang justru sedang terputus.
+   */
+  alert_phone?: string | null;
+  notify_enabled?: boolean | null;
+  /** Anti-spam peringatan kuota: kapan & di persen berapa terakhir dikabari. */
+  last_quota_alert_at?: string | null;
+  last_quota_alert_pct?: number | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -110,6 +120,10 @@ export interface StoreDeviceRecord {
    * ke prompt AI dan pencocokan pesanan ikut dipersempit.
    */
   product_ids?: string[] | null;
+  /** Kapan peringatan terakhir dikirim untuk nomor ini (anti-spam kabar). */
+  last_alert_at?: string | null;
+  /** Jenis peringatan terakhir, mis. `disconnected` — supaya tidak diulang. */
+  last_alert_kind?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -122,6 +136,8 @@ export interface ProductRecord {
   weight: number;
   stock?: number;
   description?: string;
+  /** URL foto produk (dihosting di luar). Dikirim sebagai media saat AI mengutip. */
+  image_url?: string | null;
   created_at?: string;
 }
 
@@ -135,6 +151,11 @@ export interface ConversationRecord {
   messages: Array<{ role: "user" | "assistant"; content: string; timestamp?: string }>;
   last_intent?: string;
   destination_city?: string;
+  /** AI DIAM di percakapan ini — pemilik toko sedang menjawab sendiri. */
+  ai_paused?: boolean | null;
+  ai_paused_at?: string | null;
+  /** Kapan pemilik terakhir membuka percakapan ini (penanda belum dibaca). */
+  last_seen_at?: string | null;
   updated_at?: string;
   created_at?: string;
 }
@@ -155,6 +176,22 @@ export interface BuyerOrderItem {
  * pun berbeda (`buyer_orders` vs `orders`); mencampurnya akan mengacaukan
  * penagihan.
  */
+/**
+ * Daur hidup pesanan pembeli.
+ *
+ * `new` adalah satu-satunya status yang dianggap "berjalan": hanya baris `new`
+ * yang boleh digabung oleh chat lanjutan pembeli (lihat `getOpenBuyerOrder`).
+ * Begitu ditandai `paid`, isinya terkunci — barang yang sudah dibayar tidak boleh
+ * diam-diam bertambah karena pembeli menyebut produk lain di chat berikutnya.
+ */
+export type BuyerOrderStatus = "new" | "paid" | "shipped" | "done";
+
+export const BUYER_ORDER_STATUSES: BuyerOrderStatus[] = ["new", "paid", "shipped", "done"];
+
+export function isBuyerOrderStatus(value: unknown): value is BuyerOrderStatus {
+  return typeof value === "string" && (BUYER_ORDER_STATUSES as string[]).includes(value);
+}
+
 export interface BuyerOrderRecord {
   id?: string;
   store_id: string;
@@ -169,9 +206,14 @@ export interface BuyerOrderRecord {
   shipping_courier?: string | null;
   shipping_cost?: number | null;
   note?: string | null;
-  /** 'new' = belum diproses toko; 'done' = sudah diproses. */
-  status?: "new" | "done";
+  status?: BuyerOrderStatus;
   done_at?: string | null;
+  /** Bukti transfer yang dikirim pembeli (URL). */
+  payment_proof_url?: string | null;
+  paid_at?: string | null;
+  /** Nomor resi ekspedisi — dikabarkan ke pembeli saat status jadi `shipped`. */
+  tracking_number?: string | null;
+  shipped_at?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -262,6 +304,8 @@ interface DbResult<T = unknown> {
   skipped?: boolean;
   /** Operasi tidak dijalankan karena state-nya sudah tercapai (notifikasi duplikat). */
   duplicate?: boolean;
+  /** Baris BARU dibuat (bukan memperbarui yang sudah ada). */
+  created?: boolean;
 }
 
 function headers(key: string, prefer: string = "return=representation"): HeadersInit {
@@ -1296,7 +1340,225 @@ async function saveConversationMessageLegacy(input: SaveConversationInput): Prom
   }
 }
 
-// ---------------- RATE LIMIT (lintas instance) ----------------
+/**
+ * Tambahkan SATU pesan ke sebuah percakapan (tanpa pasangan bicara).
+ *
+ * Sengaja tidak memakai RPC `append_conversation_message`: RPC itu selalu menulis
+ * SEPASANG pesan (pembeli + bot), sedangkan balasan manual pemilik toko — dan pesan
+ * pembeli pada percakapan yang AI-nya dijeda — tidak punya pasangan. Memaksakannya
+ * berarti menyisipkan pesan kosong ke riwayat, yang lalu ikut terkirim ke prompt AI
+ * sebagai giliran bicara palsu.
+ *
+ * Jalur baca-ubah-tulis di sini dapat kehilangan pesan bila balasan bot datang pada
+ * milidetik yang sama. Risikonya kecil dan disengaja: kedua pemakainya justru jalur
+ * yang bot-nya sedang TIDAK menulis (`ai_paused`), atau manusia yang mengetik satu
+ * per satu.
+ */
+async function appendConversationEntry(params: {
+  storeId: string;
+  phone: string;
+  role: "user" | "assistant";
+  text: string;
+  /** `true` = sekalian tandai percakapan sudah dibaca (balasan manual). */
+  markSeen: boolean;
+  /**
+   * `true` = pesan ini ditulis MANUSIA, bukan bot.
+   *
+   * Disimpan sebagai kunci tambahan di dalam JSON pesan — kolomnya tidak berubah,
+   * dan pembangun prompt AI hanya membaca `role`/`content`, jadi penanda ini tidak
+   * mengubah apa pun yang dilihat model. Yang dibelinya: dashboard bisa berhenti
+   * melabeli balasan pemilik toko sebagai "AI CS", sebuah kekeliruan yang persis
+   * muncul pada percakapan paling sensitif — yang diambil alih manusia.
+   */
+  manual?: boolean;
+}): Promise<DbResult> {
+  const { storeId, phone, role, text, markSeen, manual } = params;
+  const cfg = getConfig();
+  if (!cfg) return { ok: false, skipped: true };
+
+  try {
+    const existing = await getConversation(storeId, phone);
+    const nowStr = new Date().toISOString();
+    const entry = { role, content: text, timestamp: nowStr, ...(manual ? { manual: true } : {}) };
+
+    if (!existing?.id) {
+      const res = await fetch(`${cfg.url}/rest/v1/conversations`, {
+        method: "POST",
+        headers: headers(cfg.key, "return=representation"),
+        body: JSON.stringify({
+          store_id: storeId,
+          customer_phone: phone,
+          messages: [entry],
+          updated_at: nowStr
+        }),
+        cache: "no-store"
+      });
+      return { ok: res.ok, error: res.ok ? undefined : `insert ${res.status}` };
+    }
+
+    const messages = Array.isArray(existing.messages) ? [...existing.messages, entry] : [entry];
+    const body: Record<string, unknown> = {
+      messages: messages.slice(-MAX_STORED_MESSAGES),
+      updated_at: nowStr
+    };
+    // Membalas sendiri = percakapan ini sudah dibaca. Tanpa ini balasan manual
+    // sendiri akan memunculkan penanda "belum dibaca".
+    if (markSeen) body.last_seen_at = nowStr;
+
+    const res = await fetch(`${cfg.url}/rest/v1/conversations?id=eq.${existing.id}`, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify(body),
+      cache: "no-store"
+    });
+
+    // Kolom `last_seen_at` belum ada di DB yang belum dimigrasi — pesannya jauh
+    // lebih penting daripada penanda baca, jadi ulangi tanpa kolom itu.
+    if (!res.ok && res.status === 400 && markSeen) {
+      const retry = await fetch(`${cfg.url}/rest/v1/conversations?id=eq.${existing.id}`, {
+        method: "PATCH",
+        headers: headers(cfg.key, "return=representation"),
+        body: JSON.stringify({
+          messages: messages.slice(-MAX_STORED_MESSAGES),
+          updated_at: nowStr
+        }),
+        cache: "no-store"
+      });
+      return { ok: retry.ok, error: retry.ok ? undefined : `patch ${retry.status}` };
+    }
+
+    return { ok: res.ok, error: res.ok ? undefined : `patch ${res.status}` };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Balasan manual pemilik toko — sekaligus menandai percakapan sudah dibaca. */
+export async function appendManualReply(params: {
+  storeId: string;
+  phone: string;
+  text: string;
+}): Promise<DbResult> {
+  return appendConversationEntry({ ...params, role: "assistant", markSeen: true, manual: true });
+}
+
+/**
+ * Pesan pembeli yang TIDAK dibalas bot (percakapan sedang ditangani manusia).
+ *
+ * Wajib tetap dicatat: kalau pesan pembeli hilang hanya karena AI dijeda, pemilik
+ * toko membuka chat dan tidak melihat apa yang baru saja ditanyakan. Tidak menandai
+ * sudah dibaca — pesan yang belum dijawab siapa pun memang belum dibaca.
+ */
+export async function appendBuyerMessage(params: {
+  storeId: string;
+  phone: string;
+  text: string;
+}): Promise<DbResult> {
+  return appendConversationEntry({ ...params, role: "user", markSeen: false });
+}
+
+/**
+ * Nyalakan/matikan mode "AI diam" untuk satu percakapan.
+ *
+ * `skipped: true` bila kolomnya belum ada (schema belum dimigrasi) — pemanggil
+ * memakai itu untuk memberi pesan "jalankan schema.sql terbaru" ketimbang
+ * mengaku berhasil padahal AI tetap akan menjawab.
+ */
+export async function setConversationAiPaused(
+  storeId: string,
+  phone: string,
+  paused: boolean
+): Promise<DbResult> {
+  const cfg = getConfig();
+  if (!cfg || !storeId || !phone) return { ok: false, skipped: true };
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/conversations?store_id=eq.${encodeURIComponent(storeId)}` +
+      `&customer_phone=eq.${encodeURIComponent(phone)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify({
+        ai_paused: paused,
+        ai_paused_at: paused ? new Date().toISOString() : null
+      }),
+      cache: "no-store"
+    });
+
+    if (res.ok) return { ok: true };
+    const text = await res.text().catch(() => "");
+    if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+    return { ok: false, error: `${res.status}: ${text}` };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Tandai percakapan sudah dibaca pemilik toko (mematikan lencana belum dibaca). */
+export async function markConversationSeen(storeId: string, phone: string): Promise<DbResult> {
+  const cfg = getConfig();
+  if (!cfg || !storeId || !phone) return { ok: false, skipped: true };
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/conversations?store_id=eq.${encodeURIComponent(storeId)}` +
+      `&customer_phone=eq.${encodeURIComponent(phone)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: headers(cfg.key),
+      body: JSON.stringify({ last_seen_at: new Date().toISOString() }),
+      cache: "no-store"
+    });
+
+    if (res.ok) return { ok: true };
+    const text = await res.text().catch(() => "");
+    if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+    return { ok: false, error: `${res.status}: ${text}` };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Kurangi stok produk sesuai isi pesanan — atomik, lewat RPC.
+ *
+ * Dipanggil TEPAT SEKALI per pesanan (saat baris `buyer_orders` baru dibuat),
+ * bukan setiap kali pesanan diperbarui: kalau tidak, pembeli yang mengirim tiga
+ * pesan lanjutan akan mengurangi stok tiga kali untuk barang yang sama.
+ *
+ * Kegagalan di sini tidak boleh menggagalkan apa pun — pembeli sudah menerima
+ * balasannya. Stok yang tidak berkurang adalah masalah kecil; webhook yang gagal
+ * lalu dikirim ulang Fonnte akan mengulang seluruh balasan.
+ */
+export async function decrementProductStock(
+  storeId: string,
+  items: Array<{ name?: string | null; id?: string | null; units: number }>
+): Promise<DbResult> {
+  const cfg = getConfig();
+  if (!cfg || !storeId) return { ok: false, skipped: true };
+
+  const payload = items
+    .filter((i) => Number(i.units) > 0)
+    .map((i) => ({ id: i.id || null, name: i.name || null, units: Math.floor(Number(i.units)) }));
+  if (payload.length === 0) return { ok: true };
+
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/rpc/decrement_product_stock`, {
+      method: "POST",
+      headers: headers(cfg.key),
+      body: JSON.stringify({ p_store_id: storeId, p_items: payload }),
+      cache: "no-store"
+    });
+
+    if (res.ok) return { ok: true };
+    const text = await res.text().catch(() => "");
+    if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+    return { ok: false, error: `${res.status}: ${text}` };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
 
 export interface RateLimitVerdict {
   allowed: boolean;
@@ -1522,7 +1784,7 @@ export async function recordBuyerOrder(
         return { ok: false, error: `buyer order update ${res.status}: ${text}` };
       }
       const data = await res.json();
-      return { ok: true, data: Array.isArray(data) ? data[0] : data };
+      return { ok: true, created: false, data: Array.isArray(data) ? data[0] : data };
     }
 
     const res = await fetch(`${cfg.url}/rest/v1/buyer_orders`, {
@@ -1535,43 +1797,80 @@ export async function recordBuyerOrder(
       // 409 = indeks unik "satu pesanan berjalan per pembeli" menahan dua chat
       // yang datang hampir bersamaan. Itu justru hasil yang benar: pesanannya
       // sudah tercatat oleh request yang menang.
-      if (res.status === 409) return { ok: true, duplicate: true };
+      //
+      // `created` SENGAJA false di sini: request yang menang-lah yang mengurangi
+      // stok. Menandainya `true` membuat stok berkurang dua kali untuk satu
+      // pesanan yang sama.
+      if (res.status === 409) return { ok: true, duplicate: true, created: false };
       if (isMissingSchema(res.status)) return { ok: false, skipped: true };
       const text = await res.text().catch(() => "");
       return { ok: false, error: `buyer order insert ${res.status}: ${text}` };
     }
     const data = await res.json();
-    return { ok: true, data: Array.isArray(data) ? data[0] : data };
+    return { ok: true, created: true, data: Array.isArray(data) ? data[0] : data };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
 }
 
 /**
- * Tandai pesanan selesai / belum. `storeId` ikut disaring di PostgREST supaya
- * satu toko tidak bisa mengubah pesanan toko lain hanya dengan menebak id.
+ * Ubah status pesanan pembeli mengikuti daur hidup `new → paid → shipped → done`.
+ *
+ * `storeId` ikut disaring di PostgREST supaya satu toko tidak bisa mengubah
+ * pesanan toko lain hanya dengan menebak id.
+ *
+ * Stempel waktu ditulis SEKALI per tahap yang dilewati dan tidak pernah dihapus
+ * saat status dikembalikan: `paid_at` sebuah pesanan yang lalu dikoreksi kembali
+ * ke `new` tetap menjadi catatan bahwa pembayarannya pernah dikonfirmasi. Yang
+ * dibersihkan hanya `done_at`, karena "selesai" adalah keadaan, bukan riwayat.
  */
 export async function setBuyerOrderStatus(
   id: string,
   storeId: string,
-  done: boolean
+  status: BuyerOrderStatus,
+  extra?: { tracking_number?: string | null; payment_proof_url?: string | null; note?: string | null }
 ): Promise<DbResult<BuyerOrderRecord>> {
   const cfg = getConfig();
   if (!cfg || !id || !storeId) return { ok: false, skipped: true };
+
+  const nowStr = new Date().toISOString();
+  const body: Record<string, unknown> = {
+    status,
+    done_at: status === "done" ? nowStr : null
+  };
+  if (status === "paid" || status === "shipped" || status === "done") body.paid_at = nowStr;
+  if (status === "shipped" || status === "done") body.shipped_at = nowStr;
+  if (extra && typeof extra.tracking_number === "string") {
+    body.tracking_number = extra.tracking_number.trim() || null;
+  }
+  if (extra && typeof extra.payment_proof_url === "string") {
+    body.payment_proof_url = extra.payment_proof_url.trim() || null;
+  }
+  if (extra && typeof extra.note === "string") body.note = extra.note.trim() || null;
 
   try {
     const url =
       `${cfg.url}/rest/v1/buyer_orders?id=eq.${encodeURIComponent(id)}` +
       `&store_id=eq.${encodeURIComponent(storeId)}`;
-    const res = await fetch(url, {
+    let res = await fetch(url, {
       method: "PATCH",
       headers: headers(cfg.key, "return=representation"),
-      body: JSON.stringify({
-        status: done ? "done" : "new",
-        done_at: done ? new Date().toISOString() : null
-      }),
+      body: JSON.stringify(body),
       cache: "no-store"
     });
+
+    // DB yang belum menjalankan migrasi terbaru tidak punya kolom tahapan.
+    // Statusnya tetap harus bisa diubah — pemilik toko yang sedang menandai
+    // pesanan tidak boleh terhenti hanya karena kolom stempel waktu belum ada.
+    if (!res.ok && res.status === 400) {
+      res = await fetch(url, {
+        method: "PATCH",
+        headers: headers(cfg.key, "return=representation"),
+        body: JSON.stringify({ status, done_at: status === "done" ? nowStr : null }),
+        cache: "no-store"
+      });
+    }
+
     if (!res.ok) {
       if (isMissingSchema(res.status)) return { ok: false, skipped: true };
       const text = await res.text().catch(() => "");
@@ -1607,6 +1906,217 @@ export async function deleteBuyerOrder(id: string, storeId: string): Promise<DbR
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err) };
+  }
+}
+
+// ---------------- ANGGOTA TOKO (login tambahan) ----------------
+
+/**
+ * Satu login tambahan milik sebuah toko (pegawai / admin kedua).
+ *
+ * Tabel terpisah dari `stores` dengan alasan yang disengaja: `stores.email` unik
+ * dan menjadi identitas pemilik + tujuan tagihan. Menjadikan `stores` tabel
+ * multi-user berarti menyentuh jalur login yang sudah dipakai pelanggan berbayar.
+ */
+export interface StoreMemberRecord {
+  id?: string;
+  store_id: string;
+  email: string;
+  password_hash?: string;
+  role?: "staff" | "admin";
+  password_changed_at?: string | null;
+  last_login_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** Bentuk yang boleh dikirim ke browser — tanpa hash password. */
+export interface PublicStoreMember {
+  id?: string;
+  email: string;
+  role: "staff" | "admin";
+  last_login_at?: string | null;
+  created_at?: string;
+}
+
+export function toPublicMember(m: StoreMemberRecord): PublicStoreMember {
+  return {
+    id: m.id,
+    email: m.email,
+    role: m.role === "admin" ? "admin" : "staff",
+    last_login_at: m.last_login_at ?? null,
+    created_at: m.created_at
+  };
+}
+
+/**
+ * Cari anggota berdasarkan email (case-insensitive).
+ *
+ * `null` juga dikembalikan bila tabelnya belum ada. Itu penting: login pemilik
+ * toko memanggil fungsi ini sebagai jalur CADANGAN, dan database yang belum
+ * dimigrasi tidak boleh membuat halaman login error.
+ */
+export async function getStoreMemberByEmail(email: string): Promise<StoreMemberRecord | null> {
+  const cfg = getConfig();
+  const clean = (email || "").trim().toLowerCase();
+  if (!cfg || !clean) return null;
+
+  try {
+    const url = `${cfg.url}/rest/v1/store_members?email=ilike.${encodeURIComponent(clean)}&limit=1`;
+    const res = await fetch(url, { headers: headers(cfg.key), cache: "no-store" });
+    if (!res.ok) return null;
+    const list = await res.json();
+    return Array.isArray(list) && list.length > 0 ? (list[0] as StoreMemberRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function listStoreMembers(storeId: string): Promise<StoreMemberRecord[] | null> {
+  const cfg = getConfig();
+  if (!cfg || !storeId) return [];
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/store_members?store_id=eq.${encodeURIComponent(storeId)}` +
+      `&order=created_at.asc&limit=50`;
+    const res = await fetch(url, { headers: headers(cfg.key), cache: "no-store" });
+    if (!res.ok) return isMissingSchema(res.status) ? null : [];
+    return (await res.json()) as StoreMemberRecord[];
+  } catch {
+    return [];
+  }
+}
+
+export async function insertStoreMember(
+  member: Omit<StoreMemberRecord, "id" | "created_at" | "updated_at">
+): Promise<DbResult<StoreMemberRecord>> {
+  const cfg = getConfig();
+  if (!cfg) return { ok: false, skipped: true };
+
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/store_members`, {
+      method: "POST",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify({
+        store_id: member.store_id,
+        email: (member.email || "").trim().toLowerCase(),
+        password_hash: member.password_hash,
+        role: member.role === "admin" ? "admin" : "staff"
+      }),
+      cache: "no-store"
+    });
+
+    if (res.status === 409) {
+      return { ok: false, duplicate: true, error: "Email itu sudah dipakai akun lain." };
+    }
+    if (!res.ok) {
+      if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `member insert ${res.status}: ${text}` };
+    }
+    const data = await res.json();
+    return { ok: true, data: Array.isArray(data) ? data[0] : data };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+export async function deleteStoreMember(id: string, storeId: string): Promise<DbResult> {
+  const cfg = getConfig();
+  if (!cfg || !id || !storeId) return { ok: false, skipped: true };
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/store_members?id=eq.${encodeURIComponent(id)}` +
+      `&store_id=eq.${encodeURIComponent(storeId)}`;
+    const res = await fetch(url, {
+      method: "DELETE",
+      headers: headers(cfg.key, "return=minimal"),
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `member delete ${res.status}: ${text}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+export async function touchStoreMemberLogin(id: string): Promise<void> {
+  const cfg = getConfig();
+  if (!cfg || !id) return;
+  try {
+    await fetch(`${cfg.url}/rest/v1/store_members?id=eq.${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=minimal"),
+      body: JSON.stringify({ last_login_at: new Date().toISOString() }),
+      cache: "no-store"
+    });
+  } catch {
+    // Stempel login terakhir itu hiasan; kegagalannya tidak boleh menggagalkan login.
+  }
+}
+
+// ---------------- BUKU CATATAN PERINGATAN (anti-spam) ----------------
+
+/**
+ * Catat bahwa peringatan `kind` sudah dikirim untuk sebuah nomor.
+ *
+ * Tanpa ini setiap polling dashboard (25 detik sekali) akan mengirim ulang
+ * peringatan yang sama — pemilik toko diberi 140 pesan WhatsApp per jam untuk
+ * satu nomor yang terputus, dan itu membuat peringatannya diabaikan.
+ */
+export async function noteDeviceAlert(deviceId: string, kind: string): Promise<void> {
+  const cfg = getConfig();
+  if (!cfg || !deviceId) return;
+  try {
+    await fetch(`${cfg.url}/rest/v1/store_devices?id=eq.${encodeURIComponent(deviceId)}`, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=minimal"),
+      body: JSON.stringify({ last_alert_at: new Date().toISOString(), last_alert_kind: kind }),
+      cache: "no-store"
+    });
+  } catch {
+    // Kolomnya mungkin belum ada. Kegagalan di sini hanya berarti peringatan
+    // berikutnya bisa terkirim lebih cepat dari seharusnya.
+  }
+}
+
+/** Bersihkan catatan peringatan setelah nomor pulih, supaya kabar berikutnya terkirim. */
+export async function clearDeviceAlert(deviceId: string): Promise<void> {
+  const cfg = getConfig();
+  if (!cfg || !deviceId) return;
+  try {
+    await fetch(`${cfg.url}/rest/v1/store_devices?id=eq.${encodeURIComponent(deviceId)}`, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=minimal"),
+      body: JSON.stringify({ last_alert_at: null, last_alert_kind: null }),
+      cache: "no-store"
+    });
+  } catch {
+    // Lihat catatan di `noteDeviceAlert`.
+  }
+}
+
+export async function noteQuotaAlert(storeId: string, pct: number): Promise<void> {
+  const cfg = getConfig();
+  if (!cfg || !storeId) return;
+  try {
+    await fetch(`${cfg.url}/rest/v1/stores?id=eq.${encodeURIComponent(storeId)}`, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=minimal"),
+      body: JSON.stringify({
+        last_quota_alert_at: new Date().toISOString(),
+        last_quota_alert_pct: Math.round(pct)
+      }),
+      cache: "no-store"
+    });
+  } catch {
+    // Lihat catatan di `noteDeviceAlert`.
   }
 }
 

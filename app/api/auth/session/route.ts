@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getSessionEmail } from "@/lib/auth";
+import { getSessionActor } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,8 +13,15 @@ export const dynamic = "force-dynamic";
  *
  * Dipakai modal checkout: kalau pengunjung sudah login, formulir tidak perlu lagi
  * meminta kata sandi karena pembayaran itu PERPANJANGAN akun yang sudah ada.
+ *
+ * `email` tetap berisi email TOKO (seperti sebelum fitur anggota tim ada) supaya
+ * pemanggil lama tidak berubah perilaku; identitas orangnya ada di `actorEmail`.
  */
 export async function GET() {
-  const email = await getSessionEmail();
-  return NextResponse.json({ email: email || null });
+  const actor = await getSessionActor();
+  return NextResponse.json({
+    email: actor?.storeEmail || null,
+    actorEmail: actor?.email || null,
+    isMember: actor?.isMember === true
+  });
 }

@@ -203,6 +203,18 @@ export async function POST(req: Request) {
       settings.ai_include_payment = body.ai_include_payment === true;
     }
 
+    // ── Pemberitahuan ke pemilik toko ───────────────────────────────────────
+    if (typeof body.alert_phone === "string") {
+      // Hanya digit & tanda plus disimpan: nomor ini dipakai langsung sebagai
+      // target kirim WhatsApp, jadi spasi/tanda hubung yang lolos akan membuat
+      // kabar penting gagal terkirim tanpa penjelasan.
+      const cleaned = body.alert_phone.replace(/[^\d+]/g, "").slice(0, 20);
+      settings.alert_phone = cleaned || null;
+    }
+    if (body.notify_enabled !== undefined) {
+      settings.notify_enabled = body.notify_enabled === true;
+    }
+
     if (Object.keys(settings).length === 0) {
       return NextResponse.json({ error: "Tidak ada perubahan yang valid untuk disimpan." }, { status: 400 });
     }

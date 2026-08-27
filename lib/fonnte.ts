@@ -7,6 +7,15 @@ export interface FonnteSendOptions {
   target: string; // Nomor WhatsApp penerima (misal: "081234567890" atau "6281234567890")
   message: string;
   token: string; // Fonnte Device Token
+  /**
+   * URL gambar yang dilampirkan (foto produk).
+   *
+   * Fonnte menerima beberapa URL sekaligus lewat satu field `url` yang dipisah
+   * koma. Karena itu URL yang MEMUAT koma tidak bisa dikirim dan dibuang di sini:
+   * mengirimnya apa adanya akan membuat Fonnte memecahnya menjadi dua URL rusak,
+   * dan pembeli menerima pesan tanpa gambar sama sekali.
+   */
+  urls?: string[];
 }
 
 export interface FonnteDeviceResponse {
@@ -307,7 +316,7 @@ export async function applyFonnteDeviceSettings(
  * Kirim pesan WhatsApp ke pembeli lewat Fonnte API
  */
 export async function sendFonnteMessage(options: FonnteSendOptions): Promise<{ success: boolean; data?: unknown; error?: string }> {
-  const { target, message, token } = options;
+  const { target, message, token, urls } = options;
   const activeToken = token || process.env.FONNTE_TOKEN;
 
   if (!activeToken) {
@@ -322,6 +331,14 @@ export async function sendFonnteMessage(options: FonnteSendOptions): Promise<{ s
     formData.append("target", cleanPhone);
     formData.append("message", message);
     formData.append("countryCode", "62");
+
+    // Hanya URL http(s) tanpa koma. Sisanya dilewati tanpa menggagalkan kirim:
+    // pesan teksnya jauh lebih penting daripada lampirannya, dan gagal total
+    // hanya karena satu URL foto cacat berarti pembeli tidak dijawab sama sekali.
+    const media = (urls || [])
+      .map((u) => (u || "").trim())
+      .filter((u) => /^https?:\/\//i.test(u) && !u.includes(","));
+    if (media.length > 0) formData.append("url", media.join(","));
 
     const res = await fetch("https://api.fonnte.com/send", {
       method: "POST",

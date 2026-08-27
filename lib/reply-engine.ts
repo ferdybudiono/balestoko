@@ -1,9 +1,12 @@
 import { processAICustomerService, type AIProcessResult, type ChatMessage } from "@/lib/ai";
 import { sendFonnteMessage } from "@/lib/fonnte";
+import { notifyNewOrder } from "@/lib/notify";
 import { aiContextMessagesForPackage, monthlyConversationLimit, monthStartMs } from "@/lib/packages";
 import {
+  appendBuyerMessage,
   bumpRateLimit,
   countConversationsThisMonth,
+  decrementProductStock,
   getConversation,
   getOpenBuyerOrder,
   getProductsByStoreId,
@@ -34,6 +37,16 @@ export interface AutoReplyOutcome {
   capturedAddress?: string | null;
   /** Pesanan pembeli dicatat/diperbarui di daftar pesanan. */
   orderRecorded?: boolean;
+  /**
+   * Percakapan ini sedang ditangani manusia (`ai_paused`), jadi bot sengaja diam.
+   *
+   * Dibedakan dari kegagalan: webhook memakai ini untuk mencatat "AI dijeda" pada
+   * device, bukan "gagal membalas" — dan pemilik toko tidak dikirimi peringatan
+   * untuk sesuatu yang dia sendiri nyalakan.
+   */
+  aiPaused?: boolean;
+  /** Pesanan TIDAK dicatat karena ada barang habis di dalamnya. */
+  stockBlocked?: boolean;
 }
 
 // ── Pembatas laju ────────────────────────────────────────────────────────
@@ -195,6 +208,22 @@ export async function runAutoReply(params: {
   const products = productsForDevice(allProducts, device);
   const history = conversation?.messages || [];
 
+  // ── Percakapan yang sedang diambil alih manusia ──────────────────────────
+  //
+  // Diperiksa SEBELUM apa pun yang berbiaya: memanggil Gemini lalu membuang
+  // hasilnya berarti pemilik toko membayar token untuk balasan yang tidak pernah
+  // dikirim. Pesan pembelinya tetap dicatat — kalau tidak, pemilik toko membuka
+  // chat dan tidak melihat pertanyaan yang baru saja masuk.
+  if (conversation?.ai_paused === true) {
+    if (storeId) await appendBuyerMessage({ storeId, phone: sender, text: messageText });
+    return {
+      replyText: "",
+      intent: "GENERAL_CHAT",
+      delivered: false,
+      aiPaused: true
+    };
+  }
+
   const aiResult = await processAICustomerService({
     messageText,
     storeName: store.store_name || "Toko Bot WA CS AI",
@@ -243,7 +272,14 @@ export async function runAutoReply(params: {
     // pembeli berpotensi keluar dari nomor yang bukan miliknya.
     const token = deviceToken || null;
     if (token) {
-      const sent = await sendFonnteMessage({ target: sender, message: aiResult.replyText, token });
+      const sent = await sendFonnteMessage({
+        target: sender,
+        message: aiResult.replyText,
+        token,
+        // Foto produk yang dikutip balasan. Dikirim bersama pesan (bukan pesan
+        // terpisah) supaya pembeli tidak menerima dua notifikasi untuk satu jawaban.
+        urls: aiResult.mediaUrls
+      });
       delivered = sent.success;
       if (!sent.success) {
         deliveryError = sent.error;
@@ -270,6 +306,7 @@ export async function runAutoReply(params: {
     });
 
     orderRecorded = await recordOrderFromReply({
+      store,
       storeId,
       deviceId: device?.id || null,
       sender,
@@ -288,7 +325,8 @@ export async function runAutoReply(params: {
     deliveryError,
     capturedName: aiResult.capturedName,
     capturedAddress: aiResult.capturedAddress,
-    orderRecorded
+    orderRecorded,
+    stockBlocked: aiResult.stockBlocked === true
   };
 }
 
@@ -311,6 +349,7 @@ export async function runAutoReply(params: {
  * mengirim ulang pesan yang sama.
  */
 async function recordOrderFromReply(params: {
+  store: StoreRecord;
   storeId: string;
   deviceId: string | null;
   sender: string;
@@ -320,6 +359,7 @@ async function recordOrderFromReply(params: {
   result: AIProcessResult;
 }): Promise<boolean> {
   const {
+    store,
     storeId,
     deviceId,
     sender,
@@ -328,6 +368,14 @@ async function recordOrderFromReply(params: {
     conversationCity,
     result
   } = params;
+
+  // Ada barang HABIS di pesanan ini → tidak dicatat sama sekali.
+  //
+  // Balasan ke pembeli sudah mengatakan pesanannya belum dicatat (lihat jalur
+  // stok di `lib/ai.ts`), jadi mencatatnya di sini akan membuat daftar pesanan
+  // toko berisi barang yang mustahil dikirim — dan bertentangan dengan apa yang
+  // baru saja dijanjikan ke pembeli.
+  if (result.stockBlocked === true) return false;
 
   const draft = result.orderDraft;
   const lines = draft?.lines?.filter((l) => l.units > 0) || [];
@@ -371,5 +419,34 @@ async function recordOrderFromReply(params: {
   if (!res.ok && !res.skipped) {
     console.warn("[auto-reply] pesanan gagal dicatat:", res.error);
   }
+
+  // ── Stok dipotong TEPAT SEKALI per pesanan ──────────────────────────────
+  //
+  // Syaratnya `created === true`, bukan `ok`: baris pesanan yang sama diperbarui
+  // tiap pesan lanjutan pembeli ("Budi", "Jl. Merdeka 10", "kirim besok"), jadi
+  // memotong stok setiap kali `ok` akan mengosongkan gudang hanya karena pembeli
+  // banyak bicara. Duplikat 409 juga bukan pembuatan baris — pemenang race-nya
+  // yang sudah memotong.
+  if (res.created === true && lines.length > 0) {
+    const dec = await decrementProductStock(
+      storeId,
+      lines.map((l) => ({ id: l.id ?? null, name: l.name, units: l.units }))
+    );
+    if (!dec.ok && !dec.skipped) {
+      console.warn("[auto-reply] stok gagal dipotong:", dec.error);
+    }
+
+    // Kabar ke pemilik toko hanya untuk pesanan BARU, dengan alasan yang sama:
+    // memberi kabar tiap pembaruan berarti satu pesanan mengirim lima notifikasi.
+    await notifyNewOrder({
+      store,
+      customerPhone: sender,
+      customerName: result.capturedName || conversationName || null,
+      items: lines.map((l) => ({ name: l.name, units: l.units })),
+      subtotal: draft?.subtotal || 0,
+      city
+    });
+  }
+
   return res.ok === true;
 }

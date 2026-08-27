@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
-import { bumpRateLimit, getStoreByEmail, storeActivityState } from "@/lib/supabase";
+import {
+  bumpRateLimit,
+  getStoreByEmail,
+  getStoreById,
+  getStoreMemberByEmail,
+  storeActivityState,
+  touchStoreMemberLogin
+} from "@/lib/supabase";
 import { verifyPassword, setSessionCookie } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -71,8 +78,38 @@ export async function POST(req: Request) {
   // Pesan generik agar tidak membocorkan apakah email terdaftar.
   const GENERIC = "Email atau kata sandi salah.";
 
+  // Jalur CADANGAN: anggota tim (`store_members`). Dicoba hanya bila email itu
+  // bukan akun pemilik toko, jadi perilaku login pemilik tidak berubah sedikit pun
+  // — termasuk pada database yang tabel anggotanya belum ada (`getStoreMemberByEmail`
+  // mengembalikan null, dan hasilnya tetap "email atau kata sandi salah").
   if (!store || !store.password_hash) {
-    return NextResponse.json({ error: GENERIC }, { status: 401 });
+    const member = await getStoreMemberByEmail(email);
+    if (!member || !member.password_hash || !verifyPassword(password, member.password_hash)) {
+      return NextResponse.json({ error: GENERIC }, { status: 401 });
+    }
+
+    const owner = await getStoreById(member.store_id);
+    if (!owner?.email) {
+      // Anggota tanpa toko induk (toko terhapus): jangan terbitkan sesi yang
+      // menunjuk ke ruang kosong.
+      return NextResponse.json({ error: GENERIC }, { status: 401 });
+    }
+
+    if (member.id) await touchStoreMemberLogin(member.id);
+    await setSessionCookie(member.email, owner.email);
+
+    const memberState = storeActivityState(owner);
+    return NextResponse.json({
+      success: true,
+      email: member.email,
+      // Toko yang diakses — dashboard menampilkannya supaya anggota tim tahu
+      // sedang membuka toko siapa.
+      storeEmail: owner.email,
+      isMember: true,
+      role: member.role === "admin" ? "admin" : "staff",
+      state: memberState,
+      active: memberState === "active" || memberState === "trial"
+    });
   }
 
   if (!verifyPassword(password, store.password_hash)) {
@@ -85,6 +122,8 @@ export async function POST(req: Request) {
   return NextResponse.json({
     success: true,
     email,
+    storeEmail: email,
+    isMember: false,
     state,
     active: state === "active" || state === "trial",
   });

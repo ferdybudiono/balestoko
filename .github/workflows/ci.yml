@@ -1,0 +1,39 @@
+name: CI
+
+# Gerbang yang sama dengan yang dipakai sebelum melaporkan pekerjaan selesai:
+# tipe harus bersih, tes harus lulus, dan build produksi harus jadi. Ketiganya
+# dijalankan pada satu job berurutan supaya `npm ci` cukup sekali dan galat
+# muncul di urutan termurah lebih dulu.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+        env:
+          # Build tidak boleh butuh kredensial sungguhan. Nilai ini hanya
+          # memuaskan modul yang membacanya saat impor; tidak ada permintaan
+          # jaringan yang dilakukan selama build.
+          NEXT_TELEMETRY_DISABLED: "1"

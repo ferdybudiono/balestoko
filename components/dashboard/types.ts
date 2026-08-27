@@ -7,6 +7,8 @@ export interface Product {
   weight: number;
   stock?: number;
   description?: string;
+  /** URL foto produk — dikirim ke pembeli bersama balasan yang mengutipnya. */
+  image_url?: string | null;
   created_at?: string;
 }
 
@@ -14,6 +16,14 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   timestamp?: string;
+  /**
+   * `true` = balasan ini ditulis pemilik toko, bukan bot.
+   *
+   * Tidak ada pada pesan lama (sebelum fitur ambil-alih), jadi ketiadaannya berarti
+   * "tidak diketahui" — dan ditampilkan sebagai balasan AI, sebagaimana memang
+   * demikian pada seluruh riwayat sebelum fitur ini.
+   */
+  manual?: boolean;
 }
 
 export interface Conversation {
@@ -25,6 +35,17 @@ export interface Conversation {
   messages: ChatMessage[];
   last_intent?: string;
   destination_city?: string;
+  /** AI sengaja dibungkam untuk percakapan ini — sedang ditangani manusia. */
+  ai_paused?: boolean | null;
+  ai_paused_at?: string | null;
+  /**
+   * Kapan pemilik toko terakhir membuka/membalas percakapan ini.
+   *
+   * `null` pada percakapan yang sudah ada pesan = belum pernah dibuka, jadi
+   * dihitung belum dibaca. Kolom ini yang membuat penanda "belum dibaca" mungkin
+   * tanpa menyimpan status baca per pesan.
+   */
+  last_seen_at?: string | null;
   updated_at?: string;
   created_at?: string;
 }
@@ -45,6 +66,25 @@ export interface BuyerOrderItem {
  * kebetulan sama-sama bernama "order"; menyamakannya berarti mencampur uang
  * langganan dengan pesanan pembeli.
  */
+/**
+ * Tahap hidup pesanan pembeli.
+ *
+ * `new → paid → shipped → done`. Empat nilai, bukan dua: pemilik toko yang hanya
+ * punya "baru" dan "selesai" tidak bisa membedakan pesanan yang menunggu
+ * pembayaran dari yang sudah dibayar tapi belum dikirim — padahal itu dua
+ * pekerjaan berbeda dengan urgensi berbeda.
+ */
+export type BuyerOrderStatus = "new" | "paid" | "shipped" | "done";
+
+export const BUYER_ORDER_STATUS_FLOW: BuyerOrderStatus[] = ["new", "paid", "shipped", "done"];
+
+export const BUYER_ORDER_STATUS_LABELS: Record<BuyerOrderStatus, string> = {
+  new: "Baru",
+  paid: "Sudah bayar",
+  shipped: "Dikirim",
+  done: "Selesai"
+};
+
 export interface BuyerOrder {
   id?: string;
   customer_phone: string;
@@ -57,10 +97,23 @@ export interface BuyerOrder {
   shipping_courier?: string | null;
   shipping_cost?: number | null;
   note?: string | null;
-  status?: "new" | "done";
+  status?: BuyerOrderStatus;
+  /** URL bukti transfer yang dicatat pemilik toko. */
+  payment_proof_url?: string | null;
+  paid_at?: string | null;
+  /** Nomor resi pengiriman. */
+  tracking_number?: string | null;
+  shipped_at?: string | null;
   done_at?: string | null;
   created_at?: string;
   updated_at?: string;
+}
+
+/** Tahap berikutnya dari sebuah pesanan; `null` bila sudah selesai. */
+export function nextOrderStatus(status?: BuyerOrderStatus | null): BuyerOrderStatus | null {
+  const idx = BUYER_ORDER_STATUS_FLOW.indexOf(status || "new");
+  if (idx < 0 || idx >= BUYER_ORDER_STATUS_FLOW.length - 1) return null;
+  return BUYER_ORDER_STATUS_FLOW[idx + 1];
 }
 
 /**
@@ -79,6 +132,47 @@ export function conversationLabel(c: {
   const city = (c.destination_city || "").trim();
   const head = name && name.toLowerCase() !== "pembeli wa" ? name : formatPhoneDisplay(c.customer_phone);
   return city ? `${head} · ${city}` : head;
+}
+
+/** Pesan terakhir dalam sebuah percakapan (apa pun perannya). */
+export function lastMessageOf(c: Conversation): ChatMessage | null {
+  const msgs = Array.isArray(c.messages) ? c.messages : [];
+  return msgs.length > 0 ? msgs[msgs.length - 1] : null;
+}
+
+/**
+ * Ada pesan pembeli yang belum dilihat pemilik toko?
+ *
+ * Dihitung dari perbandingan waktu, bukan dari status baca per pesan: yang perlu
+ * diketahui pemilik toko hanyalah "ada yang baru sejak terakhir saya buka".
+ * Percakapan yang `last_seen_at`-nya kosong dianggap BELUM dibaca — pada kolom
+ * yang baru ditambahkan itu berarti semua chat lama sekali muncul sebagai belum
+ * dibaca, dan itu pilihan yang benar: melewatkan chat pembeli lebih mahal
+ * daripada satu kali menandai terlalu banyak.
+ */
+export function hasUnread(c: Conversation): boolean {
+  const last = lastMessageOf(c);
+  if (!last || last.role !== "user") return false;
+  const lastAt = new Date(last.timestamp || c.updated_at || 0).getTime();
+  if (!Number.isFinite(lastAt) || lastAt === 0) return false;
+  if (!c.last_seen_at) return true;
+  const seenAt = new Date(c.last_seen_at).getTime();
+  if (!Number.isFinite(seenAt)) return true;
+  return lastAt > seenAt;
+}
+
+/**
+ * Percakapan yang perlu DILIHAT MANUSIA sekarang.
+ *
+ * Tiga keadaan, semuanya berarti bot tidak (atau tidak bisa) menyelesaikannya:
+ *   • pesan terakhir dari pembeli dan belum dibaca — tidak ada yang menjawab;
+ *   • AI dijeda — memang menunggu manusia;
+ *   • pesan terakhir gagal dijawab bot (`FALLBACK`).
+ */
+export function needsAttention(c: Conversation): boolean {
+  if (c.ai_paused === true) return true;
+  if (c.last_intent === "FALLBACK") return true;
+  return hasUnread(c);
 }
 
 export interface FonnteStatus {
@@ -154,7 +248,8 @@ export const INTENT_LABELS: Record<string, string> = {
   ONGKIR_CHECK: "Cek ongkir",
   PRODUCT_INQUIRY: "Tanya produk",
   GENERAL_CHAT: "Obrolan umum",
-  ORDER: "Pesanan"
+  ORDER: "Pesanan",
+  FALLBACK: "Tidak terjawab"
 };
 
 export function intentLabel(intent?: string | null): string {

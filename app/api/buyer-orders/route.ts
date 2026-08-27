@@ -3,8 +3,10 @@ import { getSessionEmail } from "@/lib/auth";
 import {
   deleteBuyerOrder,
   getStoreByEmail,
+  isBuyerOrderStatus,
   listBuyerOrders,
   setBuyerOrderStatus,
+  type BuyerOrderStatus,
   type StoreRecord
 } from "@/lib/supabase";
 
@@ -47,7 +49,15 @@ export async function GET() {
   });
 }
 
-/** Tandai satu pesanan selesai / batal-selesai. */
+/**
+ * Ubah tahap satu pesanan.
+ *
+ *   PATCH { id, status: "new"|"paid"|"shipped"|"done", tracking_number?, payment_proof_url?, note? }
+ *
+ * `done: boolean` versi lama masih diterima. Bukan demi kerapian: browser yang
+ * sudah terbuka memuat JavaScript versi lama, dan menolaknya berarti tombol
+ * "selesai" di tab pesanan berhenti bekerja sampai user memuat ulang halaman.
+ */
 export async function PATCH(req: Request) {
   const auth = await requireStore();
   if (!auth.ok) return auth.res;
@@ -63,11 +73,35 @@ export async function PATCH(req: Request) {
   if (!id) {
     return NextResponse.json({ error: "Id pesanan wajib diisi." }, { status: 400 });
   }
-  // `done` dibaca eksplisit sebagai boolean supaya tombol bisa dipakai dua arah:
-  // menandai selesai, dan membukanya kembali kalau ternyata keliru diklik.
-  const done = body.done === true;
 
-  const result = await setBuyerOrderStatus(id, auth.storeId, done);
+  let status: BuyerOrderStatus;
+  if (body.status !== undefined) {
+    if (!isBuyerOrderStatus(body.status)) {
+      return NextResponse.json(
+        { error: "Status pesanan tidak dikenal. Pilih: new, paid, shipped, atau done." },
+        { status: 400 }
+      );
+    }
+    status = body.status;
+  } else {
+    // Jalur lama: `done` dibaca eksplisit sebagai boolean supaya tombol bisa
+    // dipakai dua arah — menandai selesai, dan membukanya kembali kalau keliru.
+    status = body.done === true ? "done" : "new";
+  }
+
+  // Kolom teks opsional. String kosong dikirim sebagai `null` (bukan ""), supaya
+  // menghapus nomor resi yang salah ketik benar-benar mengosongkannya.
+  const optionalText = (key: string): string | null | undefined => {
+    if (body[key] === undefined) return undefined;
+    const v = String(body[key] || "").trim();
+    return v || null;
+  };
+
+  const result = await setBuyerOrderStatus(id, auth.storeId, status, {
+    tracking_number: optionalText("tracking_number"),
+    payment_proof_url: optionalText("payment_proof_url"),
+    note: optionalText("note")
+  });
   if (!result.ok) {
     if (result.skipped) {
       return NextResponse.json(

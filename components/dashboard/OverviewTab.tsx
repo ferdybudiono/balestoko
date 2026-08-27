@@ -2,6 +2,8 @@
 
 import {
   ArrowRight,
+  Banknote,
+  BotOff,
   CheckCircle2,
   Circle,
   Crown,
@@ -9,13 +11,27 @@ import {
   MapPin,
   MessageSquare,
   Package,
+  PackageX,
+  Receipt,
   Send,
   Sparkles,
+  TrendingUp,
   TriangleAlert,
-  Users
+  Truck,
+  Users,
+  Wallet
 } from "lucide-react";
 import type { DashboardStats } from "./stats";
-import { formatCompact, intentLabel, relativeTime, type Conversation, type TabId } from "./types";
+import {
+  conversationLabel,
+  formatCompact,
+  formatRupiah,
+  hasUnread,
+  intentLabel,
+  relativeTime,
+  type Conversation,
+  type TabId
+} from "./types";
 
 interface OverviewTabProps {
   stats: DashboardStats;
@@ -264,6 +280,216 @@ function IntentBreakdown({ stats }: { stats: DashboardStats }) {
   );
 }
 
+/**
+ * Percakapan yang menunggu manusia.
+ *
+ * Ini kartu paling penting di Ringkasan begitu bot berjalan: yang mahal bukan
+ * chat yang dibalas bot, tapi chat yang TIDAK dibalas siapa pun. Daftar dibatasi
+ * lima baris — kalau lebih dari itu, yang dibutuhkan adalah tab Chat dengan
+ * penyaringnya, bukan daftar panjang di halaman ringkasan.
+ */
+function AttentionPanel({
+  stats,
+  conversations,
+  onGoTo,
+  onOpenChat
+}: {
+  stats: DashboardStats;
+  conversations: Conversation[];
+  onGoTo: (tab: TabId) => void;
+  onOpenChat: (convo: Conversation) => void;
+}) {
+  // Urutan sengaja: gagal dijawab bot lebih dulu, karena pembeli itu menerima
+  // jawaban ngambang — bukan cuma menunggu.
+  const queue = conversations
+    .filter((c) => c.last_intent === "FALLBACK" || c.ai_paused === true || hasUnread(c))
+    .sort((a, b) => {
+      const rank = (c: Conversation) => (c.last_intent === "FALLBACK" ? 0 : c.ai_paused ? 1 : 2);
+      const diff = rank(a) - rank(b);
+      if (diff !== 0) return diff;
+      return new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime();
+    })
+    .slice(0, 5);
+
+  if (queue.length === 0) return null;
+
+  return (
+    <section className="bg-white border border-amber-200 rounded-2xl shadow-card overflow-hidden">
+      <div className="px-5 sm:px-6 py-4 bg-amber-50 border-b border-amber-200 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 className="text-sm font-bold text-amber-900 flex items-center gap-2">
+            <BotOff className="w-4 h-4" aria-hidden="true" />
+            Perlu dijawab Anda ({stats.needsAttentionCount})
+          </h3>
+          <p className="text-[11px] text-amber-800/80 mt-0.5">
+            {stats.unansweredCount > 0
+              ? `${stats.unansweredCount} percakapan tidak bisa dijawab AI.`
+              : "Pembeli menunggu balasan manusia."}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => onGoTo("chats")}
+          className="inline-flex items-center gap-1 rounded-lg bg-amber-600 hover:bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white transition-colors"
+        >
+          Buka tab Chat
+          <ArrowRight className="w-3 h-3" aria-hidden="true" />
+        </button>
+      </div>
+      <ul className="divide-y divide-slate-100">
+        {queue.map((convo) => (
+          <li key={convo.customer_phone}>
+            <button
+              type="button"
+              onClick={() => onOpenChat(convo)}
+              className="w-full flex items-center gap-3 px-5 sm:px-6 py-3 text-left hover:bg-slate-50 transition-colors"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-semibold text-ink truncate">
+                  {conversationLabel(convo)}
+                </p>
+                <p className="text-xs text-slate-500 truncate">
+                  {convo.messages?.[convo.messages.length - 1]?.content || "Tidak ada pesan"}
+                </p>
+              </div>
+              <span
+                className={`shrink-0 px-2 py-0.5 rounded-md text-[10px] font-semibold ${
+                  convo.last_intent === "FALLBACK"
+                    ? "bg-rose-50 text-rose-700"
+                    : convo.ai_paused
+                      ? "bg-amber-50 text-amber-700"
+                      : "bg-slate-100 text-slate-600"
+                }`}
+              >
+                {convo.last_intent === "FALLBACK"
+                  ? "AI gagal jawab"
+                  : convo.ai_paused
+                    ? "AI dijeda"
+                    : "Belum dibaca"}
+              </span>
+              <span className="shrink-0 text-[11px] text-slate-400 hidden sm:inline">
+                {relativeTime(convo.updated_at)}
+              </span>
+              <ArrowRight className="w-3.5 h-3.5 shrink-0 text-slate-300" aria-hidden="true" />
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/**
+ * Panel penjualan — satu-satunya tempat di dashboard yang menjawab "apakah chat
+ * ini menghasilkan uang?".
+ *
+ * Dipisah dari KPI bot di atasnya dengan sengaja: jumlah pesan dan jumlah rupiah
+ * adalah dua pertanyaan berbeda, dan menaruhnya dalam satu baris membuat
+ * keduanya sama-sama sulit dibaca. Uang MASUK (terbayar) dipisah dari uang yang
+ * masih DITAGIH — menjumlahkan keduanya akan melaporkan pendapatan yang belum
+ * pernah diterima.
+ */
+function SalesPanel({ stats, onGoTo }: { stats: DashboardStats; onGoTo: (tab: TabId) => void }) {
+  const funnel = [
+    { label: "Pembeli chat", value: stats.totalConversations, pct: 100 },
+    { label: "Jadi pesanan", value: stats.orderCount, pct: stats.chatToOrderPct },
+    {
+      label: "Pesanan selesai",
+      value: stats.ordersDone,
+      pct: stats.totalConversations > 0 ? Math.round((stats.ordersDone / stats.totalConversations) * 100) : 0
+    }
+  ];
+
+  return (
+    <section className="bg-white border border-slate-200 rounded-2xl shadow-card p-5 sm:p-6 space-y-5">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h3 className="text-sm font-bold text-ink flex items-center gap-2">
+          <Banknote className="w-4 h-4 text-brand-600" aria-hidden="true" />
+          Penjualan
+        </h3>
+        <button
+          type="button"
+          onClick={() => onGoTo("orders")}
+          className="inline-flex items-center gap-1 text-xs font-semibold text-brand-700 hover:text-brand-800"
+        >
+          Buka pesanan
+          <ArrowRight className="w-3 h-3" aria-hidden="true" />
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+          <div className="flex items-center gap-2 text-emerald-700">
+            <Wallet className="w-4 h-4" aria-hidden="true" />
+            <span className="text-xs font-medium">Sudah dibayar</span>
+          </div>
+          <p className="mt-2 text-xl font-bold text-emerald-900 leading-none">
+            {formatRupiah(stats.revenuePaid)}
+          </p>
+          <p className="mt-1.5 text-[11px] text-emerald-700">
+            {formatRupiah(stats.revenueThisMonth)} bulan ini
+          </p>
+        </div>
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+          <div className="flex items-center gap-2 text-amber-700">
+            <Receipt className="w-4 h-4" aria-hidden="true" />
+            <span className="text-xs font-medium">Menunggu bayar</span>
+          </div>
+          <p className="mt-2 text-xl font-bold text-amber-900 leading-none">
+            {formatRupiah(stats.revenuePending)}
+          </p>
+          <p className="mt-1.5 text-[11px] text-amber-700">
+            {stats.ordersAwaitingPayment} pesanan belum dibayar
+          </p>
+        </div>
+        <StatTile
+          icon={Truck}
+          label="Siap dikirim"
+          value={formatCompact(stats.ordersAwaitingShipment)}
+          hint="Sudah dibayar, belum dikirim"
+        />
+        <StatTile
+          icon={TrendingUp}
+          label="Rata-rata pesanan"
+          value={formatRupiah(stats.averageOrderValue)}
+          hint={`${stats.ordersThisMonth} pesanan bulan ini`}
+        />
+      </div>
+
+      {/* Corong: batangnya relatif terhadap jumlah pembeli yang chat, jadi
+          penyusutan di setiap tahap langsung terlihat sebagai panjang bar. */}
+      <div>
+        <h4 className="text-xs font-semibold text-slate-600 mb-3">
+          Dari chat sampai selesai
+        </h4>
+        <ul className="space-y-2.5">
+          {funnel.map((step) => (
+            <li key={step.label}>
+              <div className="flex items-baseline justify-between gap-2 mb-1">
+                <span className="text-xs text-slate-600">{step.label}</span>
+                <span className="text-xs font-semibold text-ink tabular-nums">
+                  {step.value.toLocaleString("id-ID")}
+                  <span className="ml-1.5 font-medium text-slate-400">{step.pct}%</span>
+                </span>
+              </div>
+              <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-brand-600"
+                  style={{ width: `${Math.max(step.value > 0 ? 4 : 0, step.pct)}%` }}
+                />
+              </div>
+            </li>
+          ))}
+        </ul>
+        <p className="mt-3 text-[11px] text-slate-400">
+          {stats.chatToOrderPct}% pembeli yang chat berakhir jadi pesanan, dan {stats.orderToDonePct}%
+          pesanan sudah tuntas.
+        </p>
+      </div>
+    </section>
+  );
+}
+
 export default function OverviewTab({
   stats,
   conversations,
@@ -404,6 +630,32 @@ export default function OverviewTab({
         </div>
       )}
 
+      {/* ── Peringatan stok habis ──────────────────────────────────────── */}
+      {stats.productsOutOfStock > 0 && (
+        <div className="flex items-start gap-2.5 p-4 bg-rose-50 border border-rose-200 rounded-2xl">
+          <PackageX className="w-4 h-4 text-rose-600 mt-0.5 shrink-0" aria-hidden="true" />
+          <p className="text-xs text-rose-900 leading-relaxed">
+            <strong>{stats.productsOutOfStock} produk</strong> stoknya habis. AI akan menolak pesanan
+            untuk produk itu dan menawarkan alternatif.{" "}
+            <button
+              type="button"
+              onClick={() => onGoTo("products")}
+              className="font-semibold underline hover:no-underline"
+            >
+              Perbarui stok
+            </button>
+          </p>
+        </div>
+      )}
+
+      {/* ── Percakapan yang menunggu manusia ───────────────────────────── */}
+      <AttentionPanel
+        stats={stats}
+        conversations={conversations}
+        onGoTo={onGoTo}
+        onOpenChat={onOpenChat}
+      />
+
       {/* ── KPI row ────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
         <StatTile
@@ -440,6 +692,12 @@ export default function OverviewTab({
           planName={planName}
         />
       )}
+
+      {/* ── Penjualan ──────────────────────────────────────────────────── */}
+      {/* Ditampilkan begitu ada pembeli yang chat, bukan hanya setelah ada
+          pesanan: toko dengan 50 chat dan 0 pesanan justru paling perlu
+          melihat angka itu. */}
+      {hasActivity && <SalesPanel stats={stats} onGoTo={onGoTo} />}
 
       {/* ── Grafik & topik ─────────────────────────────────────────────── */}
       {!hasActivity ? (
@@ -492,7 +750,9 @@ export default function OverviewTab({
                     className="w-full flex items-center gap-3 py-2.5 text-left rounded-lg hover:bg-slate-50 px-2 -mx-2 transition-colors"
                   >
                     <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium text-ink truncate">{convo.customer_phone}</p>
+                      <p className="text-sm font-medium text-ink truncate">
+                        {conversationLabel(convo)}
+                      </p>
                       <p className="text-xs text-slate-400 truncate">
                         {convo.messages?.[convo.messages.length - 1]?.content || "Tidak ada pesan"}
                       </p>

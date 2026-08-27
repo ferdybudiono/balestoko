@@ -511,3 +511,151 @@ alter table public.buyer_orders add column if not exists shipping_courier text;
 alter table public.buyer_orders add column if not exists shipping_cost integer;
 alter table public.buyer_orders add column if not exists note text;
 
+-- Ambil alih percakapan oleh manusia.
+--
+-- `ai_paused` = AI DIAM di percakapan ini; pemilik toko yang menjawab sendiri.
+-- Dinyalakan otomatis begitu pemilik mengirim balasan manual dari dashboard,
+-- karena itulah tanda paling jujur bahwa ia sedang menangani pembeli ini. Tanpa
+-- ini bot dan manusia menjawab pertanyaan yang sama dengan isi yang berbeda.
+--
+-- `last_seen_at` = kapan pemilik toko terakhir MEMBUKA percakapan ini di
+-- dashboard. Dibandingkan dengan `updated_at` untuk menandai chat belum dibaca.
+alter table public.conversations add column if not exists ai_paused boolean not null default false;
+alter table public.conversations add column if not exists ai_paused_at timestamptz;
+alter table public.conversations add column if not exists last_seen_at timestamptz;
+
+-- Foto produk. URL saja (dihosting di luar, mis. Supabase Storage/CDN) — tidak
+-- ada kolom biner supaya baris katalog tetap ringan saat dikirim ke prompt AI.
+alter table public.products add column if not exists image_url text;
+
+-- Daur hidup pesanan pembeli: 'new' → 'paid' → 'shipped' → 'done'.
+--
+-- Sebelumnya hanya ada 'new' | 'done', jadi pemilik toko tidak punya tempat
+-- mencatat "sudah dibayar" atau nomor resi dan harus memakai buku catatan lain.
+-- Tidak ada CHECK constraint pada `status`: menambah status baru nanti tidak
+-- boleh butuh migrasi yang mengubah constraint di database yang sudah jalan.
+--
+-- CATATAN PENTING soal `buyer_orders_open_uidx` (partial unique where status =
+-- 'new'): slot "pesanan berjalan" tetap hanya untuk status 'new'. Begitu pemilik
+-- menandai 'paid', pesanan itu terkunci dari penggabungan otomatis dan chat
+-- berikutnya dari pembeli yang sama membuat baris BARU. Itu memang yang
+-- diinginkan — barang yang sudah dibayar tidak boleh diam-diam bertambah isi.
+alter table public.buyer_orders add column if not exists payment_proof_url text;
+alter table public.buyer_orders add column if not exists paid_at timestamptz;
+alter table public.buyer_orders add column if not exists tracking_number text;
+alter table public.buyer_orders add column if not exists shipped_at timestamptz;
+
+create index if not exists buyer_orders_status_idx on public.buyer_orders (store_id, status);
+
+-- Pemberitahuan keluar untuk pemilik toko.
+--
+-- `alert_phone` = nomor WhatsApp PRIBADI pemilik (bukan nomor toko). Peringatan
+-- "nomor terputus" harus dikirim ke nomor lain, sebab nomor yang terputus itu
+-- justru yang tidak bisa mengirim apa pun.
+alter table public.stores add column if not exists alert_phone text;
+alter table public.stores add column if not exists notify_enabled boolean not null default true;
+alter table public.stores add column if not exists last_quota_alert_at timestamptz;
+alter table public.stores add column if not exists last_quota_alert_pct integer;
+
+-- Anti-spam peringatan per nomor: satu kabar per kejadian, bukan tiap polling.
+alter table public.store_devices add column if not exists last_alert_at timestamptz;
+alter table public.store_devices add column if not exists last_alert_kind text;
+
+-- Login tambahan per toko (pegawai/admin kedua).
+--
+-- SENGAJA tabel terpisah, bukan mengubah `stores.email` yang unik: jalur login
+-- pemilik yang sudah berjalan tidak boleh tersentuh sama sekali. Login mencoba
+-- `stores` dulu, baru jatuh ke tabel ini — pelanggan yang sudah bayar tidak
+-- mungkin kehilangan akses karena fitur ini.
+create table if not exists public.store_members (
+  id                  uuid primary key default gen_random_uuid(),
+  store_id            uuid not null references public.stores(id) on delete cascade,
+  email               text not null,
+  password_hash       text not null,
+  role                text not null default 'staff',   -- 'staff' | 'admin'
+  password_changed_at timestamptz,
+  last_login_at       timestamptz,
+  created_at          timestamptz not null default now(),
+  updated_at          timestamptz not null default now()
+);
+
+-- Satu email = satu akun di SELURUH sistem, termasuk lintas toko: kalau tidak,
+-- `getSessionEmail()` tidak bisa memutuskan toko mana yang dimaksud sebuah sesi.
+create unique index if not exists store_members_email_uidx on public.store_members (lower(email));
+create index if not exists store_members_store_idx on public.store_members (store_id);
+
+alter table public.store_members enable row level security;
+
+drop trigger if exists trg_store_members_updated_at on public.store_members;
+create trigger trg_store_members_updated_at before update on public.store_members
+  for each row execute function public.set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+--  RPC: kurangi stok beberapa produk sekaligus, atomik.
+--
+--  KENAPA RPC: mengurangi stok lewat REST butuh baca-lalu-tulis, dan dua pesanan
+--  yang masuk bersamaan akan sama-sama membaca stok lama lalu menuliskan hasil
+--  yang sama — satu pesanan hilang dari hitungan. `stock - units` dievaluasi di
+--  dalam satu pernyataan UPDATE, jadi tidak ada celah di antaranya.
+--
+--  `greatest(0, ...)` supaya stok tidak pernah negatif walau pesanan lolos
+--  (mis. dua pembeli mengambil unit terakhir pada detik yang sama). Nol berarti
+--  "habis" dan langsung tercermin di prompt AI berikutnya.
+--
+--  p_items: [{"name": "...", "units": 2}] atau [{"id": "<uuid>", "units": 2}].
+--  Nama dipakai bila id tidak ada, karena pesanan menyimpan SNAPSHOT nama produk.
+-- ─────────────────────────────────────────────────────────────────────────────
+create or replace function public.decrement_product_stock(
+  p_store_id uuid,
+  p_items    jsonb
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_item    jsonb;
+  v_units   integer;
+  v_id      uuid;
+  v_name    text;
+  v_touched integer := 0;
+  v_hit     integer;
+begin
+  if p_store_id is null or p_items is null or jsonb_typeof(p_items) <> 'array' then
+    return 0;
+  end if;
+
+  for v_item in select * from jsonb_array_elements(p_items) loop
+    v_units := coalesce((v_item ->> 'units')::integer, 0);
+    if v_units <= 0 then
+      continue;
+    end if;
+
+    begin
+      v_id := nullif(v_item ->> 'id', '')::uuid;
+    exception when others then
+      v_id := null;
+    end;
+    v_name := nullif(btrim(coalesce(v_item ->> 'name', '')), '');
+
+    if v_id is not null then
+      update public.products
+         set stock = greatest(0, stock - v_units)
+       where id = v_id and store_id = p_store_id;
+    elsif v_name is not null then
+      update public.products
+         set stock = greatest(0, stock - v_units)
+       where store_id = p_store_id and lower(name) = lower(v_name);
+    else
+      continue;
+    end if;
+
+    get diagnostics v_hit = row_count;
+    v_touched := v_touched + v_hit;
+  end loop;
+
+  return v_touched;
+end;
+$$;
+

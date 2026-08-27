@@ -3,14 +3,15 @@
 import { useMemo, useState } from "react";
 import {
   Check,
+  ImageIcon,
   Package,
+  PackageX,
   Pencil,
   Plus,
   RefreshCw,
   Search,
   Trash2,
-  TriangleAlert,
-  X
+  TriangleAlert
 } from "lucide-react";
 import { formatRupiah, formatWeight, type Product, type ShowToast } from "./types";
 
@@ -27,9 +28,24 @@ interface DraftFields {
   weight: string;
   stock: string;
   description: string;
+  /**
+   * URL foto produk — bukan unggahan berkas.
+   *
+   * Aplikasi ini tidak punya penyimpanan media sendiri, dan Fonnte mengirim foto
+   * ke WhatsApp dengan cara mengambil URL publik. Menjanjikan tombol "unggah"
+   * berarti menjanjikan tempat menyimpan yang tidak ada.
+   */
+  image_url: string;
 }
 
-const EMPTY_DRAFT: DraftFields = { name: "", price: "", weight: "1000", stock: "", description: "" };
+const EMPTY_DRAFT: DraftFields = {
+  name: "",
+  price: "",
+  weight: "1000",
+  stock: "",
+  description: "",
+  image_url: ""
+};
 
 const inputCls =
   "w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm text-ink placeholder:text-slate-400 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100";
@@ -45,6 +61,13 @@ function validateDraft(d: DraftFields): string | null {
   if (d.stock.trim() !== "") {
     const stock = Number(d.stock);
     if (!Number.isFinite(stock) || stock < 0) return "Stok tidak boleh negatif.";
+  }
+  const img = d.image_url.trim();
+  if (img) {
+    if (!/^https?:\/\/\S+$/i.test(img)) return "URL foto harus diawali http:// atau https://.";
+    // Fonnte memisahkan beberapa foto dengan koma di satu field, jadi URL
+    // bermuatan koma akan terpotong dan fotonya tidak pernah sampai ke pembeli.
+    if (img.includes(",")) return "URL foto tidak boleh mengandung tanda koma.";
   }
   return null;
 }
@@ -91,7 +114,8 @@ export default function ProductsTab({ products, showToast, onChanged }: Products
           price: Number(draft.price),
           weight: Number(draft.weight),
           ...(draft.stock.trim() !== "" ? { stock: Number(draft.stock) } : {}),
-          description: draft.description.trim()
+          description: draft.description.trim(),
+          image_url: draft.image_url.trim()
         })
       });
       const data = await res.json().catch(() => ({}));
@@ -118,7 +142,8 @@ export default function ProductsTab({ products, showToast, onChanged }: Products
       price: String(p.price ?? ""),
       weight: String(p.weight ?? ""),
       stock: p.stock === undefined || p.stock === null ? "" : String(p.stock),
-      description: p.description || ""
+      description: p.description || "",
+      image_url: p.image_url || ""
     });
   };
 
@@ -139,7 +164,8 @@ export default function ProductsTab({ products, showToast, onChanged }: Products
           price: Number(editDraft.price),
           weight: Number(editDraft.weight),
           ...(editDraft.stock.trim() !== "" ? { stock: Number(editDraft.stock) } : {}),
-          description: editDraft.description.trim()
+          description: editDraft.description.trim(),
+          image_url: editDraft.image_url.trim()
         })
       });
       const data = await res.json().catch(() => ({}));
@@ -268,6 +294,42 @@ export default function ProductsTab({ products, showToast, onChanged }: Products
             className={inputCls}
           />
 
+          {/* Foto dikirim ke pembeli bersama balasan yang menyebut produk ini. */}
+          <div className="space-y-1.5">
+            <label
+              htmlFor="np-image"
+              className="flex items-center gap-1.5 text-[11px] font-medium text-slate-500"
+            >
+              <ImageIcon className="w-3.5 h-3.5" aria-hidden="true" />
+              URL foto produk <span className="text-slate-400">(opsional)</span>
+            </label>
+            <div className="flex items-start gap-2.5">
+              <input
+                id="np-image"
+                type="url"
+                inputMode="url"
+                placeholder="https://…/kaos-hitam.jpg"
+                value={draft.image_url}
+                onChange={(e) => patchDraft({ image_url: e.target.value })}
+                className={inputCls}
+              />
+              {/* Pratinjau langsung: URL salah paling sering baru terasa saat
+                  pembeli menerima balasan tanpa foto. */}
+              {/^https?:\/\/\S+$/i.test(draft.image_url.trim()) && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={draft.image_url.trim()}
+                  alt=""
+                  className="w-11 h-11 shrink-0 rounded-xl object-cover border border-slate-200 bg-white"
+                />
+              )}
+            </div>
+            <p className="text-[11px] text-slate-400">
+              Tempel tautan foto yang sudah online (mis. dari toko online Anda). AI mengirimkannya
+              ke pembeli saat menyebut produk ini.
+            </p>
+          </div>
+
           <button
             type="submit"
             disabled={adding}
@@ -328,6 +390,11 @@ export default function ProductsTab({ products, showToast, onChanged }: Products
               const isEditing = !!p.id && editingId === p.id;
               const isConfirming = !!p.id && confirmDeleteId === p.id;
               const noWeight = !Number(p.weight) || Number(p.weight) <= 0;
+              // `stock` kosong = toko tidak memakai pencatatan stok (selalu ada).
+              // Hanya angka NOL yang berarti habis.
+              const outOfStock = p.stock !== undefined && p.stock !== null && Number(p.stock) === 0;
+              const lowStock =
+                p.stock !== undefined && p.stock !== null && Number(p.stock) > 0 && Number(p.stock) <= 3;
 
               return (
                 <li
@@ -384,6 +451,14 @@ export default function ProductsTab({ products, showToast, onChanged }: Products
                           value={editDraft.description}
                           onChange={(e) => patchEdit({ description: e.target.value })}
                           className={inputCls}
+                        />
+                        <input
+                          type="url"
+                          aria-label="URL foto produk"
+                          placeholder="URL foto (https://…)"
+                          value={editDraft.image_url}
+                          onChange={(e) => patchEdit({ image_url: e.target.value })}
+                          className={`${inputCls} sm:col-span-2`}
                         />
                       </div>
                       <div className="flex items-center gap-2">
@@ -445,7 +520,22 @@ export default function ProductsTab({ products, showToast, onChanged }: Products
                   ) : (
                     /* ── Tampilan normal ─────────────────────────── */
                     <div className="flex justify-between items-start gap-3">
-                      <div className="min-w-0">
+                      {p.image_url ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={p.image_url}
+                          alt={p.name}
+                          className="w-14 h-14 shrink-0 rounded-xl object-cover border border-slate-200 bg-white"
+                        />
+                      ) : (
+                        <div
+                          className="w-14 h-14 shrink-0 rounded-xl border border-dashed border-slate-200 bg-white flex items-center justify-center"
+                          title="Belum ada foto — pembeli hanya menerima teks"
+                        >
+                          <ImageIcon className="w-5 h-5 text-slate-300" aria-hidden="true" />
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1">
                         <h4 className="font-bold text-sm text-ink truncate">{p.name}</h4>
                         <p className="text-sm font-semibold text-brand-700 mt-0.5">
                           {formatRupiah(p.price)}
@@ -455,9 +545,18 @@ export default function ProductsTab({ products, showToast, onChanged }: Products
                             Berat: {formatWeight(p.weight)}
                             {noWeight && " ⚠"}
                           </span>
-                          {p.stock !== undefined && p.stock !== null && (
-                            <span className={Number(p.stock) === 0 ? "text-amber-700 font-medium" : undefined}>
+                          {p.stock !== undefined && p.stock !== null && !outOfStock && (
+                            <span className={lowStock ? "text-amber-700 font-medium" : undefined}>
                               Stok: {Number(p.stock).toLocaleString("id-ID")}
+                            </span>
+                          )}
+                          {/* Stok nol bukan sekadar angka kecil: AI berhenti
+                              menawarkan produk ini, jadi harus terbaca sebagai
+                              penanda, bukan baris teks di antara yang lain. */}
+                          {outOfStock && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-rose-50 text-rose-700 text-[10px] font-semibold">
+                              <PackageX className="w-3 h-3" aria-hidden="true" />
+                              Stok habis — tidak ditawarkan AI
                             </span>
                           )}
                         </div>
