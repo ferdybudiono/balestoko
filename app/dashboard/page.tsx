@@ -240,6 +240,10 @@ export default function DashboardPage() {
   const [newLabel, setNewLabel] = useState("");
   const [addingDevice, setAddingDevice] = useState(false);
   const [removingDeviceId, setRemovingDeviceId] = useState<string | null>(null);
+  // Nomor yang penghapusannya ditolak Fonnte, beserta alasannya. Disimpan supaya
+  // panel konfirmasi bisa menawarkan "hapus paksa" — penolakan Fonnte tidak boleh
+  // membuat nomor menempel di dashboard selamanya.
+  const [blockedRemoval, setBlockedRemoval] = useState<{ id: string; reason: string } | null>(null);
   // Diagnosa jalur TERIMA (Fonnte → aplikasi): URL webhook yang berlaku dan
   // peringatan bila NEXT_PUBLIC_BASE_URL tidak bisa dijangkau dari internet.
   const [expectedWebhookUrl, setExpectedWebhookUrl] = useState<string | null>(null);
@@ -552,25 +556,33 @@ export default function DashboardPage() {
   }, [newPhone, newLabel, handleFetchQr, refreshDevices, showToast]);
 
   const handleRemoveDevice = useCallback(
-    async (device: StoreDevice) => {
+    async (device: StoreDevice, opts: { force?: boolean } = {}) => {
       if (!device.id) return;
       setRemovingDeviceId(device.id);
       try {
-        const res = await fetch(`/api/fonnte/devices?id=${encodeURIComponent(device.id)}`, {
-          method: "DELETE"
-        });
+        const query = new URLSearchParams({ id: device.id });
+        if (opts.force) query.set("force", "1");
+        const res = await fetch(`/api/fonnte/devices?${query.toString()}`, { method: "DELETE" });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          showToast(data.error || "Gagal menghapus nomor.", "error");
+          const reason = data.error || "Gagal menghapus nomor.";
+          showToast(reason, "error");
+          // Hanya tawarkan hapus paksa kalau server memang bilang itu tersedia.
+          // Kegagalan lain (izin, migrasi, nomor tak ditemukan) tidak jadi lebih
+          // baik dengan dipaksa.
+          if (data.canForce) setBlockedRemoval({ id: device.id, reason });
           return;
         }
+        setBlockedRemoval(null);
         if (qrDevice?.id === device.id) {
           setQrUrl(null);
           setQrDevice(null);
         }
-        // Server hanya menjawab sukses setelah device benar-benar terhapus di
-        // Fonnte, jadi tidak ada lagi kondisi "terhapus separuh" untuk dilaporkan.
-        showToast("Nomor berhasil dihapus dari dashboard dan dari Fonnte.", "success");
+        // Jalur normal: server hanya menjawab sukses setelah device benar-benar
+        // terhapus di Fonnte. Jalur paksa mengirim `warning` — nomornya masih ada
+        // di Fonnte, dan itu harus disampaikan apa adanya, bukan ditelan.
+        if (data.warning) showToast(data.warning, "error");
+        else showToast("Nomor berhasil dihapus dari dashboard dan dari Fonnte.", "success");
         await refreshDevices();
         fetchStoreData({ light: true, silent: true });
       } catch {
@@ -1530,6 +1542,7 @@ export default function DashboardPage() {
                   onAddDevice={handleAddDevice}
                   removingDeviceId={removingDeviceId}
                   onRemoveDevice={handleRemoveDevice}
+                  blockedRemoval={blockedRemoval}
                   qrDeviceId={qrDevice ? qrDevice.id || qrDevice.phone : null}
                   qrUrl={qrUrl}
                   loadingQr={loadingQr}

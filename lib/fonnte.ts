@@ -132,6 +132,21 @@ const FONNTE_DEVICE_GONE =
   /not found|tidak ada|no device|belum terdaftar|not registered|tidak terdaftar/;
 
 /**
+ * Alasan yang artinya token yang kita pakai bukan (lagi) milik device mana pun.
+ *
+ * Hanya berlaku saat kita mengautentikasi dengan token DEVICE itu sendiri: token
+ * device di Fonnte permanen selama device-nya ada, jadi token yang ditolak
+ * berarti device-nya sudah lenyap di sisi Fonnte — dan tidak ada apa pun lagi
+ * yang perlu dilepas. Dengan account token, pesan yang sama justru berarti
+ * "kamu memakai jenis token yang salah", jadi klasifikasi ini TIDAK boleh
+ * dipakai di jalur itu.
+ */
+const FONNTE_TOKEN_ORPHAN = /invalid device|invalid token|token invalid|token tidak valid/;
+
+/** Fonnte meminta kode OTP; tidak ada yang bisa diulang otomatis dari server. */
+const FONNTE_NEEDS_OTP = /otp/;
+
+/**
  * HTTP status yang berarti "coba lagi nanti", bukan "permintaanmu ditolak".
  */
 const FONNTE_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
@@ -140,12 +155,15 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type DeleteAttempt = { success: true } | { success: false; error: string; retryable: boolean };
+type DeleteAttempt =
+  | { success: true }
+  | { success: false; error: string; retryable: boolean; needsOtp?: boolean };
 
 /** Satu kali panggil `delete-device`, sekaligus menilai apakah layak diulang. */
 async function attemptDeleteFonnteDevice(
   devicePhone: string,
-  accountToken: string
+  token: string,
+  usingDeviceToken: boolean
 ): Promise<DeleteAttempt> {
   try {
     const formData = new URLSearchParams();
@@ -153,7 +171,7 @@ async function attemptDeleteFonnteDevice(
 
     const res = await fetch("https://api.fonnte.com/delete-device", {
       method: "POST",
-      headers: { Authorization: accountToken },
+      headers: { Authorization: token },
       body: formData,
       cache: "no-store"
     });
@@ -172,8 +190,36 @@ async function attemptDeleteFonnteDevice(
 
     if (res.ok && data.status) return { success: true };
 
-    const reason = String(data.reason || data.message || "").trim();
-    if (FONNTE_DEVICE_GONE.test(reason.toLowerCase())) return { success: true };
+    // `detail` WAJIB ikut dibaca: itulah field yang dipakai `delete-device` untuk
+    // pesan suksesnya, dan beberapa endpoint Fonnte memakainya untuk alasan gagal
+    // juga. Tanpa ini alasan sebenarnya hilang dan user hanya melihat pesan
+    // umum — kegagalan yang tidak bisa didiagnosis dari log.
+    const reason = String(data.reason || data.detail || data.message || "").trim();
+    const lower = reason.toLowerCase();
+
+    // Log SELALU: inilah satu-satunya jejak penyebab di log Vercel. Yang dicatat
+    // hanya jawaban Fonnte, bukan token yang kita kirim.
+    console.warn(
+      `[fonnte] delete-device gagal (HTTP ${res.status}, ${
+        usingDeviceToken ? "device token" : "account token"
+      }): ${raw.slice(0, 300) || "(body kosong)"}`
+    );
+
+    if (FONNTE_DEVICE_GONE.test(lower)) return { success: true };
+    // Token device yang ditolak = device-nya sudah tidak ada. Lihat catatan pada
+    // FONNTE_TOKEN_ORPHAN kenapa ini hanya sah untuk token device.
+    if (usingDeviceToken && FONNTE_TOKEN_ORPHAN.test(lower)) return { success: true };
+
+    if (FONNTE_NEEDS_OTP.test(lower)) {
+      return {
+        success: false,
+        error:
+          "Fonnte meminta kode OTP untuk menghapus device, dan kode itu dikirim ke nomor " +
+          "WhatsApp pemilik akun Fonnte — jadi penghapusan tidak bisa diselesaikan dari sini.",
+        retryable: false,
+        needsOtp: true
+      };
+    }
 
     // Fonnte sedang goyah (5xx/429) atau tidak menjawab apa pun yang bisa
     // ditafsirkan. Itu gangguan sementara, bukan keputusan — ulangi.
@@ -188,7 +234,7 @@ async function attemptDeleteFonnteDevice(
     // Fonnte menjawab dengan alasan yang jelas. Mengulang hanya menunda kabar buruk.
     return {
       success: false,
-      error: reason || "Gagal menghapus device Fonnte.",
+      error: reason || `Fonnte menolak tanpa keterangan (HTTP ${res.status}).`,
       retryable: false
     };
   } catch (err) {
@@ -198,24 +244,36 @@ async function attemptDeleteFonnteDevice(
 }
 
 /**
- * Hapus Device di Fonnte memakai Account Token.
+ * Hapus Device di Fonnte.
  *
  * Dipanggil saat pemilik toko melepas salah satu nomornya. Penting karena Fonnte
  * menolak `add-device` untuk nomor yang masih terdaftar — tanpa penghapusan ini,
  * nomor yang pernah dilepas tidak bisa disambungkan lagi.
  *
- * Hasil fungsi ini adalah SYARAT penghapusan di dashboard (lihat DELETE
- * /api/fonnte/devices), jadi kegagalan sesaat tidak boleh langsung menggagalkan
- * permintaan user: gangguan jaringan dan 5xx dari Fonnte diulang beberapa kali
- * lebih dulu. Penolakan yang jelas beralasan tidak diulang — mengulang hanya
- * memperlambat pesan error yang sama.
+ * `Authorization` HARUS token DEVICE, bukan account token. Ini berbeda dari
+ * `add-device` (account token) dan mudah tertukar, tapi Fonnte membalas tertukar
+ * itu dengan `{"reason":"invalid device","status":false}` pada HTTP 200 — sebuah
+ * penolakan yang terlihat seperti "nomornya tidak ada", padahal nomornya ada dan
+ * yang salah adalah kredensialnya. Account token hanya dipakai sebagai cadangan
+ * untuk baris lama yang tokennya tidak tersimpan.
+ *
+ * Kegagalan sesaat tidak boleh langsung menggagalkan permintaan user: gangguan
+ * jaringan dan 5xx dari Fonnte diulang beberapa kali lebih dulu. Penolakan yang
+ * jelas beralasan tidak diulang — mengulang hanya memperlambat pesan error yang
+ * sama.
  */
 export async function deleteFonnteDevice(
   phone: string,
-  opts: { attempts?: number } = {}
-): Promise<{ success: boolean; error?: string }> {
-  const accountToken = process.env.FONNTE_TOKEN;
-  if (!accountToken) return { success: false, error: "FONNTE_TOKEN (account token) belum diatur." };
+  opts: { deviceToken?: string | null; attempts?: number } = {}
+): Promise<{ success: boolean; error?: string; needsOtp?: boolean }> {
+  const deviceToken = (opts.deviceToken || "").trim();
+  const token = deviceToken || process.env.FONNTE_TOKEN;
+  if (!token) {
+    return {
+      success: false,
+      error: "Token Fonnte tidak tersedia (device token kosong dan FONNTE_TOKEN belum diatur)."
+    };
+  }
 
   const devicePhone = formatFonntePhone(phone);
   if (!devicePhone || devicePhone.replace(/\D/g, "").length < 8) {
@@ -223,19 +281,19 @@ export async function deleteFonnteDevice(
   }
 
   const attempts = Math.max(1, opts.attempts ?? 3);
-  let lastError = "Gagal menghapus device Fonnte.";
+  let last: DeleteAttempt = { success: false, error: "Gagal menghapus device Fonnte.", retryable: false };
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     if (attempt > 1) await delay(400 * (attempt - 1));
 
-    const outcome = await attemptDeleteFonnteDevice(devicePhone, accountToken);
+    const outcome = await attemptDeleteFonnteDevice(devicePhone, token, !!deviceToken);
     if (outcome.success) return { success: true };
 
-    lastError = outcome.error;
-    if (!outcome.retryable) return { success: false, error: outcome.error };
+    last = outcome;
+    if (!outcome.retryable) break;
   }
 
-  return { success: false, error: lastError };
+  return { success: false, error: last.error, needsOtp: last.needsOtp };
 }
 
 /**

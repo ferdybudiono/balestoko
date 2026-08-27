@@ -46,7 +46,15 @@ interface WhatsappTabProps {
   addingDevice: boolean;
   onAddDevice: () => void;
   removingDeviceId: string | null;
-  onRemoveDevice: (device: StoreDevice) => void;
+  onRemoveDevice: (device: StoreDevice, opts?: { force?: boolean }) => void;
+  /**
+   * Nomor yang penghapusannya ditolak Fonnte + alasannya, kalau ada.
+   *
+   * Dipakai untuk menawarkan hapus paksa. Tanpa jalan keluar ini, penolakan Fonnte
+   * (mis. permintaan OTP yang hanya bisa dibalas dari WhatsApp pemilik akun Fonnte)
+   * membuat nomor menempel di dashboard tanpa cara menghilangkannya.
+   */
+  blockedRemoval: { id: string; reason: string } | null;
 
   /** Katalog toko — sumber pilihan "produk yang dijawab nomor ini". */
   products: Product[];
@@ -92,6 +100,7 @@ export default function WhatsappTab({
   onAddDevice,
   removingDeviceId,
   onRemoveDevice,
+  blockedRemoval,
   products,
   savingScopeId,
   onSaveScope,
@@ -382,6 +391,50 @@ export default function WhatsappTab({
                               className="px-3 py-1.5 text-xs font-medium text-slate-500 hover:text-slate-700"
                             >
                               Batal
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Fonnte menolak menghapus device ini — tawarkan jalan keluar */}
+                    {blockedRemoval && blockedRemoval.id === device.id && confirmRemoveId !== device.id && (
+                      <div className="px-4 pb-4 -mt-1">
+                        <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl space-y-2.5">
+                          <div className="flex items-start gap-2">
+                            <TriangleAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                            <div className="space-y-1.5">
+                              <p className="text-xs font-semibold text-amber-900">
+                                Fonnte menolak menghapus nomor ini
+                              </p>
+                              <p className="text-xs text-amber-800 leading-relaxed">
+                                {blockedRemoval.reason}
+                              </p>
+                              <p className="text-xs text-amber-800 leading-relaxed">
+                                Kamu bisa menghapusnya dari dashboard saja. Bot langsung berhenti
+                                membalas di nomor ini, tapi perangkatnya{" "}
+                                <strong>masih terdaftar di Fonnte</strong> — hapus manual dari
+                                dashboard Fonnte kalau nomor ini mau dipakai lagi nanti, karena
+                                Fonnte menolak nomor yang sudah terdaftar.
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 pl-6">
+                            <button
+                              type="button"
+                              disabled={busyRemoving}
+                              onClick={() => onRemoveDevice(device, { force: true })}
+                              className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white text-xs font-semibold rounded-lg transition-colors"
+                            >
+                              {busyRemoving ? "Menghapus…" : "Hapus dari dashboard saja"}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busyRemoving}
+                              onClick={() => onRemoveDevice(device)}
+                              className="px-3 py-1.5 text-xs font-medium text-amber-700 hover:text-amber-900 disabled:opacity-60"
+                            >
+                              Coba lagi
                             </button>
                           </div>
                         </div>

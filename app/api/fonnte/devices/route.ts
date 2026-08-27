@@ -295,8 +295,9 @@ export async function POST(req: Request) {
 
   if (!inserted.ok || !inserted.data) {
     // Device sudah ada di Fonnte tapi gagal disimpan — bersihkan supaya nomornya
-    // tidak tersangkut dan bisa dicoba ulang.
-    await deleteFonnteDevice(phone);
+    // tidak tersangkut dan bisa dicoba ulang. `delete-device` minta token device,
+    // dan token itu baru saja dikembalikan oleh `add-device`.
+    await deleteFonnteDevice(phone, { deviceToken: created.token });
     return NextResponse.json(
       { error: inserted.error || "Gagal menyimpan nomor. Coba lagi." },
       { status: 500 }
@@ -350,6 +351,12 @@ export async function DELETE(req: Request) {
   const target = devices.find((d) => d.id === id);
   if (!target) return NextResponse.json({ error: "Nomor tidak ditemukan." }, { status: 404 });
 
+  // `force=1` = user sudah diberi tahu risikonya dan memilih tetap menghapus dari
+  // dashboard meski Fonnte menolak. Lihat alasannya di bawah.
+  const force = ["1", "true", "yes"].includes(
+    (new URL(req.url).searchParams.get("force") || "").toLowerCase()
+  );
+
   // Hapus dulu di Fonnte, dan jadikan ini SYARAT. Kalau gagal, JANGAN hapus
   // baris DB — supaya dashboard dan Fonnte tidak pernah beda status, dan supaya
   // nomor tidak tersangkut di akun Fonnte (add-device menolak nomor kembar,
@@ -358,16 +365,34 @@ export async function DELETE(req: Request) {
   // `deleteFonnteDevice` sudah mengulang gangguan sesaat sendiri, dan menganggap
   // nomor yang memang sudah tidak ada di Fonnte sebagai sukses. Jadi kegagalan
   // di sini berarti penolakan nyata, bukan jaringan yang kedip.
-  const unlinked = await deleteFonnteDevice(target.phone);
+  //
+  // Token yang dikirim adalah token DEVICE ini, bukan account token: itu yang
+  // diminta `delete-device`. Baris lama yang tokennya tidak tersimpan akan jatuh
+  // ke account token di dalam `deleteFonnteDevice`.
+  const unlinked = await deleteFonnteDevice(target.phone, { deviceToken: target.fonnte_token });
   if (!unlinked.success) {
-    return NextResponse.json(
-      {
-        error:
-          "Nomor gagal dihapus dari Fonnte, jadi belum dihapus dari dashboard. " +
-          `Coba lagi sebentar. Penyebab: ${unlinked.error || "tidak diketahui"}`
-      },
-      { status: 502 }
+    console.warn(
+      `[devices] delete-device ditolak untuk store ${store.id} device ${id}: ${
+        unlinked.error || "tanpa keterangan"
+      }`
     );
+
+    // Syarat di atas benar, tapi tidak boleh jadi jebakan permanen. Kalau Fonnte
+    // menolak selamanya (mis. minta OTP yang hanya bisa dibalas dari WhatsApp
+    // pemilik akun), nomor itu akan menempel di dashboard tanpa jalan keluar.
+    // Karena itu penolakan dijawab dengan tawaran "hapus paksa", bukan jalan buntu.
+    if (!force) {
+      return NextResponse.json(
+        {
+          error:
+            "Nomor gagal dihapus dari Fonnte, jadi belum dihapus dari dashboard. " +
+            `Coba lagi sebentar. Penyebab: ${unlinked.error || "tidak diketahui"}`,
+          canForce: true,
+          needsOtp: unlinked.needsOtp || false
+        },
+        { status: 502 }
+      );
+    }
   }
 
   const removed = await deleteStoreDevice(id, store.id!);
@@ -396,6 +421,19 @@ export async function DELETE(req: Request) {
         webhook_url: null
       });
     }
+  }
+
+  // Kalau sampai sini lewat jalur paksa dan Fonnte tadi menolak, nomornya masih
+  // terdaftar di sana. Itu harus dikatakan apa adanya: nomor yang sama tidak bisa
+  // ditambahkan lagi sebelum dihapus dari dashboard Fonnte.
+  if (!unlinked.success) {
+    return NextResponse.json({
+      success: true,
+      warning:
+        "Nomor dihapus dari dashboard, tapi MASIH terdaftar di Fonnte " +
+        `(${unlinked.error || "penyebab tidak diketahui"}). ` +
+        "Hapus device-nya dari dashboard Fonnte kalau nomor ini mau dipakai lagi."
+    });
   }
 
   // Sampai di sini device SUDAH terhapus di Fonnte (itu syarat di atas), jadi
