@@ -3,11 +3,14 @@ import {
   COURIER_GROUPS,
   DEFAULT_LOCAL_COURIER,
   MAX_LOCAL_COURIER_COST,
+  RETIRED_COURIERS,
   courierGroupOf,
   courierLabel,
   filterRatesByActiveCouriers,
+  isRetiredCourier,
   normalizeActiveCouriers,
-  normalizeLocalCourier
+  normalizeLocalCourier,
+  retiredCouriersIn
 } from "../lib/couriers";
 
 /**
@@ -95,6 +98,74 @@ describe("filterRatesByActiveCouriers", () => {
   it("kurir dengan kode tak dikenal tidak pernah lolos saat ada filter", () => {
     const out = filterRatesByActiveCouriers(rates, ["jne", "jt"]);
     expect(out.map((r) => r.courier_code)).not.toContain("gojek");
+  });
+
+  // Inilah bagian yang paling mudah salah: merek pensiun harus dibuang SEBELUM
+  // cabang fail-open, bukan sesudahnya. Kalau urutannya tertukar, toko yang belum
+  // menceklis apa pun tetap mengutip ekspedisi yang tidak bisa mengirim.
+  it("merek pensiun dibuang meski belum ada yang diceklis (fail-open)", () => {
+    const withRetired = [...rates, { courier_code: "ninja", cost: 11_000 }];
+    expect(filterRatesByActiveCouriers(withRetired, []).map((r) => r.courier_code)).toEqual([
+      "jne",
+      "jnecargo",
+      "jt",
+      "gojek"
+    ]);
+    expect(filterRatesByActiveCouriers(withRetired, null).map((r) => r.courier_code)).not.toContain(
+      "ninja"
+    );
+  });
+
+  it("merek pensiun tetap dibuang saat ada filter, apa pun isi filternya", () => {
+    const withRetired = [{ courier_code: "ninja", cost: 11_000 }, ...rates];
+    expect(filterRatesByActiveCouriers(withRetired, ["jne"]).map((r) => r.courier_code)).toEqual([
+      "jne",
+      "jnecargo"
+    ]);
+  });
+
+  // Konsekuensi yang disengaja, dan satu-satunya perubahan perilaku yang terasa
+  // bagi pemilik toko: kalau SATU-SATUNYA ceklisnya adalah merek pensiun, daftar
+  // aktifnya menjadi kosong dan aturan fail-open mengambil alih — semua ekspedisi
+  // lain ditawarkan. Itu dipilih karena bot yang mengutip nol ekspedisi jauh lebih
+  // merugikan, dan dashboard menyatakannya apa adanya lewat `retiredCouriersIn`.
+  it("hanya merek pensiun yang diceklis → fail-open, bukan nol ekspedisi", () => {
+    const withRetired = [{ courier_code: "ninja", cost: 11_000 }, ...rates];
+    expect(filterRatesByActiveCouriers(withRetired, ["ninja"]).map((r) => r.courier_code)).toEqual([
+      "jne",
+      "jnecargo",
+      "jt",
+      "gojek"
+    ]);
+  });
+});
+
+describe("merek pensiun", () => {
+  it("kode & alias merek pensiun dikenali, yang lain tidak", () => {
+    for (const c of RETIRED_COURIERS) {
+      expect(isRetiredCourier(c.code)).toBe(true);
+      for (const s of c.services) expect(isRetiredCourier(s.toUpperCase())).toBe(true);
+    }
+    expect(isRetiredCourier("jne")).toBe(false);
+    expect(isRetiredCourier("")).toBe(false);
+  });
+
+  it("merek pensiun tidak lagi bisa diceklis maupun tersimpan", () => {
+    for (const c of RETIRED_COURIERS) {
+      expect(COURIER_GROUPS.some((g) => g.code === c.code)).toBe(false);
+      expect(courierGroupOf(c.code)).toBeNull();
+      expect(normalizeActiveCouriers([c.code])).toEqual([]);
+      // Satu-satunya pilihan toko adalah merek pensiun → jatuh ke fail-open
+      // (semua ekspedisi lain ditawarkan), bukan nol ekspedisi.
+      expect(normalizeActiveCouriers(["jne", c.code])).toEqual(["jne"]);
+    }
+  });
+
+  it("nilai lama di active_couriers bisa dilaporkan ke pemilik toko", () => {
+    expect(retiredCouriersIn(["jne", "ninja"]).map((c) => c.label)).toEqual(["Ninja Xpress"]);
+    expect(retiredCouriersIn(["  NINJA  "]).map((c) => c.code)).toEqual(["ninja"]);
+    expect(retiredCouriersIn(["jne", "jt"])).toEqual([]);
+    expect(retiredCouriersIn(null)).toEqual([]);
   });
 });
 

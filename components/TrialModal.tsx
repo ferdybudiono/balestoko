@@ -2,6 +2,7 @@
 
 import { forwardRef, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { MIN_PASSWORD, minPasswordError } from "@/lib/password-policy";
 import {
   X,
   User,
@@ -73,7 +74,7 @@ export default function TrialModal({ open, onClose }: TrialModalProps) {
     if (form.whatsapp.replace(/\D/g, "").length < 9) next.whatsapp = "Nomor WhatsApp tidak valid.";
     if (!EMAIL_RE.test(form.email)) next.email = "Format email salah.";
     if (form.storeName.trim().length < 2) next.storeName = "Nama toko wajib diisi.";
-    if (form.password.length < 6) next.password = "Kata sandi minimal 6 karakter.";
+    if (form.password.length < MIN_PASSWORD) next.password = minPasswordError();
     setErrors(next);
     return Object.keys(next).length === 0;
   }

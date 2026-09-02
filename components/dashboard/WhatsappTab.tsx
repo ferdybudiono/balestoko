@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import {
   CheckCircle,
@@ -214,9 +215,9 @@ export default function WhatsappTab({
                 Anda punya {devices.length} nomor, sedangkan paket <strong>{planName}</strong> mencakup{" "}
                 {deviceLimit}. {overLimitIds.size} nomor bertanda{" "}
                 <strong>di luar kuota</strong> tidak dibalas bot.{" "}
-                <a href="/#harga" className="font-semibold text-rose-800 hover:underline">
+                <Link href="/#harga" className="font-semibold text-rose-800 hover:underline">
                   Upgrade paket
-                </a>{" "}
+                </Link>{" "}
                 atau hapus nomor tersebut.
               </p>
             </div>
@@ -510,9 +511,9 @@ export default function WhatsappTab({
                 {deviceLimit === 1 ? (
                   <>
                     Paket <strong>{planName}</strong> mendukung 1 nomor WhatsApp.{" "}
-                    <a href="/#harga" className="font-semibold text-brand-700 hover:underline">
+                    <Link href="/#harga" className="font-semibold text-brand-700 hover:underline">
                       Upgrade ke Pro
-                    </a>{" "}
+                    </Link>{" "}
                     untuk memakai sampai 3 nomor sekaligus.
                   </>
                 ) : (

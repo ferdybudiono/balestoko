@@ -27,6 +27,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # `next lint` sudah ditandai deprecated oleh Next 15.5 dan akan hilang di
+      # Next 16; saat itu perintahnya diganti ESLint CLI. Konfigurasinya
+      # (`.eslintrc.json`) tetap dipakai apa adanya oleh keduanya.
+      - name: Lint
+        run: npm run lint
+
       - name: Unit tests
         run: npm test
 

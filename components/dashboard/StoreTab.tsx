@@ -23,7 +23,8 @@ import {
   COURIER_GROUPS,
   MAX_LOCAL_COURIER_COST,
   normalizeActiveCouriers,
-  type LocalCourierConfig
+  type LocalCourierConfig,
+  type RetiredCourier
 } from "@/lib/couriers";
 import {
   AI_TONES,
@@ -136,8 +137,36 @@ interface StoreTabProps {
   onReset: () => void;
   /** Origin sudah berupa `_id` Mengantar asli (24 hex) → ongkir akurat. */
   originValid: boolean;
+  /**
+   * Merek ekspedisi yang dulu diceklis toko ini tapi sudah tidak bekerja sama.
+   *
+   * Dihitung di dashboard dari nilai MENTAH database, bukan dari `form` — pada
+   * saat form dibangun, `normalizeActiveCouriers` sudah membuang kode itu, jadi
+   * form tidak lagi punya cara mengetahui ada pilihan yang hilang.
+   */
+  retiredCouriers: RetiredCourier[];
   showToast: ShowToast;
 }
+
+/**
+ * Kabar yang BENAR-BENAR dikirim `lib/notify.ts`, satu per satu.
+ *
+ * Ditulis sebagai daftar, bukan satu kalimat, karena isinya bertambah: sebelum
+ * ini teksnya berbunyi "tiga hal" padahal pengingat masa aktif sudah ditambahkan
+ * — dan janji yang kurang satu justru merugikan di sini, karena pemilik toko
+ * mematikan sakelar di bawah tanpa tahu ia juga mematikan peringatan tagihan.
+ *
+ * Kalau `lib/notify.ts` menambah kabar baru, daftar ini ikut ditambah.
+ */
+const NOTIFY_EVENTS: { title: string; detail: string }[] = [
+  { title: "Nomor toko terputus", detail: "bot berhenti membalas sampai disambungkan lagi." },
+  { title: "Kuota percakapan hampir habis", detail: "di 80%, 90%, lalu saat benar-benar habis." },
+  { title: "Pesanan baru masuk", detail: "berisi barang, jumlah, dan nomor pembeli." },
+  {
+    title: "Masa aktif akan berakhir",
+    detail: "H-3, H-1, dan hari terakhir — beserta tautan perpanjangan."
+  }
+];
 
 const inputCls =
   "w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-ink placeholder:text-slate-400 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100";
@@ -151,6 +180,7 @@ export default function StoreTab({
   onSave,
   onReset,
   originValid,
+  retiredCouriers,
   showToast
 }: StoreTabProps) {
   // Pencarian lokasi asal
@@ -381,6 +411,44 @@ export default function StoreTab({
       cost: sampleCosts[i]
     }));
 
+  // ── Yang masih kurang ──────────────────────────────────────────────────
+  //
+  // Formulir ini panjangnya empat layar, dan masalah yang paling sering terjadi
+  // bukan salah isi melainkan TIDAK TAHU ada yang belum diisi: bot tetap
+  // membalas pembeli, hanya saja ongkirnya perkiraan dan instruksi bayarnya
+  // tidak pernah muncul. Jadi setiap baris di sini menyebut AKIBATNYA, bukan
+  // sekadar "belum lengkap", dan daftarnya hilang sendiri begitu tidak ada yang
+  // kurang — panel yang selalu menegur akan diabaikan.
+  const gaps: { label: string; consequence: string; href: string }[] = [];
+  if (!form.storeName.trim()) {
+    gaps.push({
+      label: "Nama toko belum diisi",
+      consequence: "AI memperkenalkan toko Anda tanpa nama.",
+      href: "#store-name"
+    });
+  }
+  if (!originValid) {
+    gaps.push({
+      label: "Lokasi asal belum dipilih dari hasil pencarian",
+      consequence: "Ongkir yang disebut ke pembeli masih perkiraan, bukan tarif kurir asli.",
+      href: "#origin-section"
+    });
+  }
+  if (normalizePaymentAccounts(form.paymentAccounts).length === 0 && !form.codEnabled) {
+    gaps.push({
+      label: "Belum ada cara pembayaran",
+      consequence: "Pembeli yang sudah setuju harga tidak diberi tahu cara membayarnya.",
+      href: "#payment-section"
+    });
+  }
+  if (!form.notifyEnabled) {
+    gaps.push({
+      label: "Kabar ke WhatsApp Anda dimatikan",
+      consequence: "Nomor toko terputus dan masa aktif berakhir tanpa satu pun peringatan.",
+      href: "#notify-section"
+    });
+  }
+
   const previewReply = buildOngkirReply({
     draft: {
       lines: [
@@ -430,6 +498,25 @@ export default function StoreTab({
           </p>
         </div>
 
+        {gaps.length > 0 && (
+          <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl">
+            <p className="text-xs font-semibold text-amber-900 flex items-center gap-1.5">
+              <TriangleAlert className="w-3.5 h-3.5 text-amber-600" aria-hidden="true" />
+              {gaps.length === 1 ? "Satu hal" : `${gaps.length} hal`} masih perlu dilengkapi
+            </p>
+            <ul className="mt-2 space-y-1.5">
+              {gaps.map((g) => (
+                <li key={g.href} className="text-xs text-amber-900 leading-relaxed">
+                  <a href={g.href} className="font-semibold underline hover:text-amber-950">
+                    {g.label}
+                  </a>{" "}
+                  — {g.consequence}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         {/* Nama toko */}
         <div>
           <label htmlFor="store-name" className={labelCls}>
@@ -445,7 +532,12 @@ export default function StoreTab({
         </div>
 
         {/* ── Lokasi asal ────────────────────────────────────────────── */}
-        <div className="p-4 sm:p-5 bg-slate-50 border border-slate-200 rounded-2xl space-y-3">
+        {/* `id` + `scroll-mt` dipakai oleh daftar "masih perlu dilengkapi" di
+            atas: tanpa jarak atas, judul bagian tertutup header yang menempel. */}
+        <div
+          id="origin-section"
+          className="p-4 sm:p-5 bg-slate-50 border border-slate-200 rounded-2xl space-y-3 scroll-mt-24"
+        >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className={`${labelCls} mb-0`}>Lokasi asal pengiriman</span>
             {originValid ? (
@@ -607,8 +699,25 @@ export default function StoreTab({
                 <Truck className="w-4 h-4 text-brand-600" aria-hidden="true" />
                 Ekspedisi yang dilayani
               </h3>
+              {/* Kalimatnya mengikuti keadaan, bukan menjanjikan satu aturan
+                  saja: daftar kosong berarti SEMUA ekspedisi ditawarkan
+                  (`filterRatesByActiveCouriers` fail-open), dan versi lama
+                  paragraf ini — "AI hanya menawarkan yang diceklis" —
+                  bertentangan dengan pemberitahuan beberapa baris di bawahnya. */}
               <p className="text-xs text-slate-500 mt-1">
-                Ceklis ekspedisi yang toko Anda benar-benar pakai. AI hanya menawarkan yang diceklis.
+                {form.activeCouriers.length === 0 ? (
+                  <>
+                    Belum ada yang diceklis, jadi{" "}
+                    <strong className="text-slate-600">semua</strong> ekspedisi di bawah ditawarkan
+                    ke pembeli. Ceklis sebagian untuk membatasinya.
+                  </>
+                ) : (
+                  <>
+                    AI hanya menawarkan{" "}
+                    <strong className="text-slate-600">{form.activeCouriers.length} ekspedisi</strong>{" "}
+                    yang diceklis. Kosongkan semua untuk menawarkan seluruhnya.
+                  </>
+                )}
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -632,6 +741,24 @@ export default function StoreTab({
               </button>
             </div>
           </div>
+
+          {/* Pilihan yang dibuang sistem harus dikatakan, bukan dihilangkan
+              diam-diam. Tanpa ini, pemilik toko yang dulu menceklis merek itu
+              hanya melihat ceklisnya lenyap dan menyimpulkan dashboard-nya rusak. */}
+          {retiredCouriers.length > 0 && (
+            <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl">
+              <TriangleAlert className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" aria-hidden="true" />
+              <p className="text-xs text-amber-900 leading-relaxed">
+                <strong>{retiredCouriers.map((c) => c.label).join(", ")}</strong> sudah dikeluarkan
+                dari daftar dan tidak lagi ditawarkan ke pembeli.{" "}
+                {retiredCouriers.map((c) => c.reason).join(" ")} Pilih ekspedisi pengganti di bawah,
+                lalu <strong>Simpan</strong>
+                {form.activeCouriers.length === 0
+                  ? " — selama daftarnya masih kosong, semua ekspedisi ditawarkan."
+                  : "."}
+              </p>
+            </div>
+          )}
 
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
             {COURIER_GROUPS.map((g) => {
@@ -760,7 +887,7 @@ export default function StoreTab({
         </div>
 
         {/* ── Pembayaran ─────────────────────────────────────────────── */}
-        <div className="space-y-4 pt-5 border-t border-slate-100">
+        <div id="payment-section" className="space-y-4 pt-5 border-t border-slate-100 scroll-mt-24">
           <div>
             <h3 className="text-sm font-bold text-ink flex items-center gap-2">
               <Banknote className="w-4 h-4 text-brand-600" aria-hidden="true" />
@@ -1201,16 +1328,31 @@ export default function StoreTab({
         </div>
 
         {/* ── Kabar ke WhatsApp pemilik toko ─────────────────────────── */}
-        <div className="pt-6 border-t border-slate-100">
+        <div id="notify-section" className="pt-6 border-t border-slate-100 scroll-mt-24">
           <h3 className="text-sm font-bold text-ink flex items-center gap-2">
             <BellRing className="w-4 h-4 text-brand-600" aria-hidden="true" />
             Kabar penting ke WhatsApp Anda
           </h3>
           <p className="text-xs text-slate-500 mt-1">
-            Tiga hal dikabarkan langsung lewat WhatsApp: nomor toko terputus, kuota percakapan
-            hampir habis, dan pesanan baru masuk. Tanpa ini, semuanya baru diketahui saat Anda
-            membuka dashboard.
+            Empat hal dikabarkan langsung lewat WhatsApp. Tanpa ini, semuanya baru diketahui saat
+            Anda membuka dashboard.
           </p>
+
+          <ul className="mt-3 grid sm:grid-cols-2 gap-x-4 gap-y-1.5">
+            {NOTIFY_EVENTS.map((e) => (
+              <li key={e.title} className="flex items-start gap-2 text-xs leading-relaxed">
+                <CheckCircle
+                  className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${
+                    form.notifyEnabled ? "text-emerald-500" : "text-slate-300"
+                  }`}
+                  aria-hidden="true"
+                />
+                <span className={form.notifyEnabled ? "text-slate-600" : "text-slate-400"}>
+                  <strong className="font-semibold">{e.title}</strong> — {e.detail}
+                </span>
+              </li>
+            ))}
+          </ul>
 
           <label className="mt-4 flex items-start gap-3 p-3.5 bg-slate-50 border border-slate-200 rounded-xl cursor-pointer">
             <input
@@ -1224,10 +1366,24 @@ export default function StoreTab({
                 Kirim kabar penting ke WhatsApp
               </span>
               <span className="block text-xs text-slate-500 mt-0.5">
-                Dimatikan berarti nomor toko bisa mati berhari-hari tanpa Anda tahu.
+                Satu sakelar untuk keempat kabar di atas.
               </span>
             </span>
           </label>
+
+          {/* Sakelar ini juga membungkam pengingat masa aktif — satu-satunya
+              peringatan sebelum layanan berhenti. Itu harus dikatakan di tempat
+              keputusannya diambil, bukan disesali setelah trial habis. */}
+          {!form.notifyEnabled && (
+            <p className="mt-2 flex items-start gap-2 text-xs text-amber-900 leading-relaxed bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+              <TriangleAlert className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" aria-hidden="true" />
+              <span>
+                Sedang dimatikan, jadi <strong>keempatnya tidak dikirim</strong> — termasuk
+                pengingat masa aktif. Nomor toko bisa mati berhari-hari, atau langganan berakhir,
+                tanpa satu pun peringatan.
+              </span>
+            </p>
+          )}
 
           <div className="mt-3 space-y-1.5">
             <label htmlFor="alert-phone" className={labelCls}>

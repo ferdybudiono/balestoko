@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  KeyRound,
   RefreshCw,
   ShieldCheck,
   Trash2,
@@ -9,6 +10,7 @@ import {
   UserPlus,
   Users
 } from "lucide-react";
+import { MIN_PASSWORD, minPasswordError } from "@/lib/password-policy";
 import { relativeTime, type ShowToast } from "./types";
 
 /** Bentuk anggota yang dikirim `/api/members` — tanpa hash kata sandi. */
@@ -32,7 +34,6 @@ const ROLE_LABELS: Record<Member["role"], string> = {
   staff: "Pegawai"
 };
 
-const MIN_PASSWORD = 8;
 
 /**
  * Anggota tim yang boleh membuka dashboard toko ini.
@@ -58,6 +59,13 @@ export default function TeamMembers({ showToast }: TeamMembersProps) {
   const [adding, setAdding] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [confirmId, setConfirmId] = useState<string | null>(null);
+
+  // Setel ulang kata sandi anggota. Hanya SATU baris yang boleh terbuka sekaligus:
+  // tiga kolom kata sandi terbuka bersamaan di satu daftar membuat pemilik toko
+  // mudah mengetikkan sandi orang lain ke baris yang salah.
+  const [resetId, setResetId] = useState<string | null>(null);
+  const [resetPassword, setResetPassword] = useState("");
+  const [resettingId, setResettingId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -91,7 +99,7 @@ export default function TeamMembers({ showToast }: TeamMembersProps) {
       return;
     }
     if (password.length < MIN_PASSWORD) {
-      showToast(`Kata sandi minimal ${MIN_PASSWORD} karakter.`, "error");
+      showToast(minPasswordError(), "error");
       return;
     }
     setAdding(true);
@@ -115,6 +123,43 @@ export default function TeamMembers({ showToast }: TeamMembersProps) {
       showToast("Gagal menambah anggota.", "error");
     } finally {
       setAdding(false);
+    }
+  };
+
+  /**
+   * Setel kata sandi anggota tanpa mengeluarkannya dari tim.
+   *
+   * Ini satu-satunya jalur pemulihan yang dimiliki anggota tim: OTP reset dikirim
+   * ke nomor WhatsApp TOKO dan hanya bisa mengganti kata sandi PEMILIK, jadi
+   * pegawai yang lupa kata sandinya tidak punya cara sendiri untuk masuk lagi.
+   * Sebelum tombol ini ada, satu-satunya penyelesaian adalah mengeluarkan lalu
+   * menambahkannya kembali — yang menghapus jejak `last_login_at` tanpa alasan.
+   */
+  const handleResetPassword = async (id: string) => {
+    if (resetPassword.length < MIN_PASSWORD) {
+      showToast(minPasswordError(), "error");
+      return;
+    }
+    setResettingId(id);
+    try {
+      const res = await fetch(`/api/members?id=${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: resetPassword })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(data.error || "Gagal menyetel kata sandi anggota.", "error");
+        return;
+      }
+      showToast(data.message || "Kata sandi anggota diperbarui.");
+      setResetId(null);
+      setResetPassword("");
+      await load();
+    } catch {
+      showToast("Gagal menyetel kata sandi anggota.", "error");
+    } finally {
+      setResettingId(null);
     }
   };
 
@@ -153,7 +198,9 @@ export default function TeamMembers({ showToast }: TeamMembersProps) {
         </h3>
         <p className="text-xs text-slate-500 mt-1">
           Beri pegawai akun sendiri untuk membuka dashboard dan menjawab chat. Mengeluarkan satu
-          orang tidak lagi berarti mengganti kata sandi untuk semua.
+          orang tidak lagi berarti mengganti kata sandi untuk semua. Kalau ada yang lupa kata
+          sandinya, setel yang baru lewat ikon kunci — anggota tim tidak bisa memakai jalur OTP
+          karena OTP dikirim ke nomor toko.
         </p>
       </div>
 
@@ -184,6 +231,7 @@ export default function TeamMembers({ showToast }: TeamMembersProps) {
             <ul className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
               {members.map((m) => {
                 const confirming = !!m.id && confirmId === m.id;
+                const resetting = !!m.id && resetId === m.id;
                 return (
                   <li key={m.id || m.email} className="px-3.5 py-3">
                     <div className="flex items-center gap-3">
@@ -208,17 +256,100 @@ export default function TeamMembers({ showToast }: TeamMembersProps) {
                         {ROLE_LABELS[m.role]}
                       </span>
                       {m.id && !confirming && (
-                        <button
-                          type="button"
-                          onClick={() => setConfirmId(m.id!)}
-                          aria-label={`Keluarkan ${m.email}`}
-                          title="Keluarkan dari tim"
-                          className="shrink-0 p-2 text-slate-400 hover:text-red-600 hover:bg-slate-50 rounded-lg transition-colors"
-                        >
-                          <Trash2 className="w-4 h-4" aria-hidden="true" />
-                        </button>
+                        <div className="shrink-0 flex items-center">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setResetId(resetting ? null : m.id!);
+                              setResetPassword("");
+                            }}
+                            aria-label={`Setel kata sandi ${m.email}`}
+                            aria-expanded={resetting}
+                            title="Setel kata sandi baru"
+                            className={`p-2 rounded-lg transition-colors ${
+                              resetting
+                                ? "text-brand-700 bg-brand-50"
+                                : "text-slate-400 hover:text-brand-600 hover:bg-slate-50"
+                            }`}
+                          >
+                            <KeyRound className="w-4 h-4" aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmId(m.id!)}
+                            aria-label={`Keluarkan ${m.email}`}
+                            title="Keluarkan dari tim"
+                            className="p-2 text-slate-400 hover:text-red-600 hover:bg-slate-50 rounded-lg transition-colors"
+                          >
+                            <Trash2 className="w-4 h-4" aria-hidden="true" />
+                          </button>
+                        </div>
                       )}
                     </div>
+
+                    {resetting && !confirming && (
+                      <div className="mt-2.5 p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2.5">
+                        <label
+                          htmlFor={`member-pwd-${m.id}`}
+                          className="block text-xs font-semibold text-slate-600"
+                        >
+                          Kata sandi baru untuk {m.email}
+                        </label>
+                        <input
+                          id={`member-pwd-${m.id}`}
+                          type="text"
+                          minLength={MIN_PASSWORD}
+                          autoComplete="off"
+                          placeholder={`Minimal ${MIN_PASSWORD} karakter`}
+                          value={resetPassword}
+                          onChange={(e) => setResetPassword(e.target.value)}
+                          onKeyDown={(e) => {
+                            // Panel ini bukan <form> — akar TeamMembers memakai satu
+                            // form untuk "Tambah anggota", dan Enter di sini tidak
+                            // boleh ikut men-submit form itu.
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              void handleResetPassword(m.id!);
+                            }
+                          }}
+                          className={inputCls}
+                        />
+                        {/* Sengaja type="text": pemilik toko HARUS bisa membaca
+                            kata sandi yang baru saja dibuatnya untuk disampaikan ke
+                            orangnya — ini bukan kata sandi miliknya sendiri, dan
+                            titik-titik hanya membuatnya salah dibacakan. */}
+                        <p className="text-[11px] text-slate-400">
+                          Terlihat supaya bisa Anda sampaikan langsung ke orangnya. Setelah disimpan,
+                          sesi lamanya di semua perangkat langsung berakhir dan dia harus masuk
+                          dengan kata sandi ini.
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleResetPassword(m.id!)}
+                            disabled={resettingId === m.id || resetPassword.length < MIN_PASSWORD}
+                            className="px-3.5 py-2 bg-brand-600 hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+                          >
+                            {resettingId === m.id ? (
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                            ) : (
+                              <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />
+                            )}
+                            Simpan kata sandi
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setResetId(null);
+                              setResetPassword("");
+                            }}
+                            className="px-3.5 py-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 text-xs font-semibold rounded-lg transition-colors"
+                          >
+                            Batal
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     {confirming && (
                       <div className="mt-2.5 p-3 bg-red-50 border border-red-200 rounded-xl space-y-2.5">

@@ -2,6 +2,7 @@
 
 import { forwardRef, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { MIN_PASSWORD, minPasswordError } from "@/lib/password-policy";
 import {
   X,
   User,
@@ -156,8 +157,8 @@ export default function CheckoutModal({
     if (form.storeName.trim().length < 2)
       next.storeName = "Nama toko wajib diisi.";
     // Perpanjangan memakai akun yang sudah ada, jadi tidak ada kata sandi baru.
-    if (!isRenewal && form.password.length < 6)
-      next.password = "Kata sandi minimal 6 karakter.";
+    if (!isRenewal && form.password.length < MIN_PASSWORD)
+      next.password = minPasswordError();
     setErrors(next);
     return Object.keys(next).length === 0;
   }

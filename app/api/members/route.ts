@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSessionActor, hashPassword } from "@/lib/auth";
+import { MIN_PASSWORD, minPasswordError } from "@/lib/password-policy";
 import {
   deleteStoreMember,
   getStoreByEmail,
@@ -34,7 +35,6 @@ export const dynamic = "force-dynamic";
  * seluruh endpoint ini menolak sesi anggota (`actor.isMember`).
  */
 const MAX_MEMBERS = 10;
-const MIN_PASSWORD = 8;
 
 async function requireOwner(): Promise<
   { ok: true; store: StoreRecord; storeId: string } | { ok: false; res: NextResponse }
@@ -95,7 +95,7 @@ export async function POST(req: Request) {
   }
   if (password.length < MIN_PASSWORD) {
     return NextResponse.json(
-      { error: `Kata sandi minimal ${MIN_PASSWORD} karakter.` },
+      { error: minPasswordError() },
       { status: 400 }
     );
   }
@@ -105,6 +105,19 @@ export async function POST(req: Request) {
   if (email === normalizeEmail(store.email)) {
     return NextResponse.json(
       { error: "Email ini sudah dipakai akun pemilik toko." },
+      { status: 409 }
+    );
+  }
+
+  // Email yang sudah menjadi PEMILIK toko lain juga tidak boleh: `auth/login`
+  // mencoba jalur pemilik lebih dulu, jadi kredensial anggota yang dibuat di sini
+  // tidak akan pernah dipakai — orangnya akan selalu masuk ke toko miliknya
+  // sendiri. Tanpa pemeriksaan ini, pemilik toko mengira sudah memberi akses ke
+  // pegawainya padahal tidak.
+  const ownerElsewhere = await getStoreByEmail(email);
+  if (ownerElsewhere) {
+    return NextResponse.json(
+      { error: "Email ini sudah dipakai sebagai akun pemilik toko lain." },
       { status: 409 }
     );
   }
@@ -192,7 +205,7 @@ export async function PATCH(req: Request) {
   const password = String(body.password || "");
   if (password.length < MIN_PASSWORD) {
     return NextResponse.json(
-      { error: `Kata sandi minimal ${MIN_PASSWORD} karakter.` },
+      { error: minPasswordError() },
       { status: 400 }
     );
   }

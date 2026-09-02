@@ -13,19 +13,10 @@ import {
   setSessionCookie,
   verifyPassword
 } from "@/lib/auth";
+import { MIN_PASSWORD, minPasswordError } from "@/lib/password-policy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-/**
- * Panjang minimum kata sandi baru.
- *
- * 8, sama dengan `POST /api/members`. Jalur lama pemilik toko (`register-trial`,
- * `reset/confirm`) masih menerima 6 dan sengaja tidak diubah di sini — menaikkan
- * ambang di jalur pendaftaran & pemulihan adalah keputusan produk, bukan
- * perbaikan bug. Penyeragamannya tercatat sebagai pekerjaan tersendiri.
- */
-const MIN_NEW_PASSWORD = 8;
 
 const HOUR_SECONDS = 3600;
 /** Batas per akun: menghambat penebakan kata sandi lama lewat endpoint ini. */
@@ -77,9 +68,9 @@ export async function POST(req: Request) {
   if (!currentPassword) {
     return NextResponse.json({ error: "Kata sandi saat ini wajib diisi." }, { status: 400 });
   }
-  if (newPassword.length < MIN_NEW_PASSWORD) {
+  if (newPassword.length < MIN_PASSWORD) {
     return NextResponse.json(
-      { error: `Kata sandi baru minimal ${MIN_NEW_PASSWORD} karakter.` },
+      { error: minPasswordError("Kata sandi baru") },
       { status: 400 }
     );
   }

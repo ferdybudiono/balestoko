@@ -188,7 +188,7 @@ create table if not exists public.buyer_orders (
   shipping_courier      text,
   shipping_cost         integer,
   note                  text,
-  status                text not null default 'new',   -- 'new' | 'done'
+  status                text not null default 'new',   -- 'new' | 'paid' | 'shipped' | 'done'
   done_at               timestamptz,
   created_at            timestamptz not null default now(),
   updated_at            timestamptz not null default now()
@@ -630,6 +630,30 @@ create unique index if not exists stores_email_lower_uidx on public.stores (lowe
 -- pengingat selamanya. Logikanya di `lib/notify.ts`.
 alter table public.stores add column if not exists last_expiry_alert_days integer;
 alter table public.stores add column if not exists last_expiry_alert_at timestamptz;
+
+-- Ekspedisi yang sudah tidak bekerja sama lagi: buang dari pilihan yang tersimpan.
+--
+-- Mengantar berhenti bekerja sama dengan Ninja Xpress, jadi tarifnya tidak boleh
+-- lagi dikutip ke pembeli. Penyaringannya sendiri ada di kode
+-- (`RETIRED_COURIERS` di `lib/couriers.ts`, disaring tanpa syarat di
+-- `filterRatesByActiveCouriers`), jadi pembeli sudah aman TANPA perintah ini —
+-- yang dibersihkan di sini hanyalah nilai basi di database.
+--
+-- Kenapa tetap perlu: `normalizeActiveCouriers` membuang kode itu setiap kali
+-- baris dibaca maupun disimpan, tapi baris yang tidak pernah dibuka lagi akan
+-- menyimpan 'ninja' selamanya — dan kolom yang isinya tidak mungkin sah lagi
+-- membuat setiap pembacaan berikutnya harus menebak apakah itu data atau sampah.
+--
+-- Efek samping yang disengaja: toko yang SATU-SATUNYA pilihannya adalah 'ninja'
+-- kini punya daftar kosong, dan daftar kosong berarti SEMUA ekspedisi ditawarkan
+-- (fail-open). Itu dipilih karena bot yang mengutip nol ekspedisi lebih merugikan,
+-- dan dashboard menyatakannya apa adanya di tab Pengaturan Toko.
+--
+-- `active_couriers` bertipe text[], jadi `array_remove` — bukan operasi jsonb.
+update public.stores
+   set active_couriers = array_remove(active_couriers, 'ninja')
+ where active_couriers is not null
+   and 'ninja' = any (active_couriers);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 --  RPC: kurangi stok beberapa produk sekaligus, atomik.

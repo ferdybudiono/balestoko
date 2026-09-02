@@ -5,6 +5,7 @@ import { createSnapTransaction } from "@/lib/midtrans";
 import { insertPendingOrder, getStoreByEmail, normalizeEmail } from "@/lib/supabase";
 import { formatFonntePhone } from "@/lib/fonnte";
 import { hashPassword, getSessionEmail } from "@/lib/auth";
+import { MIN_PASSWORD } from "@/lib/password-policy";
 import { validateCouponForPlan, applyDiscount } from "@/lib/coupons";
 import { resolveCallbackBaseUrl } from "@/lib/webhook-url";
 
@@ -111,9 +112,9 @@ export async function POST(req: Request) {
   // Password hanya relevan untuk akun BARU. Pada perpanjangan, apa pun yang
   // diisi di form diabaikan — kredensial akun yang sudah ada tidak boleh
   // tersentuh oleh alur pembayaran.
-  if (!isRenewal && (!password || password.length < 6)) {
+  if (!isRenewal && (!password || password.length < MIN_PASSWORD)) {
     return NextResponse.json(
-      { error: "Kata sandi wajib diisi (min. 6 karakter)." },
+      { error: `Kata sandi wajib diisi (min. ${MIN_PASSWORD} karakter).` },
       { status: 400 }
     );
   }

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   ArrowRight,
   Banknote,
@@ -114,7 +115,7 @@ function QuotaMeter({
       </p>
 
       {(exhausted || nearLimit) && (
-        <a
+        <Link
           href="/#harga"
           className={`mt-3 inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold text-white transition-colors ${
             exhausted ? "bg-rose-600 hover:bg-rose-700" : "bg-amber-600 hover:bg-amber-700"
@@ -122,7 +123,7 @@ function QuotaMeter({
         >
           <Crown className="w-3.5 h-3.5" aria-hidden="true" />
           Upgrade ke Pro — percakapan tanpa batas
-        </a>
+        </Link>
       )}
     </div>
   );
@@ -140,13 +141,13 @@ function AnalyticsLocked() {
         Grafik tren 7 hari, sebaran topik percakapan, dan kota tujuan ongkir terpopuler — supaya
         Anda tahu apa yang paling sering ditanyakan pembeli dan dari mana mereka.
       </p>
-      <a
+      <Link
         href="/#harga"
         className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 px-4 py-2.5 text-xs font-semibold text-white transition-colors"
       >
         <Crown className="w-3.5 h-3.5" aria-hidden="true" />
         Lihat paket Pro
-      </a>
+      </Link>
     </div>
   );
 }

@@ -75,13 +75,21 @@ function mengantarKeyPath(apiKey?: string): string {
   return encodeURIComponent(key);
 }
 
-/** Nama ekspedisi ramah-tampilan dari kode kurir Mengantar (allEstimatePublic). */
+/**
+ * Nama ekspedisi ramah-tampilan dari kode kurir Mengantar (allEstimatePublic).
+ *
+ * Merek yang sudah tidak bekerja sama TIDAK ada di sini dan tidak perlu ada:
+ * tarifnya sudah dibuang `filterRatesByActiveCouriers` sebelum sampai ke tahap
+ * penamaan. Daftar merek pensiun tinggal di `RETIRED_COURIERS`
+ * (`lib/couriers.ts`) — satu tempat saja, supaya nama merek yang tidak bisa
+ * dikirim tidak pernah muncul lagi di balasan ke pembeli.
+ */
 const COURIER_NAMES: Record<string, string> = {
   JNE: "JNE", JNECargo: "JNE Cargo",
   SiCepat: "SiCepat", SiCepatCargo: "SiCepat Cargo",
   Sap: "SAP Express", SAP: "SAP Express", SapCargo: "SAP Cargo", SAPLite: "SAP Lite",
   iDexpress: "ID Express", iDexpressCargo: "ID Express Cargo", iDlite: "ID Lite",
-  JT: "J&T Express", Ninja: "Ninja Xpress", lion: "Lion Parcel",
+  JT: "J&T Express", lion: "Lion Parcel",
   anteraja: "AnterAja", paxel: "Paxel", pos: "POS Indonesia"
 };
 

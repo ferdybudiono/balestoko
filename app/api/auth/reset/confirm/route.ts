@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { bumpRateLimit, getStoreByEmail, normalizeEmail, upsertStore } from "@/lib/supabase";
 import { hashPassword, passwordChangedAt, verifyPassword } from "@/lib/auth";
+import { MIN_PASSWORD, minPasswordError } from "@/lib/password-policy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -42,8 +43,8 @@ export async function POST(req: Request) {
   if (!email || !otp) {
     return NextResponse.json({ error: "Email dan kode OTP wajib diisi." }, { status: 400 });
   }
-  if (newPassword.length < 6) {
-    return NextResponse.json({ error: "Kata sandi baru minimal 6 karakter." }, { status: 400 });
+  if (newPassword.length < MIN_PASSWORD) {
+    return NextResponse.json({ error: minPasswordError("Kata sandi baru") }, { status: 400 });
   }
 
   const byIp = await bumpRateLimit(`reset-confirm:ip:${clientIp(req)}`, HOUR_SECONDS, CONFIRM_MAX_PER_IP_PER_HOUR);

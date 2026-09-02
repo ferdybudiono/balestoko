@@ -7,6 +7,7 @@ import {
   upsertStore
 } from "@/lib/supabase";
 import { hashPassword, setSessionCookie } from "@/lib/auth";
+import { MIN_PASSWORD, minPasswordError } from "@/lib/password-policy";
 import { formatFonntePhone } from "@/lib/fonnte";
 
 export const runtime = "nodejs";
@@ -81,8 +82,8 @@ export async function POST(req: Request) {
   if (storeName.length < 2) {
     return NextResponse.json({ error: "Nama toko wajib diisi." }, { status: 400 });
   }
-  if (password.length < 6) {
-    return NextResponse.json({ error: "Kata sandi minimal 6 karakter." }, { status: 400 });
+  if (password.length < MIN_PASSWORD) {
+    return NextResponse.json({ error: minPasswordError() }, { status: 400 });
   }
 
   const phone = formatFonntePhone(whatsapp);

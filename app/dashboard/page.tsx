@@ -30,6 +30,7 @@ import OrdersTab from "@/components/dashboard/OrdersTab";
 import OverviewTab from "@/components/dashboard/OverviewTab";
 import ProductsTab from "@/components/dashboard/ProductsTab";
 import StoreTab, { type StoreForm } from "@/components/dashboard/StoreTab";
+import AccountSecurity from "@/components/dashboard/AccountSecurity";
 import TeamMembers from "@/components/dashboard/TeamMembers";
 import WhatsappTab from "@/components/dashboard/WhatsappTab";
 import { computeStats } from "@/components/dashboard/stats";
@@ -47,7 +48,13 @@ import { getPlan, hasAdvancedAnalytics, monthlyConversationLimit } from "@/lib/p
 // Modul murni (tanpa env/fetch), jadi aman diimpor komponen client. Normalisasi
 // dijalankan DI SINI supaya bentuk form selalu kanonik dan `sameForm` — yang
 // membandingkan dengan JSON.stringify — tidak salah menandai "belum disimpan".
-import { DEFAULT_LOCAL_COURIER, normalizeActiveCouriers, normalizeLocalCourier } from "@/lib/couriers";
+import {
+  DEFAULT_LOCAL_COURIER,
+  normalizeActiveCouriers,
+  normalizeLocalCourier,
+  retiredCouriersIn,
+  type RetiredCourier
+} from "@/lib/couriers";
 import { normalizeAiTone, normalizePaymentAccounts } from "@/lib/reply-format";
 
 const TABS: Array<{ id: TabId; icon: typeof LayoutDashboard; label: string; short: string }> = [
@@ -209,6 +216,14 @@ export default function DashboardPage() {
   formRef.current = form;
   savedFormRef.current = savedForm;
 
+  /**
+   * Merek ekspedisi yang tersimpan di baris toko ini tapi sudah tidak bekerja
+   * sama. Dihitung dari nilai MENTAH server sebelum `normalizeActiveCouriers`
+   * membuangnya — setelah itu jejaknya hilang, dan pemilik toko tidak akan pernah
+   * tahu ceklisnya dibuang.
+   */
+  const [retiredCouriers, setRetiredCouriers] = useState<RetiredCourier[]>([]);
+
   const [packageId, setPackageId] = useState<string>("");
   const [fonnteStatus, setFonnteStatus] = useState<FonnteStatus>({
     status: false,
@@ -346,6 +361,8 @@ export default function DashboardPage() {
         setSubscriptionEndsAt(s.subscription_ends_at || null);
         if (data.activity?.state) setActivityState(data.activity.state as ActivityState);
         setPackageId(s.package_id || "");
+
+        setRetiredCouriers(retiredCouriersIn(s.active_couriers));
 
         const local = normalizeLocalCourier(s.local_courier);
         const next: StoreForm = {
@@ -1581,8 +1598,10 @@ export default function DashboardPage() {
                     onSave={handleSaveStoreConfig}
                     onReset={() => setForm(savedForm)}
                     originValid={originValid}
+                    retiredCouriers={retiredCouriers}
                     showToast={showToast}
                   />
+                  <AccountSecurity email={userEmail} showToast={showToast} />
                   <TeamMembers showToast={showToast} />
                 </div>
               )}

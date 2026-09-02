@@ -21,8 +21,14 @@ yarn-debug.log*
 yarn-error.log*
 
 # local env files
+#
+# `.env*.local` tidak menutup `.env.production`/`.env.staging` — nama itu tidak
+# berakhiran `.local`. Keduanya ditulis eksplisit supaya kredensial produksi tidak
+# ikut ter-commit hanya karena berkasnya dinamai mengikuti konvensi Next.js.
 .env
 .env*.local
+.env.production
+.env.staging
 
 # typescript
 *.tsbuildinfo

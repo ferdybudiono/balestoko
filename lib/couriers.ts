@@ -38,13 +38,73 @@ export const COURIER_GROUPS: CourierGroup[] = [
   { code: "jt", label: "J&T Express", services: ["jt"], aliases: ["jnt"] },
   { code: "sicepat", label: "SiCepat", services: ["sicepat", "sicepatcargo"], hint: "Reguler & Cargo" },
   { code: "anteraja", label: "AnterAja", services: ["anteraja"] },
-  { code: "ninja", label: "Ninja Xpress", services: ["ninja"] },
   { code: "idexpress", label: "ID Express", services: ["idexpress", "idexpresscargo", "idlite"], hint: "Reguler, Cargo & Lite" },
   { code: "lion", label: "Lion Parcel", services: ["lion"] },
   { code: "sap", label: "SAP Express", services: ["sap", "sapcargo", "saplite"], hint: "Reguler, Cargo & Lite" },
   { code: "paxel", label: "Paxel", services: ["paxel"] },
   { code: "pos", label: "POS Indonesia", services: ["pos"] }
 ];
+
+/**
+ * Merek yang PERNAH ada di `COURIER_GROUPS` tapi sekarang tidak boleh ditawarkan
+ * lagi ke pembeli.
+ *
+ * Ninja Xpress dihapus karena Mengantar berhenti bekerja sama dengannya. API
+ * Mengantar masih bisa mengembalikan tarif `ninja` untuk sebagian rute, jadi
+ * menghapus barisnya dari `COURIER_GROUPS` SAJA tidak cukup: tarifnya akan tetap
+ * lolos lewat cabang fail-open `filterRatesByActiveCouriers` (toko yang belum
+ * menceklis apa pun menerima semua tarif apa adanya). Karena itu daftar ini
+ * disaring tanpa syarat, sebelum setelan toko dilihat.
+ *
+ * `label` dan `reason` disimpan supaya dashboard bisa mengatakan apa yang hilang
+ * kepada toko yang dulu menceklisnya — pilihan yang lenyap tanpa keterangan
+ * membuat pemilik toko mengira ada tarif yang rusak.
+ */
+export interface RetiredCourier {
+  code: string;
+  label: string;
+  /** `courier_code` dari Mengantar yang harus dibuang untuk merek ini. */
+  services: string[];
+  reason: string;
+}
+
+export const RETIRED_COURIERS: RetiredCourier[] = [
+  {
+    code: "ninja",
+    label: "Ninja Xpress",
+    services: ["ninja"],
+    reason: "Mengantar sudah tidak bekerja sama dengan Ninja Xpress."
+  }
+];
+
+/** Semua kode & alias merek pensiun, untuk pencarian O(1). */
+const RETIRED_SERVICES: Set<string> = new Set(
+  RETIRED_COURIERS.flatMap((c) => [c.code, ...c.services]).map((s) => s.toLowerCase())
+);
+
+/** `true` bila tarif dengan kode ini tidak boleh ditawarkan lagi. */
+export function isRetiredCourier(courierCode: string): boolean {
+  return RETIRED_SERVICES.has((courierCode || "").trim().toLowerCase());
+}
+
+/**
+ * Merek pensiun yang masih tersimpan di `active_couriers` sebuah toko.
+ *
+ * Dipakai dashboard untuk memberi tahu pemilik toko bahwa ceklisnya dibuang —
+ * `normalizeActiveCouriers` sudah membuangnya secara senyap, jadi tanpa ini
+ * perubahan itu tidak pernah terlihat.
+ */
+export function retiredCouriersIn(raw: unknown): RetiredCourier[] {
+  if (!Array.isArray(raw)) return [];
+  const present = new Set(
+    raw
+      .filter((v): v is string => typeof v === "string")
+      .map((v) => v.trim().toLowerCase())
+  );
+  return RETIRED_COURIERS.filter(
+    (c) => present.has(c.code) || c.services.some((s) => present.has(s.toLowerCase()))
+  );
+}
 
 /** Peta `courier_code` (dan alias) → kode grup. Dibangun sekali saat modul dimuat. */
 const SERVICE_TO_GROUP: Record<string, string> = (() => {
@@ -98,9 +158,10 @@ export function normalizeActiveCouriers(raw: unknown): string[] {
 /**
  * Saring tarif menurut ekspedisi yang dilayani toko.
  *
- * Dua perilaku di sini SENGAJA berbeda arah, dan itu bukan inkonsistensi:
+ * Tiga perilaku di sini SENGAJA berbeda arah, dan itu bukan inkonsistensi:
  *
- * - Belum ada yang diceklis (`active` kosong/null) → kembalikan SEMUA.
+ * - Merek pensiun (`RETIRED_COURIERS`) → SELALU dibuang, apa pun setelan toko.
+ * - Belum ada yang diceklis (`active` kosong/null) → kembalikan SEMUA sisanya.
  *   Fail-open. Pemilik toko yang belum pernah membuka pengaturan ini tidak boleh
  *   mendapat bot yang mengutip nol ekspedisi.
  * - Sudah diceklis tapi rute ini tidak menghasilkan satu pun kecocokan →
@@ -112,10 +173,14 @@ export function filterRatesByActiveCouriers<T extends { courier_code: string }>(
   rates: T[],
   active?: string[] | null
 ): T[] {
+  // Urutannya penting: merek pensiun dibuang LEBIH DULU. Kalau penyaringan ini
+  // ditaruh setelah cabang fail-open di bawah, toko yang belum menceklis apa pun
+  // akan tetap mengutip tarif yang kirimannya tidak akan pernah dijemput.
+  const live = rates.filter((r) => !isRetiredCourier(r.courier_code));
   const allowed = normalizeActiveCouriers(active);
-  if (allowed.length === 0) return rates;
+  if (allowed.length === 0) return live;
   const set = new Set(allowed);
-  return rates.filter((r) => {
+  return live.filter((r) => {
     const group = courierGroupOf(r.courier_code);
     return group ? set.has(group) : false;
   });
