@@ -20,6 +20,56 @@ export function isSupabaseConfigured(): boolean {
   return getConfig() !== null;
 }
 
+/**
+ * Bentuk kanonik sebuah email di seluruh aplikasi: dipangkas, huruf kecil.
+ *
+ * Nama domain memang tidak peka huruf besar/kecil, dan tidak ada penyedia email
+ * arus utama yang membedakan `Budi` dari `budi` di bagian lokalnya. Jadi satu
+ * alamat HARUS selalu bermuara ke SATU akun. Kalau tidak, `Budi@Gmail.com` dan
+ * `budi@gmail.com` hidup sebagai dua toko berbeda: pembayaran yang dikirim dengan
+ * ejaan yang satu tidak akan pernah menghidupkan akun yang lain, dan pemiliknya
+ * tidak punya jalan keluar sendiri karena nomor WhatsApp-nya sudah terpakai di
+ * akun pertama (`store_devices_phone_uidx` unik untuk seluruh sistem).
+ *
+ * Dipasang DI DALAM `getStoreByEmail`/`upsertStore`, bukan cuma dititipkan ke
+ * route, supaya tetap benar walau ada jalur baru yang lupa memanggilnya.
+ */
+export function normalizeEmail(raw: unknown): string {
+  return String(raw ?? "").trim().toLowerCase();
+}
+
+/**
+ * Filter PostgREST untuk mencari satu email — dari yang paling tepat ke paling toleran.
+ *
+ * Langkah pertama `eq.` pada email ternormalisasi: memakai indeks, dan menjawab
+ * semua baris yang sudah dirapikan migrasi `set email = lower(email)`.
+ *
+ * Langkah kedua `ilike.` HANYA dicoba bila langkah pertama tidak menemukan apa
+ * pun — yaitu untuk baris lama yang masih memuat huruf besar di database yang
+ * belum dimigrasi. Setelah migrasi jalan, cabang ini tidak akan pernah menemukan
+ * apa pun lagi; biayanya satu query terindeks pada jalur "tidak ditemukan" saja
+ * (pendaftaran akun baru dan login dengan email asing).
+ *
+ * KENAPA `ilike` tidak dipakai sebagai langkah pertama: PostgREST mengubah `*` di
+ * dalam nilai like/ilike menjadi `%`, dan `%`/`_` diteruskan apa adanya sebagai
+ * wildcard SQL. Pola email di route mengizinkan `*`, dan `_` malah lazim di
+ * alamat sungguhan — tanpa pengamanan, `*@gmail.com` akan mencocoki BARIS TOKO
+ * SEMBARANG, cukup untuk mengirim OTP reset atau memproses checkout ke akun yang
+ * salah. Karena itu wildcard di-escape, dan nilai yang masih memuat `*` (PostgREST
+ * tidak bisa menyatakannya sebagai literal) tidak dicari lewat jalur ini.
+ */
+function emailFilters(column: string, email: string): string[] {
+  const clean = normalizeEmail(email);
+  if (!clean) return [];
+
+  const filters = [`${column}=eq.${encodeURIComponent(clean)}`];
+  if (!clean.includes("*")) {
+    const literal = clean.replace(/([\%_])/g, "\$1");
+    filters.push(`${column}=ilike.${encodeURIComponent(literal)}`);
+  }
+  return filters;
+}
+
 export interface StoreRecord {
   id?: string;
   email: string;
@@ -79,6 +129,19 @@ export interface StoreRecord {
   /** Anti-spam peringatan kuota: kapan & di persen berapa terakhir dikabari. */
   last_quota_alert_at?: string | null;
   last_quota_alert_pct?: number | null;
+  /**
+   * Anti-ulang pengingat masa aktif: AMBANG hari terakhir yang sudah dikabari
+   * (3 = H-3, 1 = H-1, 0 = hari-H atau sesudahnya) beserta waktunya.
+   *
+   * Yang disimpan ambangnya, bukan cuma waktunya — kalau tidak, cron harian akan
+   * mengirim pesan yang sama setiap hari. Waktunya dipakai untuk hal lain: kalau
+   * catatan ini lebih tua dari jendela pengingat tanggal akhir yang SEKARANG, ia
+   * milik periode sebelumnya dan diabaikan. Itulah yang membuat perpanjangan
+   * otomatis membuka kembali pengingat tanpa perlu disetel ulang dari jalur
+   * pembayaran — lihat `lib/notify.ts`.
+   */
+  last_expiry_alert_days?: number | null;
+  last_expiry_alert_at?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -361,7 +424,10 @@ export async function insertPendingOrder(order: OrderRecord): Promise<DbResult> 
  *    perpanjangan lebih awal tidak menghanguskan sisa hari yang sudah dibayar.
  */
 async function applyPaidOrderToStore(order: OrderRecord): Promise<DbResult<StoreRecord>> {
-  const email = (order.customer_email || "").trim();
+  // Normalisasi WAJIB di sini: inilah titik tempat pembayaran lunas diterapkan.
+  // Tanpa itu, checkout yang mengetik huruf berbeda dari saat mendaftar membuat
+  // baris toko KEDUA — uang masuk, akun lama tetap kedaluwarsa.
+  const email = normalizeEmail(order.customer_email);
   if (!email) return { ok: false, error: "order tanpa customer_email" };
 
   const existing = await getStoreByEmail(email);
@@ -461,19 +527,22 @@ export async function getStoreByEmail(email: string): Promise<StoreRecord | null
   const cfg = getConfig();
   if (!cfg) return null;
 
-  try {
-    const url = `${cfg.url}/rest/v1/stores?email=eq.${encodeURIComponent(email)}&limit=1`;
-    const res = await fetch(url, {
-      headers: headers(cfg.key, "return=representation"),
-      cache: "no-store"
-    });
+  for (const filter of emailFilters("email", email)) {
+    try {
+      const url = `${cfg.url}/rest/v1/stores?${filter}&limit=1`;
+      const res = await fetch(url, {
+        headers: headers(cfg.key, "return=representation"),
+        cache: "no-store"
+      });
 
-    if (!res.ok) return null;
-    const list = await res.json();
-    return Array.isArray(list) && list.length > 0 ? (list[0] as StoreRecord) : null;
-  } catch {
-    return null;
+      if (!res.ok) return null;
+      const list = await res.json();
+      if (Array.isArray(list) && list.length > 0) return list[0] as StoreRecord;
+    } catch {
+      return null;
+    }
   }
+  return null;
 }
 
 export async function getStoreByFonnteToken(token: string): Promise<StoreRecord | null> {
@@ -499,8 +568,14 @@ export async function upsertStore(store: Partial<StoreRecord> & { email: string 
   const cfg = getConfig();
   if (!cfg) return { ok: false, skipped: true };
 
+  // Email selalu DITULIS dalam bentuk kanonik — termasuk saat memperbarui baris
+  // lama, jadi setiap toko yang dipakai ikut dirapikan sendiri tanpa menunggu
+  // migrasi dijalankan.
+  const payload = { ...store, email: normalizeEmail(store.email) };
+  if (!payload.email) return { ok: false, error: "upsertStore tanpa email" };
+
   try {
-    const existing = await getStoreByEmail(store.email);
+    const existing = await getStoreByEmail(payload.email);
     let res: Response;
 
     if (existing && existing.id) {
@@ -509,7 +584,7 @@ export async function upsertStore(store: Partial<StoreRecord> & { email: string 
       res = await fetch(url, {
         method: "PATCH",
         headers: headers(cfg.key, "return=representation"),
-        body: JSON.stringify({ ...store, updated_at: new Date().toISOString() }),
+        body: JSON.stringify({ ...payload, updated_at: new Date().toISOString() }),
         cache: "no-store"
       });
     } else {
@@ -517,7 +592,7 @@ export async function upsertStore(store: Partial<StoreRecord> & { email: string 
       res = await fetch(`${cfg.url}/rest/v1/stores`, {
         method: "POST",
         headers: headers(cfg.key, "return=representation"),
-        body: JSON.stringify(store),
+        body: JSON.stringify(payload),
         cache: "no-store"
       });
     }
@@ -1629,20 +1704,25 @@ export async function getStoreAuthMeta(
   email: string
 ): Promise<{ password_changed_at: string | null } | null | undefined> {
   const cfg = getConfig();
-  if (!cfg || !email) return undefined;
+  const filters = emailFilters("email", email);
+  if (!cfg || filters.length === 0) return undefined;
 
-  try {
-    const url =
-      `${cfg.url}/rest/v1/stores?email=eq.${encodeURIComponent(email)}` +
-      `&select=password_changed_at&limit=1`;
-    const res = await fetch(url, { headers: headers(cfg.key, "return=representation"), cache: "no-store" });
-    if (!res.ok) return undefined;
-    const list = await res.json();
-    if (!Array.isArray(list) || list.length === 0) return null;
-    return { password_changed_at: list[0]?.password_changed_at ?? null };
-  } catch {
-    return undefined;
+  for (const filter of filters) {
+    try {
+      const url =
+        `${cfg.url}/rest/v1/stores?${filter}` +
+        `&select=password_changed_at&limit=1`;
+      const res = await fetch(url, { headers: headers(cfg.key, "return=representation"), cache: "no-store" });
+      if (!res.ok) return undefined;
+      const list = await res.json();
+      if (Array.isArray(list) && list.length > 0) {
+        return { password_changed_at: list[0]?.password_changed_at ?? null };
+      }
+    } catch {
+      return undefined;
+    }
   }
+  return null;
 }
 
 // ---------------- PESANAN PEMBELI (buyer_orders) ----------------
@@ -1958,18 +2038,24 @@ export function toPublicMember(m: StoreMemberRecord): PublicStoreMember {
  */
 export async function getStoreMemberByEmail(email: string): Promise<StoreMemberRecord | null> {
   const cfg = getConfig();
-  const clean = (email || "").trim().toLowerCase();
-  if (!cfg || !clean) return null;
+  if (!cfg) return null;
 
-  try {
-    const url = `${cfg.url}/rest/v1/store_members?email=ilike.${encodeURIComponent(clean)}&limit=1`;
-    const res = await fetch(url, { headers: headers(cfg.key), cache: "no-store" });
-    if (!res.ok) return null;
-    const list = await res.json();
-    return Array.isArray(list) && list.length > 0 ? (list[0] as StoreMemberRecord) : null;
-  } catch {
-    return null;
+  // Lewat `emailFilters`, bukan `ilike` telanjang: `insertStoreMember` sudah
+  // menyimpan email huruf kecil dan indeksnya `lower(email)`, jadi `eq.` memang
+  // sudah tepat — sekaligus menutup celah wildcard `_`/`%`/`*` yang dibawa
+  // `ilike` mentah (alasan lengkapnya di `emailFilters`).
+  for (const filter of emailFilters("email", email)) {
+    try {
+      const url = `${cfg.url}/rest/v1/store_members?${filter}&limit=1`;
+      const res = await fetch(url, { headers: headers(cfg.key), cache: "no-store" });
+      if (!res.ok) return null;
+      const list = await res.json();
+      if (Array.isArray(list) && list.length > 0) return list[0] as StoreMemberRecord;
+    } catch {
+      return null;
+    }
   }
+  return null;
 }
 
 export async function listStoreMembers(storeId: string): Promise<StoreMemberRecord[] | null> {
@@ -2041,6 +2127,53 @@ export async function deleteStoreMember(id: string, storeId: string): Promise<Db
       return { ok: false, error: `member delete ${res.status}: ${text}` };
     }
     return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Perbarui satu baris anggota tim — dibatasi pada `store_id` pemiliknya.
+ *
+ * `store_id` ikut jadi filter, bukan hanya `id`: tanpa itu satu UUID yang tertebak
+ * (atau tertukar) bisa mengubah kredensial anggota tim toko LAIN. Sama seperti
+ * `deleteStoreMember`.
+ *
+ * Dipakai untuk menyetel ulang kata sandi anggota oleh pemilik toko. Kolom
+ * `password_changed_at` inilah yang membuat penyetelan itu mencabut sesi anggota
+ * tersebut — `getSessionActor()` menolak token yang terbit sebelum waktu itu.
+ */
+export async function updateStoreMember(
+  id: string,
+  storeId: string,
+  patch: Partial<Pick<StoreMemberRecord, "password_hash" | "role" | "password_changed_at">>
+): Promise<DbResult<StoreMemberRecord> & { notFound?: boolean }> {
+  const cfg = getConfig();
+  if (!cfg || !id || !storeId) return { ok: false, skipped: true };
+
+  try {
+    const url =
+      `${cfg.url}/rest/v1/store_members?id=eq.${encodeURIComponent(id)}` +
+      `&store_id=eq.${encodeURIComponent(storeId)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=representation"),
+      body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
+      cache: "no-store"
+    });
+
+    if (!res.ok) {
+      if (isMissingSchema(res.status)) return { ok: false, skipped: true };
+      const text = await res.text().catch(() => "");
+      return { ok: false, error: `member update ${res.status}: ${text}` };
+    }
+
+    const data = await res.json();
+    const row = Array.isArray(data) ? data[0] : data;
+    // PATCH yang tidak mengenai baris apa pun tetap 200 dengan array kosong —
+    // itu berarti anggotanya bukan milik toko ini (atau sudah dihapus).
+    if (!row) return { ok: false, notFound: true, error: "Anggota tidak ditemukan." };
+    return { ok: true, data: row as StoreMemberRecord };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
@@ -2120,3 +2253,108 @@ export async function noteQuotaAlert(storeId: string, pct: number): Promise<void
   }
 }
 
+
+/**
+ * Kolom yang dibaca cron pengingat masa aktif.
+ *
+ * Disebut satu per satu, BUKAN `select=*`: kalau migrasi kolom anti-ulang belum
+ * dijalankan, permintaan ini gagal dengan jelas di sini. Dengan `select=*` kolom
+ * itu hanya "tidak ada" — dan cron akan mengirim pengingat yang sama setiap hari
+ * karena penanda "sudah dikabari" tidak pernah bisa dibaca maupun ditulis.
+ */
+const EXPIRY_SELECT_COLUMNS = [
+  "id",
+  "email",
+  "store_name",
+  "customer_name",
+  "customer_phone",
+  "alert_phone",
+  "notify_enabled",
+  "package_id",
+  "is_paid",
+  "trial_ends_at",
+  "subscription_ends_at",
+  "last_expiry_alert_days",
+  "last_expiry_alert_at"
+].join(",");
+
+/**
+ * Toko yang tanggal akhir masa aktifnya jatuh di dalam rentang `fromIso..toIso`.
+ *
+ * Dua tanggal diperiksa sekaligus karena keduanya bisa menjadi batas hidup sebuah
+ * toko: `trial_ends_at` untuk akun yang belum pernah bayar, `subscription_ends_at`
+ * untuk yang sudah. Penyaringan ambang yang sebenarnya (H-3 / H-1 / hari-H)
+ * dikerjakan pemanggil dengan `daysUntil`, jadi rentang di sini sengaja dilebihkan
+ * supaya pembulatan hari tidak pernah menjatuhkan toko yang seharusnya masuk.
+ */
+export async function listStoresNearExpiry(params: {
+  fromIso: string;
+  toIso: string;
+  limit?: number;
+}): Promise<
+  { ok: true; stores: StoreRecord[] } | { ok: false; needsMigration: boolean; error: string }
+> {
+  const cfg = getConfig();
+  if (!cfg) {
+    return { ok: false, needsMigration: false, error: "Supabase belum dikonfigurasi." };
+  }
+
+  const from = encodeURIComponent(params.fromIso);
+  const to = encodeURIComponent(params.toIso);
+  const limit = Math.max(1, Math.min(params.limit || 500, 1000));
+
+  const or =
+    `or=(and(trial_ends_at.gte.${from},trial_ends_at.lte.${to}),` +
+    `and(subscription_ends_at.gte.${from},subscription_ends_at.lte.${to}))`;
+
+  try {
+    const res = await fetch(
+      `${cfg.url}/rest/v1/stores?select=${EXPIRY_SELECT_COLUMNS}&${or}` +
+        `&order=updated_at.asc&limit=${limit}`,
+      { headers: headers(cfg.key), cache: "no-store" }
+    );
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      // Tabel `stores` sudah pasti ada (seluruh aplikasi memakainya), jadi 400 di
+      // sini praktis selalu berarti kolom anti-ulangnya yang belum dibuat.
+      const needsMigration = res.status === 400 && text.includes("last_expiry_alert");
+      return { ok: false, needsMigration, error: `stores expiry ${res.status}: ${text}` };
+    }
+
+    const data = await res.json();
+    return { ok: true, stores: Array.isArray(data) ? (data as StoreRecord[]) : [] };
+  } catch (err) {
+    return { ok: false, needsMigration: false, error: String(err) };
+  }
+}
+
+/**
+ * Catat bahwa pengingat masa aktif pada ambang `days` sudah dikirim.
+ *
+ * Dicatat walau pengirimannya GAGAL — pola yang sama dengan `noteDeviceAlert`.
+ * Kalau tidak, toko yang nomor WhatsApp-nya bermasalah akan dicoba lagi setiap
+ * hari sampai masa aktifnya benar-benar habis.
+ *
+ * Mengembalikan `false` bila pencatatannya sendiri gagal: itu berarti anti-ulang
+ * tidak berfungsi dan cron besok akan mengirim pesan yang sama, jadi pemanggil
+ * perlu menyuarakannya, bukan menelannya.
+ */
+export async function noteExpiryAlert(storeId: string, days: number): Promise<boolean> {
+  const cfg = getConfig();
+  if (!cfg || !storeId) return false;
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/stores?id=eq.${encodeURIComponent(storeId)}`, {
+      method: "PATCH",
+      headers: headers(cfg.key, "return=minimal"),
+      body: JSON.stringify({
+        last_expiry_alert_at: new Date().toISOString(),
+        last_expiry_alert_days: Math.round(days)
+      }),
+      cache: "no-store"
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

@@ -1,6 +1,12 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-import { bumpRateLimit, getPrimaryStoreDevice, getStoreByEmail, upsertStore } from "@/lib/supabase";
+import {
+  bumpRateLimit,
+  getPrimaryStoreDevice,
+  getStoreByEmail,
+  normalizeEmail,
+  upsertStore
+} from "@/lib/supabase";
 import { hashPassword } from "@/lib/auth";
 import { sendFonnteMessage } from "@/lib/fonnte";
 
@@ -22,14 +28,22 @@ function clientIp(req: Request): string {
 }
 
 /**
- * Minta OTP reset password. OTP dikirim via WhatsApp ke nomor terdaftar toko
- * memakai DEVICE token milik toko itu sendiri (store.fonnte_token) — device yang
- * sebelumnya dibuat dari Account Token SaaS saat toko menghubungkan WhatsApp.
+ * Minta OTP reset password. OTP dikirim via WhatsApp ke nomor terdaftar toko.
  *
- * Tidak ada device token pengirim global di ENV: setiap toko mengirim OTP-nya
- * lewat device WhatsApp-nya sendiri (cocok untuk model SaaS multi-tenant).
- * Konsekuensinya, reset via WhatsApp hanya tersedia bila toko sudah pernah
- * menghubungkan device WhatsApp-nya.
+ * PENGIRIM: device WhatsApp milik toko itu sendiri bila ada, dan `FONNTE_TOKEN`
+ * (account token SaaS) sebagai CADANGAN bila tidak.
+ *
+ * Cadangan itu bukan kenyamanan, tapi satu-satunya jalan pulih untuk dua keadaan
+ * yang justru paling sering terjadi: user yang baru mendaftar trial dan belum
+ * menyambungkan WhatsApp sama sekali, dan pemilik toko yang device-nya TERPUTUS —
+ * tepat saat dia paling butuh masuk ke dashboard untuk menyambungkannya lagi.
+ * Tanpa cadangan ini, kedua keadaan itu tidak punya kanal pemulihan apa pun
+ * (tidak ada SMTP/email di aplikasi ini) dan akunnya terkunci permanen.
+ *
+ * Ini TIDAK melanggar aturan di `lib/reply-engine.ts`, yang melarang membalas
+ * pembeli lewat account token: larangan itu ada karena balasan pembeli bisa
+ * keluar dari nomor toko lain. OTP dikirim ke nomor MILIK akun itu sendiri
+ * (`stores.customer_phone`), jadi tidak ada percampuran identitas antar-toko.
  *
  * Respons SELALU generik & IDENTIK, apa pun yang terjadi di belakang: tidak ada
  * petunjuk nomor, tidak ada perbedaan pesan, dan jalur "email tidak ada" tidak
@@ -44,12 +58,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Body tidak valid." }, { status: 400 });
   }
 
-  const email = (body.email || "").trim();
+  const email = normalizeEmail(body.email);
   const GENERIC = {
     success: true,
     message:
-      "Jika email terdaftar dan WhatsApp-nya sudah terhubung, kode OTP telah dikirim " +
-      "ke nomor WhatsApp yang terdaftar pada akun tersebut.",
+      "Jika email terdaftar, kode OTP telah dikirim ke nomor WhatsApp yang " +
+      "terdaftar pada akun tersebut.",
   };
 
   if (!email) {
@@ -69,7 +83,7 @@ export async function POST(req: Request) {
   // Batas per email: mencegah satu akun dibanjiri OTP (biaya kirim WA + gangguan
   // ke pemilik toko). Dijalankan sebelum lookup, jadi tidak membocorkan apa pun.
   const byEmail = await bumpRateLimit(
-    `reset-req:email:${email.toLowerCase()}`,
+    `reset-req:email:${email}`,
     HOUR_SECONDS,
     REQUEST_MAX_PER_HOUR
   );
@@ -81,22 +95,30 @@ export async function POST(req: Request) {
 
   const store = await getStoreByEmail(email);
 
-  // OTP dikirim lewat device UTAMA toko. `store.fonnte_token` dipakai sebagai
-  // cadangan karena kolom itu adalah cermin device utama (dan satu-satunya sumber
-  // pada data yang belum termigrasi ke `store_devices`).
+  // Pengirim pilihan pertama: device UTAMA toko. `store.fonnte_token` dipakai
+  // sebagai cadangan karena kolom itu adalah cermin device utama (dan satu-satunya
+  // sumber pada data yang belum termigrasi ke `store_devices`).
+  //
+  // Boleh kosong. `sendFonnteMessage` akan jatuh ke `FONNTE_TOKEN` bila token
+  // yang diberikan kosong — lihat alasannya di docblock route ini.
   const primaryToken = store
     ? (await getPrimaryStoreDevice(store))?.fonnte_token || store.fonnte_token || ""
     : "";
 
-  // Tidak ada akun / belum menghubungkan device WhatsApp → tetap balas generik
-  // (anti-enumerasi). Tanpa device token milik toko, OTP tidak bisa dikirim.
-  if (!store || !store.customer_phone || !primaryToken) {
-    if (store && !primaryToken) {
-      console.warn(
-        "[reset] Toko belum menghubungkan WhatsApp — OTP tidak dapat dikirim."
-      );
-    }
+  // Yang tersisa sebagai syarat MUTLAK hanyalah: akunnya ada, dan ada nomor
+  // tujuan. Tidak ada nomor terdaftar = tidak ada tempat mengirim OTP, dan
+  // jawabannya tetap generik supaya email yang terdaftar tidak bisa dipetakan
+  // dengan menembak satu-satu (anti-enumerasi).
+  if (!store || !store.customer_phone) {
     return NextResponse.json(GENERIC);
+  }
+
+  if (!primaryToken) {
+    // Bukan kegagalan — hanya jalur cadangan. Dicatat supaya terlihat di log kalau
+    // `FONNTE_TOKEN` ternyata juga kosong dan OTP tidak pernah terkirim.
+    console.warn(
+      "[reset] Toko belum menghubungkan WhatsApp — OTP dikirim lewat FONNTE_TOKEN."
+    );
   }
 
   // Buat OTP 6 digit, simpan hash-nya (bukan OTP mentah) + kedaluwarsa.
@@ -112,7 +134,8 @@ export async function POST(req: Request) {
     reset_otp_attempts: 0,
   });
 
-  // Kirim OTP lewat device WhatsApp milik toko itu sendiri, ke nomor terdaftarnya.
+  // Kirim ke nomor terdaftar akun ini — lewat device toko bila ada, lewat account
+  // token bila tidak (`token` kosong = fallback di dalam `sendFonnteMessage`).
   const message =
     `🔐 Kode reset kata sandi BalesToko.ai Anda: *${otp}*\n\n` +
     `Berlaku ${OTP_TTL_MINUTES} menit. Jangan bagikan kode ini kepada siapa pun. ` +
@@ -123,7 +146,7 @@ export async function POST(req: Request) {
     token: primaryToken,
   });
   if (!sent.success) {
-    console.warn("[reset] Gagal mengirim OTP via device toko:", sent.error);
+    console.warn("[reset] Gagal mengirim OTP:", sent.error);
   }
 
   return NextResponse.json(GENERIC);

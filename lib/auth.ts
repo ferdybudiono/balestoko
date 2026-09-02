@@ -9,48 +9,69 @@
 import crypto from "crypto";
 import { cookies } from "next/headers";
 import { getStoreAuthMeta, getStoreMemberByEmail } from "@/lib/supabase";
+import {
+  DEV_SESSION_SECRET,
+  SESSION_COOKIE,
+  SESSION_TTL_SECONDS,
+  resolveSessionSecret
+} from "@/lib/session-constants";
 
-export const SESSION_COOKIE = "bt_session";
-const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 hari
+// Nama cookie & umur sesi tinggal di `lib/session-constants.ts` supaya Edge
+// middleware memakai nilai yang SAMA, bukan salinan yang bisa melenceng.
+// Diekspor ulang di sini karena route yang sudah ada mengimpornya dari modul ini.
+export { SESSION_COOKIE };
 
 let warnedAuthSecretFallback = false;
 
 /**
  * Kunci HMAC penanda tangan sesi.
  *
- * Urutan resolusi ini HARUS sama dengan yang ada di `middleware.ts`, kalau
- * berbeda cookie yang diterbitkan di sini akan ditolak middleware.
+ * Urutan resolusinya ada di `resolveSessionSecret()` — satu tempat, dipakai
+ * bersama `middleware.ts`. Yang berbeda di sini hanyalah reaksi terhadap
+ * "tidak ada rahasia": melempar di produksi, karena menerbitkan cookie dengan
+ * kunci yang ada di dalam repo sama dengan tidak menandatanganinya sama sekali.
  */
 function getSecret(): string {
-  const explicit = process.env.AUTH_SECRET;
-  if (explicit) return explicit;
+  const secret = resolveSessionSecret();
 
-  // Fallback ke service role key dipertahankan agar sesi yang sudah terbit
-  // tidak langsung batal. Bukan praktik yang baik: merotasi kunci database
-  // ikut memaksa semua user login ulang, dan satu rahasia dipakai dua tujuan.
-  const fallback = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (fallback) {
-    if (!warnedAuthSecretFallback) {
+  if (secret) {
+    if (!process.env.AUTH_SECRET && !warnedAuthSecretFallback) {
       warnedAuthSecretFallback = true;
       console.warn(
         "[auth] AUTH_SECRET belum di-set — memakai SUPABASE_SERVICE_ROLE_KEY sebagai kunci HMAC. " +
           "Set AUTH_SECRET agar rotasi kunci database tidak membatalkan seluruh sesi login."
       );
     }
-    return fallback;
+    return secret;
   }
 
-  // Konstanta di bawah ada di dalam repo publik: siapa pun bisa memalsukan
-  // cookie sesi untuk email mana pun. Hanya boleh dipakai saat development.
   if (process.env.NODE_ENV === "production") {
     throw new Error(
       "AUTH_SECRET (atau SUPABASE_SERVICE_ROLE_KEY) wajib di-set di produksi untuk menandatangani sesi login."
     );
   }
-  return "dev-insecure-secret-change-me";
+  return DEV_SESSION_SECRET;
 }
 
 // ---------------- PASSWORD ----------------
+
+/**
+ * Nilai yang harus DITULIS ke `password_changed_at` setiap kali kata sandi berubah.
+ *
+ * Sengaja SATU DETIK di masa lalu, dan itu bukan kecerobohan. Pencabutan sesi
+ * memakai perbandingan `payload.iat <= changedSec` (lihat `getSessionActor`), dan
+ * `iat` sebuah token hanya punya presisi detik. Kalau `password_changed_at`
+ * ditulis "sekarang", cookie baru yang diterbitkan pada detik yang SAMA akan
+ * memenuhi `iat === changedSec` — jadi user yang baru saja berhasil mengganti
+ * kata sandinya langsung dikeluarkan dari sesinya sendiri.
+ *
+ * Menggeser satu detik ke belakang membuat `iat` token baru selalu lebih besar,
+ * tanpa melonggarkan pencabutan: token lama yang terbit pada detik yang sama
+ * dengan perubahan tetap ditolak.
+ */
+export function passwordChangedAt(): string {
+  return new Date(Date.now() - 1000).toISOString();
+}
 
 /** Hash password → format: scrypt$<saltHex>$<hashHex> */
 export function hashPassword(password: string): string {

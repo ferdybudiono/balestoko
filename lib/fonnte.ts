@@ -6,7 +6,19 @@
 export interface FonnteSendOptions {
   target: string; // Nomor WhatsApp penerima (misal: "081234567890" atau "6281234567890")
   message: string;
-  token: string; // Fonnte Device Token
+  /**
+   * Fonnte DEVICE token — nomor mana yang mengirim.
+   *
+   * Sengaja WAJIB (bukan opsional) meski string kosong diterima: setiap pemanggil
+   * harus memutuskan sadar nomor siapa yang dipakai. String kosong berarti
+   * "pakai account token `FONNTE_TOKEN`", dan itu HANYA boleh untuk pesan tingkat
+   * sistem kepada pemilik akun sendiri (OTP reset, pengingat masa aktif).
+   *
+   * Untuk BALASAN PEMBELI token toko wajib ada dan tidak boleh kosong — lihat
+   * `lib/reply-engine.ts`: balasan yang keluar dari nomor toko lain adalah
+   * kebocoran identitas antar-tenant.
+   */
+  token: string;
   /**
    * URL gambar yang dilampirkan (foto produk).
    *

@@ -6,7 +6,9 @@ import {
   getStoreMemberByEmail,
   insertStoreMember,
   listStoreMembers,
+  normalizeEmail,
   toPublicMember,
+  updateStoreMember,
   type StoreRecord
 } from "@/lib/supabase";
 
@@ -18,6 +20,7 @@ export const dynamic = "force-dynamic";
  *
  *   GET    → daftar anggota
  *   POST   { email, password, role? }
+ *   PATCH  ?id=<uuid>  { password }   → setel ulang kata sandi anggota
  *   DELETE ?id=<uuid>
  *
  * Yang dipecahkan: sebelumnya satu toko punya satu kata sandi. Pegawai yang ikut
@@ -83,7 +86,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Gagal membaca body request." }, { status: 400 });
   }
 
-  const email = String(body.email || "").trim().toLowerCase();
+  const email = normalizeEmail(body.email);
   const password = String(body.password || "");
   const role = body.role === "admin" ? "admin" : "staff";
 
@@ -99,7 +102,7 @@ export async function POST(req: Request) {
 
   // Email yang sama dengan akun pemilik akan membuat login ambigu: jalur pemilik
   // dicoba lebih dulu, jadi anggota ini tidak akan pernah bisa masuk.
-  if (email === (store.email || "").trim().toLowerCase()) {
+  if (email === normalizeEmail(store.email)) {
     return NextResponse.json(
       { error: "Email ini sudah dipakai akun pemilik toko." },
       { status: 409 }
@@ -154,6 +157,79 @@ export async function POST(req: Request) {
   }
 
   return NextResponse.json({ success: true, member: toPublicMember(res.data) });
+}
+
+/**
+ * Setel ulang kata sandi satu anggota tim (hanya pemilik toko).
+ *
+ * Ini satu-satunya jalan pemulihan yang dipunyai anggota tim. Jalur OTP di
+ * `/api/auth/reset/*` bekerja pada baris `stores` dan mengirim kodenya ke nomor
+ * WhatsApp toko, jadi anggota yang lupa kata sandinya sebelum ini tidak punya
+ * pilihan selain dihapus lalu dibuat ulang — kehilangan peran dan riwayat
+ * `last_login_at`-nya, dan sempat menghapus akses orang yang masih bekerja.
+ *
+ * `password_changed_at` wajib ikut ditulis. Kolomnya sudah ada di skema dan sudah
+ * diperiksa `getSessionActor()`, tapi tidak pernah ditulis siapa pun — artinya
+ * mengganti kata sandi anggota TIDAK memutus sesinya yang sedang berjalan. Dengan
+ * kolom itu terisi, cookie yang terbit sebelum penyetelan langsung ditolak.
+ */
+export async function PATCH(req: Request) {
+  const auth = await requireOwner();
+  if (!auth.ok) return auth.res;
+
+  const id = (new URL(req.url).searchParams.get("id") || "").trim();
+  if (!id) {
+    return NextResponse.json({ error: "Id anggota wajib diisi." }, { status: 400 });
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await req.json()) as Record<string, unknown>;
+  } catch {
+    return NextResponse.json({ error: "Gagal membaca body request." }, { status: 400 });
+  }
+
+  const password = String(body.password || "");
+  if (password.length < MIN_PASSWORD) {
+    return NextResponse.json(
+      { error: `Kata sandi minimal ${MIN_PASSWORD} karakter.` },
+      { status: 400 }
+    );
+  }
+
+  // Waktu apa adanya, BUKAN `passwordChangedAt()` dari `lib/auth.ts`. Helper itu
+  // menggeser waktu 1 detik ke belakang supaya orang yang mengganti kata sandinya
+  // sendiri tidak ikut terlempar dari sesinya; di sini yang menyetel adalah pemilik
+  // toko dan tidak ada cookie anggota yang perlu diselamatkan, jadi pencabutannya
+  // dibuat seketat mungkin.
+  const changedAt = new Date().toISOString();
+
+  // `storeId` ikut disaring di dalam query, jadi id anggota toko LAIN tidak bisa
+  // disetel dari sini walaupun UUID-nya diketahui.
+  const res = await updateStoreMember(id, auth.storeId, {
+    password_hash: hashPassword(password),
+    password_changed_at: changedAt
+  });
+
+  if (!res.ok || !res.data) {
+    if (res.skipped) {
+      return NextResponse.json(
+        { error: "Fitur anggota tim belum aktif di database. Jalankan supabase/schema.sql versi terbaru." },
+        { status: 409 }
+      );
+    }
+    if (res.notFound) {
+      return NextResponse.json({ error: "Anggota tidak ditemukan." }, { status: 404 });
+    }
+    console.error("[members] gagal menyetel kata sandi anggota:", res.error);
+    return NextResponse.json({ error: "Gagal menyetel kata sandi anggota." }, { status: 500 });
+  }
+
+  return NextResponse.json({
+    success: true,
+    member: toPublicMember(res.data),
+    message: "Kata sandi anggota diperbarui. Sesi lamanya sudah dikeluarkan."
+  });
 }
 
 export async function DELETE(req: Request) {

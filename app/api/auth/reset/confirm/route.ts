@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { bumpRateLimit, getStoreByEmail, upsertStore } from "@/lib/supabase";
-import { hashPassword, verifyPassword } from "@/lib/auth";
+import { bumpRateLimit, getStoreByEmail, normalizeEmail, upsertStore } from "@/lib/supabase";
+import { hashPassword, passwordChangedAt, verifyPassword } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,7 +35,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Body tidak valid." }, { status: 400 });
   }
 
-  const email = (body.email || "").trim();
+  const email = normalizeEmail(body.email);
   const otp = (body.otp || "").trim();
   const newPassword = body.newPassword || "";
 
@@ -96,7 +96,7 @@ export async function POST(req: Request) {
   const result = await upsertStore({
     email,
     password_hash: hashPassword(newPassword),
-    password_changed_at: new Date().toISOString(),
+    password_changed_at: passwordChangedAt(),
     reset_otp_hash: null,
     reset_otp_expires: null,
     reset_otp_attempts: 0,

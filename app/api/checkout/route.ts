@@ -2,7 +2,8 @@ import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { getPlan, isPackageId } from "@/lib/packages";
 import { createSnapTransaction } from "@/lib/midtrans";
-import { insertPendingOrder, getStoreByEmail } from "@/lib/supabase";
+import { insertPendingOrder, getStoreByEmail, normalizeEmail } from "@/lib/supabase";
+import { formatFonntePhone } from "@/lib/fonnte";
 import { hashPassword, getSessionEmail } from "@/lib/auth";
 import { validateCouponForPlan, applyDiscount } from "@/lib/coupons";
 import { resolveCallbackBaseUrl } from "@/lib/webhook-url";
@@ -23,14 +24,6 @@ interface CheckoutBody {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** Normalisasi nomor WA Indonesia: 08xx / +62 / 62 -> 62xxxx */
-function normalizePhone(raw: string): string {
-  let p = raw.replace(/[^\d+]/g, "");
-  if (p.startsWith("+")) p = p.slice(1);
-  if (p.startsWith("0")) p = "62" + p.slice(1);
-  if (!p.startsWith("62")) p = "62" + p;
-  return p;
-}
 
 /** order_id unik & mudah dilacak: ORDER-PRO-1733650000000-a1b2c3 */
 function generateOrderId(packageId: string): string {
@@ -83,7 +76,12 @@ export async function POST(req: Request) {
     );
   }
 
-  const cleanEmail = email.trim();
+  // Titik masuk JALUR UANG. Normalisasi di sini yang menentukan apakah pembayaran
+  // mendarat di akun yang sudah ada atau membuat toko kedua: `getStoreByEmail` di
+  // bawah dan `applyPaidOrderToStore` (saat webhook Midtrans melunasi order) harus
+  // melihat email yang sama persis, dan `customer_email` order ikut disimpan
+  // ternormalisasi supaya keduanya tidak bisa melenceng.
+  const cleanEmail = normalizeEmail(email);
 
   // ---- Akun baru atau perpanjangan? ----
   //
@@ -97,7 +95,7 @@ export async function POST(req: Request) {
 
   if (isRenewal) {
     const sessionEmail = await getSessionEmail();
-    if (sessionEmail?.toLowerCase() !== cleanEmail.toLowerCase()) {
+    if (normalizeEmail(sessionEmail) !== cleanEmail) {
       return NextResponse.json(
         {
           error:
@@ -157,7 +155,11 @@ export async function POST(req: Request) {
 
   const cleanName = name.trim();
   const [firstName, ...rest] = cleanName.split(/\s+/);
-  const phone = normalizePhone(whatsapp);
+  // `formatFonntePhone` (lib/fonnte.ts) melakukan normalisasi yang sama persis dan
+  // dipakai jalur pendaftaran trial. Satu fungsi untuk satu aturan: kalau formatnya
+  // pernah berubah di satu tempat saja, nomor pemilik toko yang sama bisa tersimpan
+  // dalam dua bentuk berbeda antara order dan akunnya.
+  const phone = formatFonntePhone(whatsapp);
 
   // Pembeli pulang ke domain yang BENAR-BENAR dia pakai (aplikasi ini dilayani
   // di beberapa domain, dan cookie sesi terikat host — dilempar ke domain lain

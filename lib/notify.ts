@@ -2,25 +2,36 @@
  * Pemberitahuan keluar untuk PEMILIK toko (bukan untuk pembeli).
  *
  * Semua kabar penting aplikasi ini sebelumnya hanya muncul di dashboard, yang
- * artinya baru diketahui saat pemilik toko membukanya. Tiga kejadian tidak boleh
+ * artinya baru diketahui saat pemilik toko membukanya. Empat kejadian tidak boleh
  * menunggu selama itu:
  *
  *   • nomor WhatsApp terputus  → bot berhenti membalas SEMUA pembeli;
  *   • kuota percakapan hampir habis → pembeli berikutnya tidak akan dijawab;
- *   • pesanan baru masuk → uang menunggu diproses.
+ *   • pesanan baru masuk → uang menunggu diproses;
+ *   • masa uji coba / langganan akan berakhir → bot akan berhenti total.
  *
  * Semuanya dikirim lewat WhatsApp memakai device toko itu sendiri. Konsekuensinya
  * disengaja: kabar "nomor terputus" hanya bisa terkirim bila masih ada nomor LAIN
  * yang tersambung. Toko satu-nomor yang nomornya mati memang tidak punya jalur
  * keluar — dan itu lebih baik daripada memakai token akun bersama, yang berarti
  * pesan pemilik toko A keluar dari nomor toko B.
+ *
+ * SATU pengecualian: pengingat masa aktif (`notifyExpiryReminder`) boleh memakai
+ * account token `FONNTE_TOKEN` lewat `allowAccountToken`. Alasannya, penerimanya
+ * justru sebagian besar TIDAK punya device tersambung — akun uji coba yang belum
+ * pernah scan QR adalah audiens utamanya — jadi aturan di atas akan membuat
+ * pengingat ini tidak pernah sampai ke siapa pun yang paling membutuhkannya.
+ * Isinya pun murni tentang akun penerima sendiri, tidak membawa identitas toko
+ * lain seperti balasan pembeli.
  */
 
 import { sendFonnteMessage } from "@/lib/fonnte";
+import { daysUntil } from "@/lib/packages";
 import {
   clearDeviceAlert,
   listStoreDevices,
   noteDeviceAlert,
+  noteExpiryAlert,
   noteQuotaAlert,
   type StoreDeviceRecord,
   type StoreRecord
@@ -67,8 +78,14 @@ async function notifyOwner(params: {
   /** Jangan kirim lewat device ini (dipakai saat device itulah yang bermasalah). */
   excludeDeviceId?: string | null;
   devices?: StoreDeviceRecord[];
+  /**
+   * Boleh jatuh ke account token `FONNTE_TOKEN` bila toko ini tidak punya satu pun
+   * nomor tersambung. HANYA untuk kabar yang isinya murni soal akun penerima —
+   * lihat catatan di kepala berkas ini dan di `FonnteSendOptions.token`.
+   */
+  allowAccountToken?: boolean;
 }): Promise<boolean> {
-  const { store, text, excludeDeviceId, devices } = params;
+  const { store, text, excludeDeviceId, devices, allowAccountToken } = params;
 
   if (store.notify_enabled === false) return false;
 
@@ -78,9 +95,11 @@ async function notifyOwner(params: {
   try {
     const list = devices || (await listStoreDevices(store.id || ""));
     const sender = senderDevice(list, excludeDeviceId);
-    if (!sender?.fonnte_token) return false;
+    const token = (sender?.fonnte_token || "").trim();
+    if (!token && !allowAccountToken) return false;
 
-    const sent = await sendFonnteMessage({ target, message: text, token: sender.fonnte_token });
+    // `token: ""` berarti "pakai FONNTE_TOKEN" di `sendFonnteMessage`.
+    const sent = await sendFonnteMessage({ target, message: text, token });
     if (!sent.success) console.warn("[notify] kabar ke pemilik toko gagal:", sent.error);
     return sent.success;
   } catch (err) {
@@ -220,4 +239,155 @@ export async function notifyNewOrder(params: {
       `${city ? `Tujuan: ${city}\n` : ""}` +
       `\nBuka dashboard → tab Pesanan untuk memprosesnya.`
   });
+}
+
+/** Ambang pengingat masa aktif (hari tersisa), dari yang paling mendesak. */
+const EXPIRY_STEPS = [0, 1, 3];
+
+/** Ambang paling awal: H-3. Juga lebar jendela "catatan ini milik periode ini". */
+const EXPIRY_FIRST_STEP = 3;
+
+/** Sampai berapa hari SESUDAH tanggal akhir pengingat masih dikirim. */
+const EXPIRY_PAST_GRACE_DAYS = 2;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Rentang tanggal akhir yang perlu diambil dari database untuk satu putaran cron.
+ *
+ * Dilebihkan sehari di kedua ujung dari ambang sebenarnya: `daysUntil` membulatkan
+ * ke atas, dan jadwal cron bisa bergeser beberapa jam. Penyaringan tepatnya tetap
+ * di `notifyExpiryReminder`, jadi kelebihan di sini tidak pernah menghasilkan
+ * pesan tambahan — hanya beberapa baris ekstra yang lalu dilewati.
+ */
+export function expiryReminderWindow(nowMs: number = Date.now()): {
+  fromIso: string;
+  toIso: string;
+} {
+  return {
+    fromIso: new Date(nowMs - (EXPIRY_PAST_GRACE_DAYS + 1) * DAY_MS).toISOString(),
+    toIso: new Date(nowMs + (EXPIRY_FIRST_STEP + 1) * DAY_MS).toISOString()
+  };
+}
+
+export interface ExpiryReminderOutcome {
+  /** Pesan benar-benar terkirim. */
+  sent: boolean;
+  /** Ambang yang diproses; `null` bila toko ini belum waktunya dikabari. */
+  step: number | null;
+  kind: "trial" | "subscription" | null;
+  /** Penanda anti-ulang berhasil ditulis. `false` = cron besok akan mengulang. */
+  noted: boolean;
+  /** Alasan singkat untuk log bila tidak dikirim. */
+  reason?: string;
+}
+
+/** "3 hari lagi" / "besok" / "hari ini" / "sudah berakhir". */
+function expiryWhen(days: number): string {
+  if (days > 1) return `${days} hari lagi`;
+  if (days === 1) return "besok";
+  if (days === 0) return "hari ini";
+  return "sudah berakhir";
+}
+
+/**
+ * Masa uji coba / langganan akan berakhir.
+ *
+ * Ini kabar yang paling mahal kalau tidak ada: uji coba 7 hari dan langganan 30
+ * hari sebelumnya mati dalam diam, jadi pemilik toko baru tahu botnya berhenti
+ * dari keluhan pembeli. Dikirim pada tiga ambang — H-3, H-1, dan hari-H (termasuk
+ * dua hari sesudahnya) — masing-masing tepat sekali.
+ *
+ * Dipanggil dari `/api/cron/reminders`, sekali sehari. Karena itu SEMUA keputusan
+ * "kirim atau tidak" ada di sini, bukan di route-nya: satu tempat yang bisa diuji,
+ * dan cron-nya tinggal melaporkan hasil.
+ */
+export async function notifyExpiryReminder(params: {
+  store: StoreRecord;
+  /** Base URL publik aplikasi, untuk tautan pembayaran di dalam pesan. */
+  baseUrl: string;
+  nowMs?: number;
+  /**
+   * Hitung ambangnya saja: jangan kirim WhatsApp dan jangan tulis penanda
+   * anti-ulang. Dipakai `?dry=1` di cron untuk memastikan sasarannya benar
+   * sebelum menghabiskan pulsa Fonnte.
+   */
+  dryRun?: boolean;
+}): Promise<ExpiryReminderOutcome> {
+  const { store, baseUrl, dryRun } = params;
+  const nowMs = params.nowMs ?? Date.now();
+  const idle = (reason: string): ExpiryReminderOutcome => ({
+    sent: false,
+    step: null,
+    kind: null,
+    noted: false,
+    reason
+  });
+
+  if (!store.id) return idle("toko tanpa id");
+
+  // Tanggal yang menentukan, dengan aturan yang SAMA seperti `storeActivityState`:
+  // langganan bila akun sudah pernah bayar, kalau tidak masa uji cobanya. Kalau
+  // aturannya beda, pesan yang dikirim bisa bertentangan dengan status yang
+  // dilihat pemilik toko di dashboard.
+  const kind: "trial" | "subscription" =
+    store.is_paid && store.subscription_ends_at ? "subscription" : "trial";
+  const endsAt = kind === "subscription" ? store.subscription_ends_at : store.trial_ends_at;
+
+  const days = daysUntil(endsAt, nowMs);
+  if (days === null) return idle("tanpa tanggal akhir");
+  if (days > EXPIRY_FIRST_STEP) return idle(`masih ${days} hari`);
+  if (days < -EXPIRY_PAST_GRACE_DAYS) return idle(`berakhir ${-days} hari lalu`);
+
+  const step = EXPIRY_STEPS.find((s) => days <= s);
+  if (step === undefined) return idle("di luar ambang");
+
+  // Catatan dari periode SEBELUMNYA wajib diabaikan. Tanpa ini satu perpanjangan
+  // membungkam pengingat selamanya: `last_expiry_alert_days` tersimpan 0, dan 0
+  // lebih kecil dari ambang mana pun sehingga tidak ada kabar yang pernah lolos
+  // lagi. Pengingat paling awal terbit H-3, jadi catatan yang lebih tua dari itu
+  // (plus sehari kelonggaran jadwal cron) pasti milik tanggal akhir yang lama —
+  // dan perpanjangan selalu menggeser tanggal 30 hari, jauh di luar jendela ini.
+  const endMs = new Date(endsAt as string).getTime();
+  const windowStartMs = endMs - (EXPIRY_FIRST_STEP + 1) * DAY_MS;
+  const notedAtMs = store.last_expiry_alert_at
+    ? new Date(store.last_expiry_alert_at).getTime()
+    : NaN;
+  const lastStep =
+    Number.isFinite(notedAtMs) && notedAtMs >= windowStartMs ? store.last_expiry_alert_days : null;
+
+  if (typeof lastStep === "number" && lastStep <= step) {
+    return idle(`ambang ${step} sudah dikabari`);
+  }
+
+  if (dryRun) return { sent: false, step, kind, noted: false, reason: "mode kering" };
+
+  const when = expiryWhen(days);
+  const link = `${baseUrl.replace(/\/+$/, "")}/#harga`;
+  const label = kind === "subscription" ? "Langganan" : "Masa uji coba";
+  const habis = days <= 0;
+
+  const text = habis
+    ? `🚫 *${label} sudah berakhir*\n\n` +
+      `Bot WhatsApp ${store.store_name || "toko Anda"} berhenti membalas chat pembeli. ` +
+      `Produk, nomor, dan riwayat chat Anda tetap tersimpan dan langsung aktif lagi ` +
+      `begitu ${kind === "subscription" ? "diperpanjang" : "berlangganan"}.\n\n` +
+      `${kind === "subscription" ? "Perpanjang" : "Pilih paket"} di sini: ${link}\n` +
+      `Pakai email *${store.email}* saat membayar supaya paketnya menempel ke toko ini.`
+    : `⏳ *${label} berakhir ${when}*\n\n` +
+      `${label} BalesToko.ai untuk ${store.store_name || "toko Anda"} habis ${when}. ` +
+      `Sesudah itu bot berhenti membalas chat pembeli sampai ` +
+      `${kind === "subscription" ? "diperpanjang" : "Anda berlangganan"}.\n\n` +
+      `${kind === "subscription" ? "Perpanjang" : "Pilih paket"} di sini: ${link}\n` +
+      `Pakai email *${store.email}* saat membayar supaya paketnya menempel ke toko ini.`
+
+  // `allowAccountToken`: audiens terbesar pengingat ini justru akun uji coba yang
+  // belum pernah menyambungkan WhatsApp. Lihat catatan di kepala berkas.
+  const sent = await notifyOwner({ store, text, allowAccountToken: true });
+
+  // Dicatat walau gagal kirim — kalau tidak, toko yang nomornya bermasalah dicoba
+  // ulang setiap hari sampai masa aktifnya benar-benar habis.
+  const noted = await noteExpiryAlert(store.id, step);
+
+  return { sent, step, kind, noted, reason: sent ? undefined : "pengiriman gagal" };
 }

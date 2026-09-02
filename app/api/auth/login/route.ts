@@ -7,6 +7,7 @@ import {
   storeActivityState,
   touchStoreMemberLogin
 } from "@/lib/supabase";
+import { normalizeEmail } from "@/lib/supabase";
 import { verifyPassword, setSessionCookie } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -42,7 +43,11 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Body tidak valid." }, { status: 400 });
   }
 
-  const email = (body.email || "").trim();
+  // Huruf besar/kecil TIDAK boleh membedakan akun. Sebelum normalisasi ini,
+  // pemilik yang mendaftar sebagai `Budi@Gmail.com` lalu login `budi@gmail.com`
+  // selalu ditolak 401 — tanpa pesan yang menjelaskan kenapa, dan tanpa cara
+  // memperbaikinya sendiri.
+  const email = normalizeEmail(body.email);
   const password = body.password || "";
 
   if (!email || !password) {
@@ -62,7 +67,7 @@ export async function POST(req: Request) {
   }
 
   const byEmail = await bumpRateLimit(
-    `login:email:${email.toLowerCase()}`,
+    `login:email:${email}`,
     WINDOW_SECONDS,
     MAX_ATTEMPTS_PER_EMAIL
   );

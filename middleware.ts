@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-
-const SESSION_COOKIE = "bt_session";
+import {
+  DEV_SESSION_SECRET,
+  SESSION_COOKIE,
+  resolveSessionSecret,
+  timingSafeEqualStrings
+} from "@/lib/session-constants";
 
 /**
  * Penjaga rute dashboard.
@@ -42,7 +46,10 @@ async function verifyToken(token: string | undefined, secret: string): Promise<b
     );
     const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payloadB64));
     const expected = Buffer.from(mac).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    if (expected !== sig) return false;
+
+    // Konstan-waktu: `expected !== sig` berhenti pada byte pertama yang berbeda,
+    // dan lama pembandingannya membocorkan berapa byte awal yang sudah benar.
+    if (!timingSafeEqualStrings(expected, sig)) return false;
 
     const json = JSON.parse(Buffer.from(payloadB64.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
     return typeof json.exp === "number" && json.exp >= Math.floor(Date.now() / 1000);
@@ -52,8 +59,10 @@ async function verifyToken(token: string | undefined, secret: string): Promise<b
 }
 
 export async function middleware(req: NextRequest) {
-  // Urutan resolusi HARUS sama dengan getSecret() di lib/auth.ts.
-  const secret = process.env.AUTH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Satu sumber kebenaran dengan `getSecret()` di lib/auth.ts — kalau urutannya
+  // berbeda, cookie yang diterbitkan route Node akan ditolak di sini dan semua
+  // pengguna terlempar ke /login tanpa jejak yang jelas di log.
+  const secret = resolveSessionSecret();
 
   // Tanpa rahasia, satu-satunya kunci yang tersisa adalah konstanta publik di
   // repo — cookie sesi bisa dipalsukan siapa pun. Gagal tertutup: perlakukan
@@ -66,7 +75,7 @@ export async function middleware(req: NextRequest) {
       url.search = "";
       return NextResponse.redirect(url);
     }
-    return handle(req, "dev-insecure-secret-change-me");
+    return handle(req, DEV_SESSION_SECRET);
   }
 
   return handle(req, secret);

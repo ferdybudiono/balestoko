@@ -590,6 +590,47 @@ drop trigger if exists trg_store_members_updated_at on public.store_members;
 create trigger trg_store_members_updated_at before update on public.store_members
   for each row execute function public.set_updated_at();
 
+-- Email akun toko: satu identitas, tanpa peduli huruf besar/kecil.
+--
+-- `stores.email unique` di atas bersifat CASE-SENSITIVE, jadi `Budi@Gmail.com`
+-- dan `budi@gmail.com` bisa hidup berdampingan sebagai DUA akun. Itu bukan
+-- kejanggalan kosmetik: checkout mencari toko berdasarkan email, dan kalau
+-- pelanggan mengetik huruf yang berbeda dari saat mendaftar, pembayarannya
+-- dihitung sebagai akun baru — uang masuk, akun lamanya tetap kedaluwarsa, dan
+-- nomor WhatsApp-nya tidak bisa dipindahkan ke akun baru itu karena
+-- `store_devices_phone_uidx` unik untuk seluruh sistem.
+--
+-- Dua langkah, dan urutannya penting: rapikan datanya dulu, baru pasang indeks.
+--
+-- PERIKSA DULU sebelum menjalankan. Indeks di bawah akan GAGAL bila masih ada
+-- dua akun yang hanya berbeda huruf, dan pasangan seperti itu HARUS digabung
+-- manual (pilih yang punya `store_devices`/`buyer_orders`) — bukan dihapus
+-- sembarangan, karena salah satunya bisa milik pelanggan yang sudah bayar:
+--
+--   select lower(email), count(*), array_agg(email)
+--   from public.stores group by 1 having count(*) > 1;
+--
+update public.stores set email = lower(email) where email <> lower(email);
+update public.orders set customer_email = lower(customer_email)
+  where customer_email is not null and customer_email <> lower(customer_email);
+
+create unique index if not exists stores_email_lower_uidx on public.stores (lower(email));
+
+-- Pengingat masa aktif akan berakhir (dikirim oleh cron harian).
+--
+-- Anti-ulangnya meniru `last_quota_alert_pct`: yang disimpan adalah AMBANG
+-- terakhir yang sudah dikabari (3 = H-3, 1 = H-1, 0 = hari-H atau sesudahnya),
+-- bukan sekadar waktu kirimnya. Tanpa itu cron harian akan mengirim pesan yang
+-- sama setiap hari, dan pengingat yang berisik adalah pengingat yang diabaikan.
+--
+-- Waktunya (`last_expiry_alert_at`) dipakai untuk hal berbeda: catatan yang lebih
+-- tua dari jendela pengingat tanggal akhir yang SEKARANG dianggap milik periode
+-- sebelumnya dan diabaikan. Itulah yang membuat perpanjangan otomatis membuka
+-- kembali pengingat — tanpa itu, ambang 0 yang tersimpan akan membungkam
+-- pengingat selamanya. Logikanya di `lib/notify.ts`.
+alter table public.stores add column if not exists last_expiry_alert_days integer;
+alter table public.stores add column if not exists last_expiry_alert_at timestamptz;
+
 -- ─────────────────────────────────────────────────────────────────────────────
 --  RPC: kurangi stok beberapa produk sekaligus, atomik.
 --
@@ -659,3 +700,58 @@ begin
 end;
 $$;
 
+
+-- ────────────────────────────────────────────────────────────────────────────
+--  HAK AKSES RPC: cabut EXECUTE dari peran publik.
+--
+--  Postgres memberi EXECUTE kepada PUBLIC pada SETIAP fungsi baru, dan Supabase
+--  menambah default privilege untuk `anon` + `authenticated` di schema public.
+--  Untuk `decrement_product_stock` gabungan itu berbahaya: fungsi tersebut
+--  `security definer`, jadi ia berjalan sebagai pemiliknya dan MELEWATI RLS.
+--  Tanpa pencabutan di bawah, siapa pun yang memegang anon key — dan kunci itu
+--  memang dirancang untuk ditempel di browser — cukup menebak/mengetahui satu
+--  UUID toko untuk memanggil
+--
+--    POST /rest/v1/rpc/decrement_product_stock
+--
+--  dan mengosongkan stok toko mana pun.
+--
+--  Tiga fungsi lain BUKAN `security definer`, jadi RLS sudah menahan mereka.
+--  Pencabutannya tetap dipasang sebagai pertahanan berlapis: kalau suatu hari
+--  salah satunya dinaikkan menjadi `security definer`, hak aksesnya sudah benar
+--  sejak sebelum perubahan itu dibuat.
+--
+--  Aplikasi tidak terpengaruh: semua pemanggilan memakai SERVICE ROLE key, dan
+--  peran itu tetap mendapat EXECUTE lewat `grant` di atas serta di blok ini.
+--
+--  Dijalankan lewat DO block, bukan pernyataan `revoke` telanjang, karena
+--  `revoke ... from anon` akan menggagalkan seluruh skrip pada Postgres biasa
+--  yang tidak punya peran bawaan Supabase. Blok ini aman diulang.
+-- ────────────────────────────────────────────────────────────────────────────
+do $$
+declare
+  v_fn   text;
+  v_role text;
+begin
+  for v_fn in
+    select unnest(array[
+      'public.decrement_product_stock(uuid, jsonb)',
+      'public.trim_jsonb_tail(jsonb, integer)',
+      'public.bump_rate_limit(text, integer, integer)',
+      'public.append_conversation_message(uuid, text, text, text, text, text, integer, text, text)'
+    ])
+  loop
+    execute format('revoke execute on function %s from public', v_fn);
+
+    for v_role in
+      select rolname from pg_roles where rolname in ('anon', 'authenticated')
+    loop
+      execute format('revoke execute on function %s from %I', v_fn, v_role);
+    end loop;
+  end loop;
+
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    execute 'grant execute on function public.decrement_product_stock(uuid, jsonb) to service_role';
+  end if;
+end;
+$$;
