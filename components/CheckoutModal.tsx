@@ -18,6 +18,7 @@ import {
   Ticket,
   Eye,
   EyeOff,
+  LogOut,
 } from "lucide-react";
 import { formatIDR, type Plan } from "@/lib/packages";
 import { validateCouponForPlan, applyDiscount } from "@/lib/coupons";
@@ -39,6 +40,15 @@ interface CheckoutModalProps {
   plan: Plan | null;
   open: boolean;
   onClose: () => void;
+  /**
+   * Email toko yang sedang login, atau `null`. Datang dari induknya (`app/page.tsx`)
+   * dan BUKAN diambil sendiri di sini seperti sebelumnya: navbar butuh nilai yang
+   * sama, dan salinan terpisah membuat logout dari navbar tidak diketahui modal
+   * ini. Versi lama juga tidak pernah menge-null-kan state-nya, jadi nilai basi
+   * bisa mengunci kolom email ke akun yang sudah keluar.
+   */
+  sessionEmail: string | null;
+  onLogout: () => Promise<void>;
 }
 
 interface FormState {
@@ -65,20 +75,33 @@ export default function CheckoutModal({
   plan,
   open,
   onClose,
+  sessionEmail,
+  onLogout,
 }: CheckoutModalProps) {
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [errors, setErrors] = useState<Partial<FormState>>({});
   const [status, setStatus] = useState<Status>({ kind: "idle" });
-  /**
-   * Email pemilik sesi yang sedang login, bila ada. Kehadirannya mengubah arti
-   * formulir ini: pembayaran menjadi PERPANJANGAN akun tersebut, bukan pendaftaran
-   * akun baru — jadi kata sandi tidak lagi diminta dan email dikunci.
-   */
-  const [sessionEmail, setSessionEmail] = useState<string | null>(null);
+  const [switching, setSwitching] = useState(false);
   const firstFieldRef = useRef<HTMLInputElement>(null);
+  const emailFieldRef = useRef<HTMLInputElement>(null);
 
   const busy = status.kind === "submitting" || status.kind === "paying";
+  /**
+   * Sesi yang ada mengubah arti formulir ini: pembayaran menjadi PERPANJANGAN
+   * akun tersebut, bukan pendaftaran akun baru — kata sandi tidak diminta dan
+   * email dikunci.
+   */
   const isRenewal = !!sessionEmail;
+  /**
+   * Email diturunkan, tidak pernah disalin ke `form`.
+   *
+   * Menyalinnya ke state akan membuka satu balapan: kalau pengunjung mengeklik
+   * paket sebelum `/api/auth/session` menjawab, effect reset sudah jalan dengan
+   * email kosong, dan yang tersisa adalah kolom terkunci yang kosong — mustahil
+   * diisi maupun dikoreksi. Sebagai turunan, nilainya selalu benar tanpa peduli
+   * urutan datangnya.
+   */
+  const emailValue = isRenewal ? sessionEmail : form.email;
 
   // Reset saat modal dibuka untuk paket baru.
   useEffect(() => {
@@ -91,26 +114,28 @@ export default function CheckoutModal({
     }
   }, [open, plan?.id]);
 
-  // Cek sesi hanya saat modal dibuka — halaman harga tidak perlu membayar
-  // permintaan ini sampai pengunjung benar-benar berniat membayar.
-  useEffect(() => {
-    if (!open) return;
-    let alive = true;
-    fetch("/api/auth/session")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
-        if (!alive || !d?.email) return;
-        setSessionEmail(d.email);
-        setForm((f) => ({ ...f, email: d.email }));
-      })
-      .catch(() => {
-        // Gagal mengecek sesi → perlakukan sebagai pengunjung baru. Server tetap
-        // jadi otoritas: perpanjangan tanpa sesi akan ditolak dengan 409.
-      });
-    return () => {
-      alive = false;
-    };
-  }, [open]);
+  /**
+   * Keluar dari sesi TANPA menutup modal, supaya pembayaran atas nama akun lain
+   * tidak perlu perjalanan ke `/dashboard` dan kembali.
+   *
+   * Yang dibersihkan hanya milik akun lama — email dan kata sandi. Nama, nomor
+   * WhatsApp, dan nama toko yang sudah diketik dipertahankan; itu sebabnya effect
+   * reset di atas TIDAK boleh ikut bergantung pada `sessionEmail`, karena
+   * perubahan nilai itulah yang terjadi tepat pada saat ini.
+   */
+  const handleSwitchAccount = async () => {
+    if (switching || busy) return;
+    setSwitching(true);
+    try {
+      await onLogout();
+    } finally {
+      setSwitching(false);
+    }
+    setForm((f) => ({ ...f, email: "", password: "" }));
+    setErrors({});
+    setStatus({ kind: "idle" });
+    setTimeout(() => emailFieldRef.current?.focus(), 60);
+  };
 
   // Tutup dengan tombol ESC.
   useEffect(() => {
@@ -153,7 +178,10 @@ export default function CheckoutModal({
     if (form.name.trim().length < 3) next.name = "Nama minimal 3 karakter.";
     if (form.whatsapp.replace(/\D/g, "").length < 9)
       next.whatsapp = "Nomor WhatsApp tidak valid.";
-    if (!EMAIL_RE.test(form.email)) next.email = "Format email salah.";
+    // Saat perpanjangan, emailnya berasal dari sesi yang sudah terverifikasi —
+    // memvalidasinya lagi hanya bisa menghasilkan galat pada kolom yang bahkan
+    // tidak bisa disunting.
+    if (!isRenewal && !EMAIL_RE.test(form.email)) next.email = "Format email salah.";
     if (form.storeName.trim().length < 2)
       next.storeName = "Nama toko wajib diisi.";
     // Perpanjangan memakai akun yang sudah ada, jadi tidak ada kata sandi baru.
@@ -178,7 +206,7 @@ export default function CheckoutModal({
           packageId: plan.id,
           name: form.name,
           whatsapp: form.whatsapp,
-          email: form.email,
+          email: emailValue,
           storeName: form.storeName,
           password: isRenewal ? undefined : form.password,
           coupon: form.coupon.trim() || undefined,
@@ -285,7 +313,13 @@ export default function CheckoutModal({
 
         {/* Body */}
         {terminal ? (
-          <ResultView status={status} planName={plan.name} email={form.email} onClose={onClose} />
+          <ResultView
+            status={status}
+            planName={plan.name}
+            email={emailValue}
+            isRenewal={isRenewal}
+            onClose={onClose}
+          />
         ) : (
           <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
             {/* Area isian — SATU-SATUNYA bagian yang menggulir. */}
@@ -315,14 +349,28 @@ export default function CheckoutModal({
 
             <div className="space-y-3.5">
               {isRenewal && (
-                <div className="flex items-start gap-2 rounded-xl bg-brand-50 px-3.5 py-3 text-sm text-brand-800">
-                  <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>
-                    Pembayaran ini masuk ke akun{" "}
-                    <strong className="break-all">{sessionEmail}</strong> yang sedang login — bukan
-                    akun baru. Produk, nomor WhatsApp, dan riwayat chat Anda tetap utuh. Masa aktif
-                    30 hari; bila langganan sekarang masih berjalan, sisa harinya ditambahkan.
-                  </span>
+                <div className="rounded-xl bg-brand-50 px-3.5 py-3 text-sm text-brand-800">
+                  <div className="flex items-start gap-2">
+                    <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      Pembayaran ini masuk ke akun{" "}
+                      <strong className="break-all">{sessionEmail}</strong> yang sedang login — bukan
+                      akun baru. Produk, nomor WhatsApp, dan riwayat chat Anda tetap utuh. Masa aktif
+                      30 hari; bila langganan sekarang masih berjalan, sisa harinya ditambahkan.
+                    </span>
+                  </div>
+                  {/* Jalan keluar dari kunci email, di tempat kuncinya terasa.
+                      Tanpa tombol ini satu-satunya cara membayar untuk akun lain
+                      adalah menebak bahwa logout ada di dalam `/dashboard`. */}
+                  <button
+                    type="button"
+                    onClick={handleSwitchAccount}
+                    disabled={switching || busy}
+                    className="mt-2.5 inline-flex items-center gap-1.5 rounded-lg border border-brand-200 bg-white px-3 py-1.5 text-xs font-semibold text-brand-700 transition hover:bg-brand-100 disabled:opacity-50"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    {switching ? "Mengeluarkan…" : "Keluar & bayar untuk akun lain"}
+                  </button>
                 </div>
               )}
               <Field
@@ -346,17 +394,22 @@ export default function CheckoutModal({
                 autoComplete="tel"
               />
               <Field
+                ref={emailFieldRef}
                 icon={<Mail className="h-4 w-4" />}
                 label="Email Akun Toko"
                 placeholder="mis. budi@email.com"
-                value={form.email}
+                value={emailValue}
                 onChange={(v) => update("email", v)}
                 error={errors.email}
                 type="email"
                 inputMode="email"
                 autoComplete="email"
                 readOnly={isRenewal}
-                hint={isRenewal ? "Terkunci ke akun yang sedang login." : undefined}
+                hint={
+                  isRenewal
+                    ? "Terkunci ke akun yang sedang login — keluar dulu untuk memakai email lain."
+                    : undefined
+                }
               />
               <Field
                 icon={<Store className="h-4 w-4" />}
@@ -551,11 +604,18 @@ function ResultView({
   status,
   planName,
   email,
+  isRenewal,
   onClose,
 }: {
   status: Status;
   planName: string;
   email: string;
+  /**
+   * Perpanjangan tidak membuat kata sandi apa pun dan orangnya sudah login, jadi
+   * ajakan "login memakai kata sandi yang tadi Anda buat" — yang dulu tampil
+   * tanpa syarat di sini — menyuruh mencari sesuatu yang tidak pernah ada.
+   */
+  isRenewal: boolean;
   onClose: () => void;
 }) {
   const success = status.kind === "success";
@@ -581,9 +641,11 @@ function ResultView({
         {success ? "Pembayaran Berhasil! 🎉" : "Menunggu Pembayaran"}
       </h3>
       <p className="mx-auto max-w-xs text-sm text-ink-muted">
-        {success
-          ? `Terima kasih! Pembayaran Paket ${planName} sukses. Silakan login memakai email & kata sandi yang tadi Anda buat untuk menautkan WhatsApp.`
-          : "Selesaikan pembayaran sesuai instruksi. Status akan otomatis terupdate setelah pembayaran diterima."}
+        {!success
+          ? "Selesaikan pembayaran sesuai instruksi. Status akan otomatis terupdate setelah pembayaran diterima."
+          : isRenewal
+            ? `Terima kasih! Paket ${planName} sudah dibayar dan masa aktif akun Anda diperpanjang. Buka dashboard untuk melanjutkan.`
+            : `Terima kasih! Pembayaran Paket ${planName} sukses. Silakan login memakai email & kata sandi yang tadi Anda buat untuk menautkan WhatsApp.`}
       </p>
       {orderId && (
         <p className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500 font-mono">
@@ -593,11 +655,17 @@ function ResultView({
 
       {success ? (
         <Link
-          href={email ? `/login?email=${encodeURIComponent(email)}` : "/login"}
+          href={
+            isRenewal
+              ? "/dashboard"
+              : email
+                ? `/login?email=${encodeURIComponent(email)}`
+                : "/login"
+          }
           onClick={onClose}
           className="flex items-center justify-center gap-2 w-full rounded-2xl bg-emerald-600 hover:bg-emerald-700 px-5 py-3.5 text-sm font-semibold text-white transition shadow-glow"
         >
-          <span>Login ke Dashboard</span>
+          <span>{isRenewal ? "Buka Dashboard" : "Login ke Dashboard"}</span>
           <ArrowRight className="h-4 w-4" />
         </Link>
       ) : (

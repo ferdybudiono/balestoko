@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { MessageCircle, Menu, X, LayoutDashboard } from "lucide-react";
+import { MessageCircle, Menu, X, LayoutDashboard, LogOut, UserRound } from "lucide-react";
 
 const NAV_LINKS = [
   { href: "#fitur", label: "Fitur" },
@@ -11,9 +11,43 @@ const NAV_LINKS = [
   { href: "#faq", label: "FAQ" },
 ];
 
-export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
+interface NavbarProps {
+  onCtaClick: () => void;
+  /** Email toko yang sedang login, atau `null` bila pengunjung anonim. */
+  sessionEmail: string | null;
+  /**
+   * `false` = jawaban `/api/auth/session` belum tiba. Dibedakan dari "tidak
+   * login" supaya slot autentikasi tidak sempat menampilkan tombol Masuk lalu
+   * berkedip berubah jadi blok akun sepersekian detik kemudian.
+   */
+  sessionReady: boolean;
+  onLogout: () => Promise<void>;
+}
+
+/**
+ * Navbar landing page — sekarang sadar sesi.
+ *
+ * Sebelumnya navbar ini selalu menampilkan "Masuk", termasuk kepada orang yang
+ * sedang login. Itu terasa di jalur uang: modal checkout mengunci kolom email ke
+ * akun yang sedang login, dan tidak ada satu pun tombol keluar di halaman
+ * pemasaran — logout hanya ada di dalam `/dashboard`, tempat yang tidak akan
+ * ditebak orang yang sedang berada di halaman harga.
+ */
+export default function Navbar({ onCtaClick, sessionEmail, sessionReady, onLogout }: NavbarProps) {
   const [scrolled, setScrolled] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  const handleLogout = async () => {
+    if (loggingOut) return;
+    setLoggingOut(true);
+    try {
+      await onLogout();
+    } finally {
+      setLoggingOut(false);
+      setMobileOpen(false);
+    }
+  };
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 12);
@@ -68,13 +102,52 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
         </div>
 
         <div className="hidden items-center gap-3 md:flex">
-          <Link
-            href="/login"
-            className="flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-ink transition hover:bg-slate-50"
-          >
-            <LayoutDashboard className="h-4 w-4 text-brand-600" />
-            <span>Masuk</span>
-          </Link>
+          {!sessionReady ? (
+            // Penahan tempat selebar slotnya. Tanpa ini tombol "Masuk" tampil
+            // sekejap kepada orang yang sebenarnya sedang login.
+            <div
+              className="h-9 w-[7.5rem] animate-pulse rounded-xl bg-slate-200/50"
+              aria-hidden="true"
+            />
+          ) : sessionEmail ? (
+            <>
+              {/* Chip ini yang menjawab pertanyaan "checkout tadi terkunci ke akun
+                  siapa?" sebelum modalnya dibuka. Disembunyikan di bawah `lg`
+                  karena di sana empat elemen tidak lagi muat; identitas akunnya
+                  tetap disebut di dalam modal checkout. */}
+              <span
+                title={sessionEmail}
+                className="hidden max-w-[11rem] items-center gap-1.5 rounded-xl bg-slate-100 px-3 py-2 text-xs font-semibold text-ink-soft lg:flex"
+              >
+                <UserRound className="h-3.5 w-3.5 shrink-0 text-brand-600" />
+                <span className="truncate">{sessionEmail}</span>
+              </span>
+              <Link
+                href="/dashboard"
+                className="flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-ink transition hover:bg-slate-50"
+              >
+                <LayoutDashboard className="h-4 w-4 text-brand-600" />
+                <span>Dashboard</span>
+              </Link>
+              <button
+                type="button"
+                onClick={handleLogout}
+                disabled={loggingOut}
+                className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-semibold text-ink-soft transition hover:bg-slate-100 hover:text-ink disabled:opacity-50"
+              >
+                <LogOut className="h-4 w-4" />
+                <span>{loggingOut ? "Keluar…" : "Keluar"}</span>
+              </button>
+            </>
+          ) : (
+            <Link
+              href="/login"
+              className="flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-ink transition hover:bg-slate-50"
+            >
+              <LayoutDashboard className="h-4 w-4 text-brand-600" />
+              <span>Masuk</span>
+            </Link>
+          )}
           <button
             onClick={onCtaClick}
             className="rounded-xl bg-brand-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-brand-700"
@@ -108,14 +181,40 @@ export default function Navbar({ onCtaClick }: { onCtaClick: () => void }) {
                 {l.label}
               </a>
             ))}
-            <Link
-              href="/login"
-              onClick={() => setMobileOpen(false)}
-              className="mt-2 flex items-center justify-center gap-2 rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-ink"
-            >
-              <LayoutDashboard className="h-4 w-4 text-brand-600" />
-              <span>Masuk</span>
-            </Link>
+            {sessionReady && sessionEmail ? (
+              <>
+                <span className="mt-2 flex items-center gap-2 rounded-xl bg-slate-100 px-3.5 py-2.5 text-xs font-semibold text-ink-soft">
+                  <UserRound className="h-3.5 w-3.5 shrink-0 text-brand-600" />
+                  <span className="truncate">{sessionEmail}</span>
+                </span>
+                <Link
+                  href="/dashboard"
+                  onClick={() => setMobileOpen(false)}
+                  className="mt-2 flex items-center justify-center gap-2 rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-ink"
+                >
+                  <LayoutDashboard className="h-4 w-4 text-brand-600" />
+                  <span>Dashboard</span>
+                </Link>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  disabled={loggingOut}
+                  className="mt-2 flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold text-ink-soft transition hover:bg-slate-50 disabled:opacity-50"
+                >
+                  <LogOut className="h-4 w-4" />
+                  <span>{loggingOut ? "Keluar…" : "Keluar"}</span>
+                </button>
+              </>
+            ) : (
+              <Link
+                href="/login"
+                onClick={() => setMobileOpen(false)}
+                className="mt-2 flex items-center justify-center gap-2 rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold text-ink"
+              >
+                <LayoutDashboard className="h-4 w-4 text-brand-600" />
+                <span>Masuk</span>
+              </Link>
+            )}
             <button
               onClick={() => {
                 setMobileOpen(false);

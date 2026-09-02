@@ -16,11 +16,15 @@ import {
   ArrowRight,
   Eye,
   EyeOff,
+  LogOut,
 } from "lucide-react";
 
 interface TrialModalProps {
   open: boolean;
   onClose: () => void;
+  /** Email toko yang sedang login, atau `null`. Lihat pemberitahuan di bawah. */
+  sessionEmail: string | null;
+  onLogout: () => Promise<void>;
 }
 
 interface FormState {
@@ -34,13 +38,29 @@ interface FormState {
 const EMPTY_FORM: FormState = { name: "", whatsapp: "", email: "", storeName: "", password: "" };
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-export default function TrialModal({ open, onClose }: TrialModalProps) {
+export default function TrialModal({
+  open,
+  onClose,
+  sessionEmail,
+  onLogout
+}: TrialModalProps) {
   const router = useRouter();
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [errors, setErrors] = useState<Partial<FormState>>({});
   const [submitting, setSubmitting] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [switching, setSwitching] = useState(false);
   const firstFieldRef = useRef<HTMLInputElement>(null);
+
+  const handleSwitchAccount = async () => {
+    if (switching || submitting) return;
+    setSwitching(true);
+    try {
+      await onLogout();
+    } finally {
+      setSwitching(false);
+    }
+  };
 
   useEffect(() => {
     if (open) {
@@ -132,11 +152,38 @@ export default function TrialModal({ open, onClose }: TrialModalProps) {
         <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-4 sm:px-6 sm:py-5">
           <div className="space-y-3.5">
+            {/* `POST /api/auth/register-trial` tidak memeriksa sesi dan MENERBITKAN
+                sesi baru untuk toko yang baru dibuat. Tanpa pemberitahuan ini,
+                orang yang sedang login mengeklik "uji coba gratis" lalu mendarat di
+                dashboard akun yang sama sekali lain — tanpa pernah diberi tahu
+                bahwa dia baru saja berpindah akun. */}
+            {sessionEmail && (
+              <div className="rounded-xl bg-amber-50 px-3.5 py-3 text-sm text-amber-900">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                  <span>
+                    Anda sedang login sebagai{" "}
+                    <strong className="break-all">{sessionEmail}</strong>. Uji coba membuat akun{" "}
+                    <strong>baru</strong> dan memindahkan sesi Anda ke akun itu — akun sekarang tidak
+                    ikut diperpanjang. Untuk memperpanjang akun ini, pilih paket di bagian Harga.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSwitchAccount}
+                  disabled={switching || submitting}
+                  className="mt-2.5 inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-800 transition hover:bg-amber-100 disabled:opacity-50"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  {switching ? "Mengeluarkan…" : "Keluar dari akun ini dulu"}
+                </button>
+              </div>
+            )}
             <TrialField ref={firstFieldRef} icon={<User className="h-4 w-4" />} label="Nama Lengkap" placeholder="mis. Budi Santoso" value={form.name} onChange={(v) => update("name", v)} error={errors.name} autoComplete="name" />
             <TrialField icon={<Phone className="h-4 w-4" />} label="Nomor WhatsApp Toko" placeholder="mis. 0812xxxxxxx" value={form.whatsapp} onChange={(v) => update("whatsapp", v)} error={errors.whatsapp} inputMode="tel" autoComplete="tel" />
             <TrialField icon={<Mail className="h-4 w-4" />} label="Email Akun Toko" placeholder="mis. budi@email.com" value={form.email} onChange={(v) => update("email", v)} error={errors.email} type="email" inputMode="email" autoComplete="email" />
             <TrialField icon={<Store className="h-4 w-4" />} label="Nama Toko Anda" placeholder="mis. Toko Budi Jaya" value={form.storeName} onChange={(v) => update("storeName", v)} error={errors.storeName} autoComplete="organization" />
-            <TrialField icon={<Lock className="h-4 w-4" />} label="Kata Sandi (untuk login dashboard)" placeholder="min. 6 karakter" value={form.password} onChange={(v) => update("password", v)} error={errors.password} type="password" revealable autoComplete="new-password" />
+            <TrialField icon={<Lock className="h-4 w-4" />} label="Kata Sandi (untuk login dashboard)" placeholder={`min. ${MIN_PASSWORD} karakter`} value={form.password} onChange={(v) => update("password", v)} error={errors.password} type="password" revealable autoComplete="new-password" />
           </div>
 
           {serverError && (
