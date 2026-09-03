@@ -69,7 +69,11 @@ export async function middleware(req: NextRequest) {
   // sebagai belum login alih-alih memakai kunci yang sudah bocor.
   if (!secret) {
     if (process.env.NODE_ENV === "production") {
-      console.error("[middleware] AUTH_SECRET belum di-set; akses dashboard ditolak.");
+      console.error(
+        "[middleware] AUTH_SECRET belum di-set — SEMUA akses dashboard dialihkan ke /login " +
+          "dan login pun akan gagal. Isi AUTH_SECRET di environment produksi " +
+          "(mis. `openssl rand -hex 32`), lalu deploy ulang."
+      );
       const url = req.nextUrl.clone();
       url.pathname = "/login";
       url.search = "";

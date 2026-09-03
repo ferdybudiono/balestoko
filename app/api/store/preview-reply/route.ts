@@ -97,8 +97,14 @@ export async function POST(req: Request) {
       storeName: pickString("store_name", store.store_name, 120) || "Toko",
       aiPromptSystem: pickString("ai_prompt_system", store.ai_prompt_system, 4000),
       greetingMessage: pickString("greeting_message", store.greeting_message, 1000),
-      originSubdistrictId: pickString("origin_subdistrict_id", store.origin_subdistrict_id, 64) || "3171010",
-      originCityName: pickString("origin_city_name", store.origin_city_name, 160) || "Jakarta Pusat",
+      // TANPA nilai bawaan, walaupun ini "cuma" pratinjau. Justru karena ini
+      // pratinjau: gunanya memperlihatkan apa yang BENAR-BENAR diterima pembeli.
+      // Dulu di sini ada "3171010"/"Jakarta Pusat", sehingga toko yang belum
+      // menyetel lokasi asal melihat tarif lengkap di dashboard sementara
+      // pembelinya menerima balasan tanpa angka — pratinjau yang menyesatkan
+      // pemiliknya persis pada satu pengaturan yang belum ia isi.
+      originSubdistrictId: pickString("origin_subdistrict_id", store.origin_subdistrict_id, 64),
+      originCityName: pickString("origin_city_name", store.origin_city_name, 160),
       mengantarApiKey: store.mengantar_api_key,
       defaultWeight,
       products: products.map((p) => ({
@@ -153,7 +159,11 @@ export async function POST(req: Request) {
       subtotal: result.orderDraft?.subtotal ?? 0,
       matchedProducts: (result.orderDraft?.lines || []).map((l) => ({ name: l.name, units: l.units })),
       ambiguous: result.orderDraft?.ambiguous || [],
-      orderCommit: result.orderCommit === true
+      orderCommit: result.orderCommit === true,
+      // Balasannya sengaja tanpa angka ongkir karena lokasi asal belum disetel.
+      // Harus ikut dikembalikan: tanpa penjelasan ini, pemilik toko melihat
+      // pratinjau tanpa tarif dan menyimpulkan botnya rusak.
+      originMissing: result.originMissing === true
     });
   } catch (err) {
     console.error("[store/preview-reply] gagal:", err);

@@ -193,6 +193,17 @@ export default function DashboardPage() {
   const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  /**
+   * Pemuatan data toko GAGAL — bukan "toko ini memang kosong".
+   *
+   * Tanpa state ini kegagalan non-401 (500, koneksi putus, JSON rusak) berakhir
+   * di `console.error` sementara `finally` tetap mematikan `loading`: dashboard
+   * dirender penuh dengan pesanan kosong, produk kosong, chat kosong, dan tanpa
+   * satu pun keterangan. Error backend sementara jadi tidak bisa dibedakan dari
+   * toko yang benar-benar belum punya data — dan pemilik toko tidak punya alasan
+   * untuk mencoba lagi.
+   */
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ msg: string; type: "success" | "error"; key: number } | null>(null);
 
@@ -344,7 +355,17 @@ export default function DashboardPage() {
           router.push("/login");
           return;
         }
-        if (!res.ok) return;
+        // Gagal DITANDAI, bukan diabaikan — dan state data tidak disentuh sama
+        // sekali: angka lama yang masih di layar lebih berguna daripada nol yang
+        // salah, selama pemiliknya tahu angka itu belum tersegarkan.
+        if (!res.ok) {
+          setLoadError(
+            res.status >= 500
+              ? "Server toko sedang bermasalah (kode " + res.status + ")."
+              : "Data toko tidak bisa dimuat (kode " + res.status + ")."
+          );
+          return;
+        }
 
         const data = await res.json();
         if (!data.store) {
@@ -354,6 +375,8 @@ export default function DashboardPage() {
         }
 
         const s = data.store;
+        // Sampai di sini artinya pemuatan berhasil utuh.
+        setLoadError(null);
         setStoreId(s.id || "");
         setUserEmail(s.email || "");
         setIsPaid(!!s.is_paid);
@@ -428,6 +451,10 @@ export default function DashboardPage() {
         }
       } catch (err) {
         console.error("Gagal memuat data toko:", err);
+        // Koneksi putus / JSON rusak. Pesannya dibuat bisa ditindaklanjuti tanpa
+        // menyalahkan pihak yang belum tentu bersalah: dari sini kita tidak tahu
+        // apakah yang mati jaringan pemilik toko atau server kami.
+        setLoadError("Tidak bisa menghubungi server. Periksa koneksi internet Anda.");
       } finally {
         setLoading(false);
         setRefreshing(false);
@@ -1144,12 +1171,63 @@ export default function DashboardPage() {
   };
 
   // Cegah "flash" data kosong: tampilkan skeleton hingga data toko termuat.
-  if (loading && !storeId) {
+  //
+  // `!loadError` menjaga urutannya: sekali pemuatan pertama gagal, menekan "Coba
+  // lagi" tidak boleh melempar pemilik toko kembali ke skeleton — konteksnya
+  // hilang, dan kalau percobaan itu gagal juga layarnya berkedip bolak-balik.
+  // Spinner-nya tetap ada, di dalam tombolnya.
+  if (loading && !storeId && !loadError) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
         <div className="flex flex-col items-center gap-3 text-slate-400">
           <RefreshCw className="w-8 h-8 animate-spin text-brand-600" aria-hidden="true" />
           <p className="text-sm">Memuat dashboard toko Anda…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Pemuatan PERTAMA gagal: tidak ada satu pun data yang bisa ditampilkan.
+  //
+  // Ini menggantikan dashboard kosong yang dulu dirender di sini. Bedanya bukan
+  // kosmetik: dashboard kosong memberi tahu pemilik toko bahwa dia tidak punya
+  // pesanan, produk, dan chat — tiga pernyataan yang mungkin semuanya salah.
+  if (loadError && !storeId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div
+          role="alert"
+          className="max-w-md w-full bg-white border border-slate-200 rounded-2xl shadow-card p-6 text-center"
+        >
+          <span className="w-12 h-12 rounded-2xl bg-red-50 text-red-600 flex items-center justify-center mx-auto">
+            <TriangleAlert className="w-6 h-6" aria-hidden="true" />
+          </span>
+          <h1 className="mt-4 text-lg font-bold text-ink">Gagal memuat data toko</h1>
+          <p className="mt-2 text-sm text-ink-soft leading-relaxed">{loadError}</p>
+          <p className="mt-1 text-sm text-ink-soft leading-relaxed">
+            Produk, pesanan, dan riwayat chat Anda tetap tersimpan — yang gagal hanya
+            pemuatannya ke halaman ini.
+          </p>
+          <div className="mt-5 flex flex-col sm:flex-row gap-2 justify-center">
+            <button
+              type="button"
+              onClick={() => fetchStoreData({ syncForm: true })}
+              disabled={loading}
+              className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-brand-600 text-white text-sm font-semibold hover:bg-brand-700 disabled:opacity-60 transition-colors"
+            >
+              <RefreshCw
+                className={`w-4 h-4 ${loading ? "animate-spin" : ""}`}
+                aria-hidden="true"
+              />
+              {loading ? "Mencoba…" : "Coba lagi"}
+            </button>
+            <Link
+              href="/"
+              className="inline-flex items-center justify-center px-4 py-2.5 rounded-xl border border-slate-200 text-sm font-semibold text-ink-soft hover:bg-slate-50 transition-colors"
+            >
+              Ke halaman utama
+            </Link>
+          </div>
         </div>
       </div>
     );
@@ -1306,6 +1384,35 @@ export default function DashboardPage() {
             </button>
           </div>
         </div>
+
+        {/*
+          Penyegaran latar GAGAL sementara data lama masih di layar.
+
+          Ditempel di header (yang sticky) dan bukan di kartu "Status bot" —
+          kartu itu `hidden lg:block`, jadi di ponsel tandanya tidak akan pernah
+          terlihat. Sengaja tidak mengganti isi dashboard: angka lama yang
+          diberi label "belum tersegarkan" masih berguna, sedangkan halaman
+          error akan membuang data yang sudah benar hanya karena satu polling
+          gagal.
+        */}
+        {loadError && storeId && (
+          <div role="status" className="bg-amber-50 border-t border-amber-200">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2 flex items-center gap-2 flex-wrap">
+              <TriangleAlert className="w-3.5 h-3.5 text-amber-700 shrink-0" aria-hidden="true" />
+              <span className="text-xs text-amber-900">
+                Angka di halaman ini belum tersegarkan — {loadError}
+              </span>
+              <button
+                type="button"
+                onClick={() => fetchStoreData({ silent: true })}
+                disabled={refreshing}
+                className="text-xs font-semibold text-amber-900 underline hover:no-underline disabled:opacity-60"
+              >
+                {refreshing ? "Mencoba…" : "Segarkan sekarang"}
+              </button>
+            </div>
+          </div>
+        )}
       </header>
 
       {/* ── Banner uji coba ───────────────────────────────────────────── */}

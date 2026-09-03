@@ -22,17 +22,35 @@ export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 hari
 /**
  * Kunci HMAC yang dipakai untuk menandatangani/memverifikasi token sesi.
  *
- * `undefined` = tidak ada rahasia sungguhan yang tersedia. Pemanggil yang
- * memutuskan apa artinya: `lib/auth.ts` melempar di produksi, `middleware.ts`
- * memperlakukan pengunjung sebagai belum login.
+ * SATU sumber, tanpa cadangan: `AUTH_SECRET` atau tidak ada. `undefined` berarti
+ * tidak ada rahasia sungguhan yang tersedia, dan pemanggil yang memutuskan
+ * artinya — `lib/auth.ts` melempar di produksi, `middleware.ts` memperlakukan
+ * pengunjung sebagai belum login. Keduanya gagal-TERTUTUP.
  *
- * Fallback ke service role key dipertahankan supaya sesi yang sudah terbit tidak
- * langsung batal saat `AUTH_SECRET` ditambahkan. Bukan praktik yang baik —
- * merotasi kunci database ikut memaksa semua user login ulang, dan satu rahasia
- * dipakai untuk dua tujuan berbeda.
+ * Dulu di sini ada cadangan `|| process.env.SUPABASE_SERVICE_ROLE_KEY`, dipasang
+ * agar sesi yang sudah terbit tidak langsung batal pada hari `AUTH_SECRET`
+ * diperkenalkan. Migrasi itu sudah lama lewat dan cadangannya menyisakan dua
+ * masalah: satu rahasia memikul dua tujuan (tanda tangan sesi DAN akses penuh
+ * database, sehingga bocornya salah satu berarti bocornya keduanya), dan
+ * merotasi kunci database — tindakan yang justru dilakukan saat curiga ada
+ * kebocoran — ikut melogout seluruh pengguna tanpa sebab yang terlihat.
+ *
+ * KONSEKUENSI YANG HARUS DIKETAHUI SEBELUM DEPLOY: tanpa `AUTH_SECRET` di
+ * environment produksi, tidak ada sesi yang bisa diterbitkan MAUPUN diverifikasi
+ * — login gagal dan seluruh akses dashboard dialihkan ke `/login`. Isi variabel
+ * itu lebih dulu (`openssl rand -hex 32`). Mengisi atau mengubahnya juga
+ * membatalkan semua sesi yang sedang berjalan satu kali; itu memang harga
+ * rotasi kunci, bukan bug.
  */
 export function resolveSessionSecret(): string | undefined {
-  return process.env.AUTH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || undefined;
+  // `.trim()` mengikuti pola `FONNTE_WEBHOOK_SECRET`/`CRON_SECRET` di route lain,
+  // dan menutup dua kasus yang sama-sama nyata: `AUTH_SECRET=` tanpa nilai (bentuk
+  // baris ini di `.env.example`, jadi deployment yang menyalinnya apa adanya harus
+  // dianggap BELUM diisi, bukan memakai kunci kosong), dan spasi/newline yang ikut
+  // ter-paste di dashboard Vercel — tanpa trim, nilai "abc" dan "abc " adalah dua
+  // kunci berbeda dan membetulkan paste-nya melogout semua orang.
+  const secret = (process.env.AUTH_SECRET || "").trim();
+  return secret.length > 0 ? secret : undefined;
 }
 
 /**

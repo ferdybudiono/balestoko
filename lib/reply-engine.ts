@@ -1,6 +1,6 @@
 import { processAICustomerService, type AIProcessResult, type ChatMessage } from "@/lib/ai";
 import { sendFonnteMessage } from "@/lib/fonnte";
-import { notifyNewOrder } from "@/lib/notify";
+import { notifyNewOrder, notifyOriginMissing } from "@/lib/notify";
 import { aiContextMessagesForPackage, monthlyConversationLimit, monthStartMs } from "@/lib/packages";
 import {
   appendBuyerMessage,
@@ -47,6 +47,15 @@ export interface AutoReplyOutcome {
   aiPaused?: boolean;
   /** Pesanan TIDAK dicatat karena ada barang habis di dalamnya. */
   stockBlocked?: boolean;
+  /**
+   * Pembeli menanyakan ongkir tapi toko belum menetapkan lokasi asal pengiriman,
+   * jadi balasannya sengaja tanpa satu pun angka tarif.
+   *
+   * Diteruskan ke pemanggil supaya pratinjau dashboard bisa menjelaskan KENAPA
+   * balasannya tidak memuat ongkir — kalau tidak, pemilik toko membacanya sebagai
+   * bot yang rusak, bukan sebagai pengaturan yang belum ia isi.
+   */
+  originMissing?: boolean;
 }
 
 // ── Pembatas laju ────────────────────────────────────────────────────────
@@ -229,8 +238,14 @@ export async function runAutoReply(params: {
     storeName: store.store_name || "Toko Bot WA CS AI",
     aiPromptSystem: store.ai_prompt_system,
     greetingMessage: store.greeting_message,
-    originSubdistrictId: store.origin_subdistrict_id || "3171010",
-    originCityName: store.origin_city_name || "Jakarta Pusat",
+    // Dikirim apa adanya, TANPA nilai bawaan. Dulu di sini ada "3171010"
+    // (Gambir, Jakarta Pusat), sehingga toko yang belum mengisi lokasi asal
+    // membuat bot mengarang tarif dari Jakarta dan menyebut kota asal yang salah
+    // ke pembelinya. Sekarang kosongnya diteruskan utuh: `lib/ai.ts` mengenalinya
+    // lewat `isMengantarId` dan membalas tanpa satu pun angka ongkir, lalu
+    // menyalakan `originMissing` supaya pemiliknya dikabari.
+    originSubdistrictId: store.origin_subdistrict_id,
+    originCityName: store.origin_city_name,
     mengantarApiKey: store.mengantar_api_key,
     defaultWeight: store.default_weight || 1000,
     products,
@@ -317,6 +332,18 @@ export async function runAutoReply(params: {
     });
   }
 
+  // Pembeli tadi menanyakan ongkir dan tidak mendapat angka. Kabari pemiliknya.
+  //
+  // Hanya pada jalur yang benar-benar mengirim (`send`): endpoint uji coba dari
+  // dashboard dipakai justru oleh pemilik toko yang sedang membaca layarnya, jadi
+  // mengiriminya WhatsApp untuk hal yang sedang ia lihat sendiri cuma kebisingan.
+  //
+  // `await`-nya aman: `notifyOriginMissing` tidak pernah melempar, dan balasan ke
+  // pembeli sudah terkirim beberapa baris di atas — jadi tidak ada yang menunggu.
+  if (aiResult.originMissing && send) {
+    await notifyOriginMissing({ store });
+  }
+
   return {
     replyText: aiResult.replyText,
     intent: aiResult.intent,
@@ -326,7 +353,8 @@ export async function runAutoReply(params: {
     capturedName: aiResult.capturedName,
     capturedAddress: aiResult.capturedAddress,
     orderRecorded,
-    stockBlocked: aiResult.stockBlocked === true
+    stockBlocked: aiResult.stockBlocked === true,
+    originMissing: aiResult.originMissing === true
   };
 }
 

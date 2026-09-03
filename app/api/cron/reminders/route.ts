@@ -44,8 +44,7 @@ function timingSafeEqual(a: string, b: string): boolean {
 /**
  * Wewenang pemanggil.
  *
- * BERBEDA dari `FONNTE_WEBHOOK_SECRET` yang membiarkan endpointnya terbuka saat
- * kosong (kompatibilitas deployment lama): tanpa `CRON_SECRET` route ini menolak
+ * SAMA seperti `FONNTE_WEBHOOK_SECRET`: tanpa `CRON_SECRET` route ini menolak
  * SEMUA request. Setiap panggilan mengirim WhatsApp berbayar ke daftar pemilik
  * toko, jadi endpoint terbuka sama dengan tombol spam bagi siapa pun yang menebak
  * URL-nya. Lebih baik pengingatnya belum jalan daripada bisa dipicu orang lain.

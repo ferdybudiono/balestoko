@@ -4,7 +4,13 @@
  * Handles Buyer Greeting -> Location Extraction -> Mengantar Ongkir Calculation -> Conversational Chat
  */
 
-import { calculateMengantarOngkir, searchMengantarLocation, RateSource, ShippingOption } from "./mengantar";
+import {
+  calculateMengantarOngkir,
+  isMengantarId,
+  searchMengantarLocation,
+  RateSource,
+  ShippingOption
+} from "./mengantar";
 import { LocalCourierConfig, courierLabel, normalizeActiveCouriers } from "./couriers";
 import {
   AI_TONE_INSTRUCTIONS,
@@ -47,7 +53,18 @@ export interface AIProcessParams {
   storeName: string;
   aiPromptSystem?: string;
   greetingMessage?: string;
+  /**
+   * `_id` Mengantar kecamatan asal pengiriman toko (24 hex, dari `address/search`).
+   *
+   * KOSONG / bukan `_id` Mengantar = pemilik toko BELUM menetapkan lokasi asal.
+   * Itu keadaan yang harus diakui, bukan ditambal: dulu di sini ada nilai bawaan
+   * "3171010" (Gambir, Jakarta Pusat), sehingga toko di Makassar yang belum
+   * mengisi lokasi membuat bot mengarang tarif dari Jakarta DAN memberi tahu
+   * pembeli "Dari Jakarta Pusat". Sekarang jalur ongkir menolak menyebut angka
+   * sampai lokasinya diisi — lihat `originMissing` pada `AIProcessResult`.
+   */
   originSubdistrictId?: string;
+  /** Nama kota asal untuk dibacakan ke pembeli. Kosong = tidak disebut sama sekali. */
   originCityName?: string;
   mengantarApiKey?: string;
   /** Berat default (gram) dari pengaturan toko; dipakai bila berat produk tidak diketahui. */
@@ -134,8 +151,22 @@ export interface AIProcessResult {
   intent: "GREETING" | "ONGKIR_CHECK" | "PRODUCT_INQUIRY" | "GENERAL_CHAT" | "ORDER" | "FALLBACK";
   shippingDetails?: ShippingOption[];
   detectedCity?: string;
-  /** `mock` = tarif simulasi (lokasi asal toko belum valid), bukan tarif kurir asli. */
+  /**
+   * `mock` = tarif simulasi (tujuan tidak dikenali kurir), bukan tarif kurir asli.
+   *
+   * Lokasi ASAL yang belum valid tidak lagi menghasilkan tarif simulasi — jalur
+   * ongkirnya berhenti lebih awal tanpa angka apa pun; lihat `originMissing`.
+   */
   rateSource?: RateSource;
+  /**
+   * Pembeli menanyakan ongkir tapi toko BELUM menetapkan lokasi asal pengiriman,
+   * jadi balasan ini sengaja tidak memuat satu pun angka ongkir.
+   *
+   * Pemanggil memakai ini untuk mengabari pemilik toko: ini satu-satunya kelalaian
+   * pengaturan yang gejalanya dialami PEMBELI, bukan pemilik — dan tanpa kabar,
+   * satu-satunya petunjuk ada di dashboard yang mungkin tidak dibuka berhari-hari.
+   */
+  originMissing?: boolean;
   /** Berat (gram) yang dipakai menghitung ongkir — berguna untuk audit tarif. */
   shippingWeightGram?: number;
   /** Nama/alamat yang BARU terbaca dari pesan ini (`null` = tidak ada). */
@@ -766,7 +797,10 @@ function renderStoreVoice(v: StoreVoice): string {
   const lines: string[] = [];
 
   lines.push(`Kamu adalah Customer Service WhatsApp untuk toko "${v.storeName}".`);
-  lines.push(`Barang dikirim dari: ${v.originCityName}.`);
+  // Hanya disebut kalau kotanya memang diketahui. Kalimat ini pernah selalu ada
+  // dengan nilai bawaan "Jakarta Pusat", jadi toko yang belum mengisi lokasi
+  // memberi tahu pembeli asal barang yang salah.
+  if (v.originCityName.trim()) lines.push(`Barang dikirim dari: ${v.originCityName}.`);
   lines.push(`Nada bicara: ${AI_TONE_INSTRUCTIONS[v.tone]}`);
 
   if (v.instructions && v.instructions.trim()) {
@@ -1072,8 +1106,8 @@ async function runCustomerService(params: AIProcessParams, trace: AITrace): Prom
     storeName,
     aiPromptSystem,
     greetingMessage,
-    originSubdistrictId = "3171010",
-    originCityName = "Jakarta Pusat",
+    originSubdistrictId = "",
+    originCityName = "",
     mengantarApiKey,
     defaultWeight = 1000,
     products = [],
@@ -1321,12 +1355,100 @@ async function runCustomerService(params: AIProcessParams, trace: AITrace): Prom
   // tujuannya TIDAK bisa dipastikan tidak masuk sini — ia jatuh ke jalur
   // konfirmasi pesanan di bawah, yang tidak menyebut angka ongkir sama sekali.
   if (wantsOngkir || resolvedDest) {
+    // ── Lokasi asal toko belum ditetapkan ────────────────────────────────────
+    //
+    // Diperiksa PALING AWAL di jalur ongkir, sebelum tarif apa pun dihitung.
+    // Sebelum ini `originSubdistrictId` punya nilai bawaan "3171010" (Gambir,
+    // Jakarta Pusat) — bukan `_id` Mengantar yang sah, jadi `calculateMengantarOngkir`
+    // melewati API live dan mengembalikan tarif simulasi. Label "Perkiraan" memang
+    // muncul, tapi dua hal tetap salah: angkanya dihitung dari jarak semu ke
+    // Jakarta, dan pembeli diberi tahu "📍 Dari Jakarta Pusat" untuk toko yang
+    // mungkin ada di Makassar. Perkiraan tidak menghalalkan kota yang salah.
+    //
+    // Ambangnya `isMengantarId`, bukan sekadar "tidak kosong", supaya persis sama
+    // dengan lampu `originValid` di dashboard: satu definisi "lokasi asal sudah
+    // diisi" untuk pemilik toko dan untuk bot.
+    if (!isMengantarId(originSubdistrictId)) {
+      const ask =
+        `Mohon maaf Kak, ongkir belum bisa kami hitung otomatis karena admin toko ` +
+        `belum menetapkan lokasi pengiriman asal. 🙏\n\n` +
+        `Pesan Kakak sudah kami terima — mohon tunggu admin membalas untuk ` +
+        `konfirmasi ongkirnya ya Kak.`;
+      const fallback = draft.lines.length > 0 ? `${formatOrderSummary(draft)}\n\n${ask}` : ask;
+
+      // Intent & tujuan diperlakukan SAMA seperti jalur ongkir yang berhasil:
+      //
+      //   • `ORDER` bila pesanannya lengkap, supaya pesanan tetap masuk daftar
+      //     pesanan toko. Ongkir yang belum bisa dihitung bukan alasan kehilangan
+      //     pesanan yang pembelinya sudah menyebut barang, jumlah, dan tujuan.
+      //   • `detectedCity` tetap dicatat, supaya begitu pemilik toko mengisi lokasi
+      //     asalnya, pesan lanjutan seperti "oke lanjut" langsung mendapat ongkir
+      //     tanpa pembeli harus menyebut kotanya lagi.
+      const missingIntent = commitWithLines ? ("ORDER" as const) : ("ONGKIR_CHECK" as const);
+
+      if (!geminiApiKey) {
+        return {
+          replyText: fallback,
+          intent: missingIntent,
+          detectedCity: resolvedDest?.name,
+          originMissing: true,
+          capturedName,
+          capturedAddress,
+          orderDraft: draft,
+          orderCommit
+        };
+      }
+
+      const guard = baseGuard();
+      const orderFacts = renderOrderFacts(draft, guard);
+      const replyText = await narrateWithGemini({
+        apiKey: geminiApiKey,
+        guard,
+        fallback,
+        label: "ongkir-tanpa-origin",
+        trace,
+        prompt: `${voiceText}
+
+DATA:
+${orderFacts || "Pembeli belum menyebut produk tertentu."}
+Ongkir dan total bayar TIDAK bisa dihitung karena toko belum menetapkan lokasi
+pengiriman asalnya. Ini kelalaian pengaturan di sisi toko, bukan kesalahan pembeli.
+
+${NUMBER_RULES}
+- Jangan menyebut angka ongkir maupun total bayar sama sekali; angkanya tidak ada.
+- Jangan menyebut nama kota asal pengiriman mana pun; kotanya belum diketahui.
+- Jangan menjanjikan waktu tertentu kapan admin membalas.
+
+Pesan pembeli: "${rawMessage}"
+
+Tugasmu: minta maaf singkat, jelaskan ongkir akan dikonfirmasi admin, dan minta
+pembeli menunggu. Kalau DATA memuat rincian produk, sebutkan dulu rincian dan
+subtotalnya. Tulis untuk WhatsApp (*tebal* satu bintang), tanpa kalimat pengantar.`
+      });
+
+      return {
+        replyText,
+        intent: missingIntent,
+        detectedCity: resolvedDest?.name,
+        originMissing: true,
+        capturedName,
+        capturedAddress,
+        orderDraft: draft,
+        orderCommit
+      };
+    }
+
     if (!resolvedDest) {
       // Menanyakan ongkir tanpa menyebut kota. Ongkirnya belum bisa dihitung,
       // tapi subtotal produknya sudah bisa — jadi pembeli tetap dapat sesuatu
       // yang berguna sambil dimintai kota tujuan.
+      // Kota asal hanya disebut kalau memang diketahui: `origin_subdistrict_id`
+      // yang sah tidak menjamin `origin_city_name` ikut terisi, dan tanpa penjaga
+      // ini kalimatnya keluar sebagai "dari toko kami (**)" — markup WhatsApp yang
+      // rusak, di pesan pertama yang dibaca pembeli.
+      const from = originCityName.trim() ? ` dari toko kami (*${originCityName.trim()}*)` : "";
       const ask =
-        `Tentu Kak! Untuk mengecek tarif ongkir dari toko kami (*${originCityName}*), ` +
+        `Tentu Kak! Untuk mengecek tarif ongkir${from}, ` +
         `boleh minta informasi nama *Kecamatan* atau *Kota* tujuan pengirimannya Kak? 🚚`;
       const fallback = draft.lines.length > 0 ? `${formatOrderSummary(draft)}\n\n${ask}` : ask;
 

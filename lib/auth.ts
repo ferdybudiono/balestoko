@@ -21,33 +21,27 @@ import {
 // Diekspor ulang di sini karena route yang sudah ada mengimpornya dari modul ini.
 export { SESSION_COOKIE };
 
-let warnedAuthSecretFallback = false;
-
 /**
  * Kunci HMAC penanda tangan sesi.
  *
- * Urutan resolusinya ada di `resolveSessionSecret()` — satu tempat, dipakai
- * bersama `middleware.ts`. Yang berbeda di sini hanyalah reaksi terhadap
- * "tidak ada rahasia": melempar di produksi, karena menerbitkan cookie dengan
- * kunci yang ada di dalam repo sama dengan tidak menandatanganinya sama sekali.
+ * Sumbernya `resolveSessionSecret()` — satu tempat, dipakai bersama
+ * `middleware.ts`. Yang berbeda di sini hanyalah reaksi terhadap "tidak ada
+ * rahasia": melempar di produksi, karena menerbitkan cookie dengan kunci yang
+ * ada di dalam repo sama dengan tidak menandatanganinya sama sekali.
+ *
+ * Pesan `throw`-nya memuat nama variabel DAN cara membuat nilainya: yang membaca
+ * pesan ini sedang melihat login yang gagal 500 di produksi, dan pada saat itu
+ * ia tidak punya akses ke file ini.
  */
 function getSecret(): string {
   const secret = resolveSessionSecret();
-
-  if (secret) {
-    if (!process.env.AUTH_SECRET && !warnedAuthSecretFallback) {
-      warnedAuthSecretFallback = true;
-      console.warn(
-        "[auth] AUTH_SECRET belum di-set — memakai SUPABASE_SERVICE_ROLE_KEY sebagai kunci HMAC. " +
-          "Set AUTH_SECRET agar rotasi kunci database tidak membatalkan seluruh sesi login."
-      );
-    }
-    return secret;
-  }
+  if (secret) return secret;
 
   if (process.env.NODE_ENV === "production") {
     throw new Error(
-      "AUTH_SECRET (atau SUPABASE_SERVICE_ROLE_KEY) wajib di-set di produksi untuk menandatangani sesi login."
+      "AUTH_SECRET belum di-set — sesi login tidak bisa ditandatangani. Isi variabel " +
+        "AUTH_SECRET di environment produksi (mis. hasil `openssl rand -hex 32`), lalu " +
+        "deploy ulang. Perhatikan: mengisi/mengubahnya melogout semua sesi yang sedang berjalan."
     );
   }
   return DEV_SESSION_SECRET;

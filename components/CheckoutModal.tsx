@@ -229,11 +229,19 @@ export default function CheckoutModal({
         order_id: string;
       };
 
+      // Skripnya dimuat di `app/(marketing)/layout.tsx`. Kalau sampai di sini ia
+      // belum ada, penyebab yang paling sering: pemblokir iklan/skrip memblokir
+      // domain Midtrans, atau `NEXT_PUBLIC_MIDTRANS_CLIENT_KEY` belum di-set.
+      // Pesanannya sudah dibuat di server sebelum baris ini, jadi katakan itu —
+      // kalau tidak, pelanggan mengira uangnya hangus dan mengulang dari nol.
       if (!window.snap) {
         setStatus({
           kind: "error",
           message:
-            "Snap belum termuat. Pastikan NEXT_PUBLIC_MIDTRANS_CLIENT_KEY sudah di-set, lalu refresh.",
+            "Halaman pembayaran Midtrans tidak bisa dimuat. Coba matikan pemblokir " +
+            "iklan lalu refresh halaman ini — pesanan Anda sudah tersimpan (kode " +
+            orderId +
+            ") dan belum ada dana yang terpotong.",
         });
         return;
       }
@@ -426,7 +434,7 @@ export default function CheckoutModal({
                 <Field
                   icon={<Lock className="h-4 w-4" />}
                   label="Kata Sandi (untuk login dashboard)"
-                  placeholder="min. 6 karakter"
+                  placeholder={`min. ${MIN_PASSWORD} karakter`}
                   value={form.password}
                   onChange={(v) => update("password", v)}
                   error={errors.password}

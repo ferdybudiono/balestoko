@@ -28,6 +28,7 @@
 import { sendFonnteMessage } from "@/lib/fonnte";
 import { daysUntil } from "@/lib/packages";
 import {
+  bumpRateLimit,
   clearDeviceAlert,
   listStoreDevices,
   noteDeviceAlert,
@@ -207,6 +208,54 @@ export async function notifyQuotaThreshold(params: {
   });
 
   await noteQuotaAlert(store.id, step);
+}
+
+/**
+ * Jeda antar kabar "lokasi asal belum disetel", dalam detik (6 jam).
+ *
+ * Ditegakkan lewat `bumpRateLimit` — bukan kolom penanda baru di tabel `stores`.
+ * Alasannya: kunci `origin-alert:<storeId>` sudah cukup, tidak perlu migrasi, dan
+ * penahannya berlaku lintas instance serverless (penahan in-memory berarti
+ * "satu pesan per instance per 6 jam", yang bukan penahan).
+ */
+const ORIGIN_ALERT_WINDOW_SEC = 6 * 60 * 60;
+
+/**
+ * Pembeli menanyakan ongkir tapi toko belum menetapkan lokasi asal pengiriman.
+ *
+ * Ini satu-satunya kelalaian pengaturan yang gejalanya dialami PEMBELI, bukan
+ * pemilik toko: botnya tetap ramah, tetap menjawab, hanya menolak menyebut angka
+ * ongkir. Tanpa kabar ini pemilik toko tidak punya alasan untuk curiga — dan
+ * satu-satunya petunjuk ada di dashboard yang mungkin tidak dibuka berhari-hari,
+ * sementara setiap pertanyaan ongkir yang masuk berakhir tanpa harga.
+ *
+ * Anti-spamnya sengaja gagal-TERTUTUP (`enforced: false` → tidak dikirim), kebalikan
+ * dari `bumpRateLimit` di jalur lain. Yang dipertaruhkan di sini bukan balasan ke
+ * pembeli — itu sudah terkirim sebelum fungsi ini dipanggil — melainkan tagihan
+ * WhatsApp pemilik toko: satu toko ramai tanpa origin bisa menerima ratusan pesan
+ * identik per hari. Banner di dashboard tetap menjadi jalur utamanya, jadi
+ * kehilangan satu kabar WhatsApp bukan kehilangan informasinya.
+ */
+export async function notifyOriginMissing(params: {
+  store: StoreRecord;
+  devices?: StoreDeviceRecord[];
+}): Promise<void> {
+  const { store, devices } = params;
+  if (!store.id) return;
+
+  const gate = await bumpRateLimit(`origin-alert:${store.id}`, ORIGIN_ALERT_WINDOW_SEC, 1);
+  if (!gate.enforced || !gate.allowed) return;
+
+  await notifyOwner({
+    store,
+    devices,
+    text:
+      `📍 *Lokasi kirim belum disetel*\n\n` +
+      `Ada pembeli menanyakan ongkir, tapi bot TIDAK bisa menyebut tarifnya karena ` +
+      `lokasi asal pengiriman toko belum dipilih. Pembeli itu diminta menunggu balasan Anda.\n\n` +
+      `Buka dashboard → tab Pengaturan Toko → *Lokasi asal pengiriman*, pilih kecamatan ` +
+      `dari hasil pencarian, lalu Simpan. Setelah itu ongkir dihitung otomatis.`
+  });
 }
 
 /**

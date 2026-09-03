@@ -4,6 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Bot, Mail, Lock, KeyRound, ArrowRight, ShieldCheck, CheckCircle2, Eye, EyeOff } from "lucide-react";
+import { MIN_PASSWORD, minPasswordError } from "@/lib/password-policy";
 
 type Step = "request" | "verify" | "done";
 
@@ -48,6 +49,15 @@ export default function ResetPasswordPage() {
 
   const confirmReset = async (e: React.FormEvent) => {
     e.preventDefault();
+    // Panjang kata sandi diperiksa di sini juga, bukan cuma di server.
+    // `reset/confirm` sudah menolak yang terlalu pendek SEBELUM menyentuh OTP
+    // (jadi jatah percobaan tidak hangus), tapi tanpa penjaga ini user harus
+    // menunggu satu perjalanan jaringan untuk mengetahui hal yang sudah bisa
+    // dijawab di layar — di halaman yang OTP-nya cuma berlaku 10 menit.
+    if (newPassword.length < MIN_PASSWORD) {
+      setError(minPasswordError("Kata sandi baru"));
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -148,7 +158,8 @@ export default function ResetPasswordPage() {
                   <input
                     type={showPassword ? "text" : "password"}
                     required
-                    placeholder="min. 6 karakter"
+                    minLength={MIN_PASSWORD}
+                    placeholder={`min. ${MIN_PASSWORD} karakter`}
                     value={newPassword}
                     onChange={(e) => setNewPassword(e.target.value)}
                     className="w-full pl-11 pr-11 py-3 bg-gray-50 border border-gray-200 rounded-xl text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition-all"

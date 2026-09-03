@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { searchMengantarLocation, calculateMengantarOngkir } from "@/lib/mengantar";
+import { searchMengantarLocation, calculateMengantarOngkir, isMengantarId } from "@/lib/mengantar";
 import { getStoreByEmail } from "@/lib/supabase";
 import { getSessionEmail } from "@/lib/auth";
 
@@ -58,7 +58,24 @@ export async function POST(req: Request) {
     }
 
     // Origin & API key selalu dari toko session — tidak bisa di-override client.
-    const originId = store.origin_subdistrict_id || "3171010";
+    //
+    // Tanpa lokasi asal yang sah, alat tes ini DITOLAK, bukan ditambal. Dulu di
+    // sini ada nilai bawaan "3171010" (Gambir, Jakarta Pusat): pemilik toko di
+    // Makassar menekan "Tes ongkir", melihat angka yang masuk akal, dan
+    // menyimpulkan fiturnya sudah jalan — padahal yang dilihatnya tarif simulasi
+    // dari Jakarta. Alat verifikasi yang memberi lampu hijau palsu lebih buruk
+    // daripada alat yang menolak bekerja.
+    const originId = (store.origin_subdistrict_id || "").trim();
+    if (!isMengantarId(originId)) {
+      return NextResponse.json(
+        {
+          error:
+            "Lokasi asal pengiriman toko belum disetel. Pilih kecamatan asal dari " +
+            "hasil pencarian di Pengaturan Toko, simpan, lalu tes ongkir lagi."
+        },
+        { status: 400 }
+      );
+    }
     const weightRaw = Number(body.weightGram);
     const weightGram =
       Number.isFinite(weightRaw) && weightRaw > 0 ? Math.round(weightRaw) : store.default_weight || 1000;

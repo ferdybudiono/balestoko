@@ -46,9 +46,9 @@ cp .env.example .env.local
 | `SUPABASE_SERVICE_ROLE_KEY` | Service Role key Supabase (**server-only**, jangan diekspos!). |
 | `NEXT_PUBLIC_BASE_URL` | Base URL publik aplikasi (callback Snap **dan** URL webhook yang didaftarkan ke Fonnte). **Wajib domain publik di produksi** — bila masih `localhost`, bot bisa mengirim tapi tidak akan pernah menerima chat pembeli. Isi **satu** domain kanonik. |
 | `NEXT_PUBLIC_ALT_BASE_URLS` | *(opsional)* Domain lain tempat aplikasi ini juga dilayani, dipisah koma — mis. `https://balestoko.vercel.app` saat domain kanoniknya `https://balestoko.my.id`. Lihat [Dua domain](#dua-domain-untuk-satu-aplikasi). |
-| `AUTH_SECRET` | Kunci HMAC penandatangan session login. **Wajib di produksi.** |
+| `AUTH_SECRET` | Kunci HMAC penandatangan session login (`openssl rand -hex 32`). **Wajib di produksi, tanpa cadangan** — bila kosong, login gagal dan seluruh akses `/dashboard` dialihkan ke `/login`. Mengubahnya melogout semua sesi satu kali. |
 | `FONNTE_TOKEN` | Account Token Fonnte (untuk provisioning device per toko). |
-| `FONNTE_WEBHOOK_SECRET` | Shared secret pelindung `/api/fonnte/webhook`. **Sangat disarankan di produksi** — tanpa ini endpoint terbuka dan bisa dipakai sebagai relay spam. |
+| `FONNTE_WEBHOOK_SECRET` | Shared secret pelindung `/api/fonnte/webhook`. **Wajib** — bila kosong, webhook menolak semua pesan masuk (503) dan bot tidak membalas siapa pun. |
 | `GEMINI_API_KEY` | API key Gemini untuk balasan AI. |
 
 > 🔑 Ambil kunci Midtrans di **Dashboard → Settings → Access Keys**.

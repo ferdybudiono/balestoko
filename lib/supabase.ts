@@ -57,14 +57,21 @@ export function normalizeEmail(raw: unknown): string {
  * SEMBARANG, cukup untuk mengirim OTP reset atau memproses checkout ke akun yang
  * salah. Karena itu wildcard di-escape, dan nilai yang masih memuat `*` (PostgREST
  * tidak bisa menyatakannya sebagai literal) tidak dicari lewat jalur ini.
+ *
+ * DIEKSPOR DEMI TES (`tests/email-filters.test.ts`). Escape di bawah pernah
+ * rusak dalam sunyi: backslash-nya ditulis tunggal, `"\$1"`, yang di JavaScript
+ * sama saja dengan `"$1"` — rujukan capture group, yakni karakter yang cocok itu
+ * sendiri. `%` diganti `%`, `_` diganti `_`, jadi barisnya tidak melakukan apa
+ * pun sementara docblock di atas menjelaskan panjang-panjang apa yang seharusnya
+ * dicegahnya. Tidak ada tes yang bisa memberi tahu; sekarang ada.
  */
-function emailFilters(column: string, email: string): string[] {
+export function emailFilters(column: string, email: string): string[] {
   const clean = normalizeEmail(email);
   if (!clean) return [];
 
   const filters = [`${column}=eq.${encodeURIComponent(clean)}`];
   if (!clean.includes("*")) {
-    const literal = clean.replace(/([\%_])/g, "\$1");
+    const literal = clean.replace(/([%_])/g, "\\$1");
     filters.push(`${column}=ilike.${encodeURIComponent(literal)}`);
   }
   return filters;
@@ -1690,6 +1697,125 @@ export async function bumpRateLimit(
   } catch {
     return fallback;
   }
+}
+
+export type RpcStatus = "ok" | "missing" | "unknown";
+
+export interface DatabaseHealth {
+  /** `false` = kredensial Supabase belum diisi; pemeriksaan di bawah tidak berarti. */
+  configured: boolean;
+  /**
+   * Apakah pembatas laju BENAR-BENAR ditegakkan saat ini.
+   *
+   * Pertanyaan paling mahal kalau jawabannya salah, dan paling sunyi kalau
+   * rusak: `bumpRateLimit` sengaja gagal-terbuka, jadi hilangnya RPC-nya tidak
+   * menimbulkan satu gejala pun — login, ganti kata sandi, reset, dan
+   * pendaftaran uji coba semuanya berjalan tanpa batas, dan satu-satunya
+   * jejaknya adalah `console.warn` di log yang tidak ada yang membacanya.
+   */
+  rateLimitEnforced: boolean;
+  rpc: Record<string, RpcStatus>;
+  /** Masalah yang ditemukan, sudah dalam bahasa manusia. Kosong = sehat. */
+  problems: string[];
+}
+
+/**
+ * Cek keberadaan satu RPC TANPA efek samping.
+ *
+ * Caranya sengaja lewat galat: argumennya dikirim dengan tipe yang pasti gagal
+ * di-cast (`p_store_id` bukan UUID). Kalau PostgREST menjawab 404/`PGRST202`,
+ * fungsinya memang tidak ada di schema cache. Galat APA PUN yang lain justru
+ * membuktikan fungsinya ADA — ia sudah dipanggil dan baru kemudian menolak
+ * datanya, jadi tidak ada satu baris pun yang tertulis.
+ */
+async function probeRpc(
+  cfg: { url: string; key: string },
+  name: string,
+  body: Record<string, unknown>
+): Promise<RpcStatus> {
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/rpc/${name}`, {
+      method: "POST",
+      headers: headers(cfg.key),
+      body: JSON.stringify(body),
+      cache: "no-store"
+    });
+    if (res.ok) return "ok";
+    const detail = await res.text();
+    if (res.status === 404 || detail.includes("PGRST202")) return "missing";
+    return "ok";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Pemeriksaan kesehatan database — untuk OPERATOR, bukan untuk pemilik toko.
+ *
+ * KENAPA ADA: empat RPC di `supabase/schema.sql` ditambahkan setelah deployment
+ * pertama. Kalau schema-nya belum dijalankan ulang, tiga di antaranya punya jalur
+ * cadangan yang bekerja tanpa suara — dan `bump_rate_limit` yang hilang berarti
+ * penebakan kata sandi tidak dibatasi apa pun. Tidak ada satu layar pun yang
+ * memberitahukannya. `/api/health/db` memakai fungsi ini supaya jawabannya bisa
+ * dilihat kapan saja, bukan dicari di log.
+ *
+ * Semua pemeriksaan aman dijalankan di produksi: tiga RPC diprobe dengan argumen
+ * yang pasti ditolak sebelum menulis apa pun, dan `bump_rate_limit` dipanggil
+ * dengan kunci khusus + batas sangat tinggi supaya tidak pernah memblokir siapa
+ * pun. Dijalankan paralel karena keempatnya saling bebas.
+ */
+export async function checkDatabaseHealth(): Promise<DatabaseHealth> {
+  const cfg = getConfig();
+  if (!cfg) {
+    return {
+      configured: false,
+      rateLimitEnforced: false,
+      rpc: {},
+      problems: [
+        "NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY belum diisi — " +
+          "aplikasi berjalan tanpa database."
+      ]
+    };
+  }
+
+  const BAD_UUID = "bukan-uuid";
+  const [rateLimit, trim, append, stock] = await Promise.all([
+    bumpRateLimit("healthcheck:db", 60, 1_000_000),
+    probeRpc(cfg, "trim_jsonb_tail", { p_arr: [], p_max: 1 }),
+    probeRpc(cfg, "append_conversation_message", {
+      p_store_id: BAD_UUID,
+      p_phone: "",
+      p_user_msg: "",
+      p_assistant_reply: ""
+    }),
+    probeRpc(cfg, "decrement_product_stock", { p_store_id: BAD_UUID, p_items: [] })
+  ]);
+
+  const rpc: Record<string, RpcStatus> = {
+    bump_rate_limit: rateLimit.enforced ? "ok" : "missing",
+    trim_jsonb_tail: trim,
+    append_conversation_message: append,
+    decrement_product_stock: stock
+  };
+
+  const problems: string[] = [];
+  if (!rateLimit.enforced) {
+    problems.push(
+      "RPC bump_rate_limit tidak menjawab — pembatas laju TIDAK ditegakkan. " +
+        "Login, reset kata sandi, dan pendaftaran uji coba saat ini tanpa batas. " +
+        "Jalankan ulang supabase/schema.sql."
+    );
+  }
+  for (const [name, status] of Object.entries(rpc)) {
+    if (name === "bump_rate_limit" || status === "ok") continue;
+    problems.push(
+      status === "missing"
+        ? `RPC ${name} belum ada di database. Jalankan ulang supabase/schema.sql.`
+        : `RPC ${name} tidak bisa diperiksa (database tidak menjawab).`
+    );
+  }
+
+  return { configured: true, rateLimitEnforced: rateLimit.enforced, rpc, problems };
 }
 
 /**

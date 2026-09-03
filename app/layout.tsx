@@ -1,6 +1,5 @@
 import type { Metadata, Viewport } from "next";
 import { Plus_Jakarta_Sans } from "next/font/google";
-import Script from "next/script";
 import "./globals.css";
 
 const jakarta = Plus_Jakarta_Sans({
@@ -46,24 +45,12 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const isProduction = process.env.MIDTRANS_IS_PRODUCTION === "true";
-  const snapUrl = isProduction
-    ? "https://app.midtrans.com/snap/snap.js"
-    : "https://app.sandbox.midtrans.com/snap/snap.js";
-  const clientKey = process.env.NEXT_PUBLIC_MIDTRANS_CLIENT_KEY ?? "";
-
+  // Midtrans Snap.js TIDAK dimuat di sini. Ia hanya dipakai `CheckoutModal` di
+  // halaman pemasaran, jadi tempatnya `app/(marketing)/layout.tsx` — lihat
+  // alasannya di sana.
   return (
     <html lang="id" className={jakarta.variable}>
-      <body>
-        {children}
-
-        {/* Midtrans Snap.js — menyediakan window.snap untuk pop-up pembayaran. */}
-        <Script
-          src={snapUrl}
-          data-client-key={clientKey}
-          strategy="afterInteractive"
-        />
-      </body>
+      <body>{children}</body>
     </html>
   );
 }

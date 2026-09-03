@@ -516,7 +516,7 @@ export default function OverviewTab({
       title: "Tetapkan lokasi asal pengiriman",
       desc: originValid
         ? `Ongkir dihitung dari ${originCityName}.`
-        : "Wajib dipilih dari hasil pencarian, kalau tidak ongkir masih simulasi.",
+        : "Wajib dipilih dari hasil pencarian. Tanpa ini bot menolak menyebut ongkir sama sekali.",
       cta: "Atur lokasi",
       tab: "store" as TabId
     },
@@ -612,6 +612,34 @@ export default function OverviewTab({
           )}
         </div>
       </section>
+
+      {/*
+        ── Lokasi asal belum disetel, PADAHAL botnya sudah hidup ──────────
+        Sengaja terpisah dari checklist di atas, dan sengaja hanya muncul saat
+        WhatsApp sudah tersambung: sebelum tersambung ini masih "langkah
+        penyiapan yang belum dikerjakan", tapi sesudahnya ia berubah menjadi
+        kerusakan yang sedang berjalan — pembeli sungguhan menanyakan ongkir dan
+        pulang tanpa angka. Checklist penyiapan adalah hal yang paling cepat
+        diabaikan pemilik toko, jadi keadaan yang sedang merugikan itu harus
+        punya suara sendiri.
+      */}
+      {whatsappConnected && !originValid && (
+        <div className="flex items-start gap-2.5 p-4 bg-rose-50 border border-rose-200 rounded-2xl">
+          <MapPin className="w-4 h-4 text-rose-600 mt-0.5 shrink-0" aria-hidden="true" />
+          <p className="text-xs text-rose-900 leading-relaxed">
+            <strong>Bot tidak bisa menyebut ongkir.</strong> Lokasi asal pengiriman belum dipilih dari
+            hasil pencarian, jadi setiap pembeli yang menanyakan ongkir hanya diminta menunggu balasan
+            Anda.{" "}
+            <button
+              type="button"
+              onClick={() => onGoTo("store")}
+              className="font-semibold underline hover:no-underline"
+            >
+              Tetapkan lokasi asal
+            </button>
+          </p>
+        </div>
+      )}
 
       {/* ── Peringatan berat produk ────────────────────────────────────── */}
       {stats.productsMissingWeight > 0 && (

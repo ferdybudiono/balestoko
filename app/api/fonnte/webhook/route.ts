@@ -10,6 +10,7 @@ import {
 } from "@/lib/supabase";
 import { checkConversationQuota, checkRateLimit, runAutoReply } from "@/lib/reply-engine";
 import { notifyQuotaThreshold } from "@/lib/notify";
+import { timingSafeEqualStrings } from "@/lib/session-constants";
 import {
   buildFonnteWebhookUrl,
   isWebhookUrlSynced,
@@ -27,27 +28,48 @@ export const dynamic = "force-dynamic";
  * KEAMANAN — endpoint ini menerima pesan dari internet publik dan setiap
  * pemanggilan memicu Gemini + pengiriman WhatsApp berbayar ke nomor yang ada
  * di payload. Tanpa verifikasi, siapa pun yang tahu nomor device sebuah toko
- * bisa memakainya sebagai relay spam.
+ * bisa memakainya sebagai relay spam — dan nomor device justru nomor yang
+ * diiklankan toko, jadi "tahu nomornya" bukan penghalang apa pun.
  *
- * Set `FONNTE_WEBHOOK_SECRET` di environment; URL webhook device disinkronkan
- * otomatis dengan `?secret=...`. Selama variabel itu belum diisi, request tetap
- * diterima (agar deployment lama tidak mati) namun dicatat sebagai peringatan.
+ * `FONNTE_WEBHOOK_SECRET` WAJIB diisi: tanpa itu route ini menolak semua request
+ * (503). Dulu request tetap diterima dengan satu `console.warn` supaya deployment
+ * lama tidak mati — tapi peringatan di log tidak menghalangi siapa pun, dan
+ * gerbang di belakangnya (`isStoreActive`, kuota, batas laju) hanya membatasi
+ * kerusakan, tidak mencegahnya: kunci batas lajunya memuat nomor pengirim yang
+ * dikendalikan pemanggil, jadi memutar-mutar nomor melewati batasnya. Sama
+ * seperti `/api/cron/reminders`: lebih baik webhook-nya belum jalan daripada bisa
+ * dipicu orang lain dengan tagihan pemilik toko.
+ *
+ * URL webhook device disinkronkan otomatis dengan `?secret=...` — lihat jalur
+ * perbaikan-sekali di bawah untuk device yang tersambung sebelum secret dipasang.
+ */
+
+/** Secret ada di environment? Dipisah karena jawabannya tidak butuh body. */
+function webhookSecretConfigured(): boolean {
+  return (process.env.FONNTE_WEBHOOK_SECRET || "").trim().length > 0;
+}
+
+/**
+ * Apakah pemanggil menyertakan secret yang benar?
+ *
+ * Query param `?secret=` tetap didukung karena dashboard Fonnte hanya bisa diisi
+ * URL, bukan header — konsekuensinya nilainya ikut tercatat di access log, dan
+ * itu memang alasan untuk merotasinya kalau log-nya pernah dibagikan.
+ *
+ * Dibandingkan konstan-waktu: `provided === expected` berhenti pada byte pertama
+ * yang berbeda, jadi lama pembandingannya membocorkan berapa banyak karakter awal
+ * yang sudah benar — cukup untuk menyusun secretnya karakter demi karakter.
  */
 function verifyWebhookSecret(req: Request, body: Record<string, unknown>): boolean {
-  const expected = process.env.FONNTE_WEBHOOK_SECRET;
-  if (!expected) {
-    console.warn(
-      "[fonnte webhook] FONNTE_WEBHOOK_SECRET belum diatur — endpoint ini TERBUKA. " +
-        "Isi variabel tersebut lalu buka tab WhatsApp di dashboard agar URL device tersinkron."
-    );
-    return true;
-  }
+  const expected = (process.env.FONNTE_WEBHOOK_SECRET || "").trim();
+  if (!expected) return false;
   const url = new URL(req.url);
-  const provided =
+  const provided = (
     url.searchParams.get("secret") ||
     req.headers.get("x-webhook-secret") ||
-    String(body.secret || "");
-  return provided === expected;
+    String(body.secret || "")
+  ).trim();
+  return provided.length > 0 && timingSafeEqualStrings(provided, expected);
 }
 
 /**
@@ -73,6 +95,27 @@ async function noteInbound(device: StoreDeviceRecord, note: string): Promise<voi
 }
 
 export async function POST(req: Request) {
+  // Gagal-TERTUTUP, dan ini pemeriksaan pertama di handler — sebelum body dibaca,
+  // sebelum database disentuh. 503 (bukan 401) karena pemanggilnya tidak salah
+  // apa pun: yang belum siap adalah deployment-nya, dan status itulah yang perlu
+  // terbaca di log pengiriman Fonnte maupun di `/api/health/db`.
+  if (!webhookSecretConfigured()) {
+    console.error(
+      "[fonnte webhook] FONNTE_WEBHOOK_SECRET belum diisi — SEMUA pesan masuk ditolak. " +
+        "Isi variabel itu di environment, lalu buka tab WhatsApp di dashboard tiap toko " +
+        "agar URL webhook device tersinkron dengan secret yang baru."
+    );
+    return NextResponse.json(
+      {
+        error:
+          "FONNTE_WEBHOOK_SECRET belum diisi di environment. Endpoint ini memicu " +
+          "pengiriman WhatsApp berbayar, jadi ia menolak semua request sampai " +
+          "secret-nya dipasang."
+      },
+      { status: 503 }
+    );
+  }
+
   let body: Record<string, unknown>;
   try {
     const contentType = req.headers.get("content-type") || "";
@@ -99,9 +142,12 @@ export async function POST(req: Request) {
 
   const secretOk = verifyWebhookSecret(req, body);
 
-  // Secret salah/absen: bendung banjir SEBELUM menyentuh database, karena di
-  // bawah kita masih perlu satu lookup untuk membedakan device lama yang URL-nya
-  // belum tersinkron dari penyerang.
+  // Secret salah atau tidak disertakan: bendung banjir SEBELUM menyentuh
+  // database, karena di bawah kita masih perlu satu lookup untuk membedakan
+  // device lama yang URL-nya belum tersinkron dari penyerang.
+  //
+  // (Secret yang belum DIPASANG di environment sudah ditolak 503 di atas — yang
+  // sampai ke sini pasti punya nilai pembanding.)
   if (!secretOk) {
     const pre = await checkRateLimit(`unverified:${deviceNumber || "unknown"}`, sender);
     if (!pre.ok) {

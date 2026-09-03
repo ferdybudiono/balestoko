@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 /**
@@ -11,8 +12,18 @@ import { defineConfig } from "vitest/config";
  *
  * Komponen React tidak ikut diuji di sini karena butuh jsdom + testing-library;
  * `tsc --noEmit` dan `next build` sudah menjaga sisi itu dari galat tipe.
+ *
+ * Alias `@/` harus dinyatakan ulang di sini: vitest tidak membaca `paths` dari
+ * `tsconfig.json`, jadi tanpa baris ini modul mana pun yang mengimpor lewat
+ * `@/lib/...` (mis. `lib/supabase.ts`) gagal di-resolve saat tes — dan modul
+ * itulah yang justru paling perlu diuji.
  */
 export default defineConfig({
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL(".", import.meta.url))
+    }
+  },
   test: {
     include: ["tests/**/*.test.ts"],
     environment: "node"

@@ -73,6 +73,11 @@ interface PreviewRun {
   subtotal: number;
   matchedProducts: { name: string; units: number }[];
   ambiguous: string[];
+  /**
+   * Balasannya tanpa angka ongkir karena lokasi asal pengiriman belum disetel.
+   * Ditampilkan terpisah supaya pratinjau tanpa tarif tidak terbaca sebagai bot rusak.
+   */
+  originMissing?: boolean;
   /** Pemilik toko menekan tombol "balasan final AI", bukan tombol isi. */
   requestedFinal: boolean;
 }
@@ -334,6 +339,7 @@ export default function StoreTab({
         subtotal: Number(data.subtotal) || 0,
         matchedProducts: Array.isArray(data.matchedProducts) ? data.matchedProducts : [],
         ambiguous: Array.isArray(data.ambiguous) ? data.ambiguous : [],
+        originMissing: data.originMissing === true,
         requestedFinal: final
       });
     } catch {
@@ -430,7 +436,8 @@ export default function StoreTab({
   if (!originValid) {
     gaps.push({
       label: "Lokasi asal belum dipilih dari hasil pencarian",
-      consequence: "Ongkir yang disebut ke pembeli masih perkiraan, bukan tarif kurir asli.",
+      consequence:
+        "Bot menolak menyebut ongkir sama sekali dan meminta pembeli menunggu balasan Anda.",
       href: "#origin-section"
     });
   }
@@ -464,7 +471,10 @@ export default function StoreTab({
     rates: previewRates,
     localCourier: previewLocal,
     destinationName: "Coblong, Bandung",
-    originCityName: form.originCityName || "Jakarta Pusat",
+    // Kosong = baris "📍 Dari …" tidak muncul. Dulu di sini ada "Jakarta Pusat",
+    // jadi pratinjau memperlihatkan kota asal yang bukan milik toko ini kepada
+    // pemilik yang justru belum mengisi lokasinya.
+    originCityName: form.originCityName,
     source: "live",
     payment: {
       // Dinormalisasi sama seperti di server: baris rekening yang masih kosong
@@ -1291,7 +1301,31 @@ export default function StoreTab({
                       Tarif perkiraan
                     </span>
                   )}
+                  {previewRun.originMissing && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 bg-red-50 border border-red-200 text-red-700 text-xs font-semibold rounded-lg">
+                      <MapPin className="w-3 h-3" aria-hidden="true" />
+                      Tanpa ongkir
+                    </span>
+                  )}
                 </div>
+
+                {/*
+                  Balasan tanpa angka bukan bot yang rusak — ini yang BENAR-BENAR
+                  diterima pembeli selama lokasi asal belum disetel. Dijelaskan di
+                  sini karena pratinjaunya memang terlihat kurang, dan pemilik toko
+                  yang tidak diberi alasan akan menyimpulkan fiturnya gagal.
+                */}
+                {previewRun.originMissing && (
+                  <p className="text-xs text-red-700">
+                    Bot menolak menyebut tarif karena{" "}
+                    <a href="#origin-section" className="font-semibold underline">
+                      lokasi asal pengiriman
+                    </a>{" "}
+                    belum dipilih dari hasil pencarian. Pembeli hanya diminta menunggu balasan
+                    Anda, dan Anda dikabari lewat WhatsApp. Isi lokasinya, lalu ongkir dihitung
+                    otomatis.
+                  </p>
+                )}
 
                 {previewRun.matchedProducts.length > 0 && (
                   <p className="text-xs text-slate-500">
